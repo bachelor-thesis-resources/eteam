@@ -963,6 +963,8 @@ static inline int normal_prio(struct task_struct *p)
 		prio = MAX_DL_PRIO-1;
 	else if (task_has_rt_policy(p))
 		prio = MAX_RT_PRIO-1 - p->rt_priority;
+	else if (task_has_e_policy(p))
+		prio = ENERGY_PRIO;
 	else
 		prio = __normal_prio(p);
 	return prio;
@@ -2021,6 +2023,9 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 #endif
 	INIT_LIST_HEAD(&p->se.group_node);
 
+	p->ee.on_rq			= 0;
+	p->ee.running			= 0;
+
 #ifdef CONFIG_SCHEDSTATS
 	memset(&p->se.statistics, 0, sizeof(p->se.statistics));
 #endif
@@ -2124,7 +2129,7 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	 * Revert to default priority/policy on fork if requested.
 	 */
 	if (unlikely(p->sched_reset_on_fork)) {
-		if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
+		if (task_has_dl_policy(p) || task_has_rt_policy(p) || task_has_e_policy(p)) {
 			p->policy = SCHED_NORMAL;
 			p->static_prio = NICE_TO_PRIO(0);
 			p->rt_priority = 0;
@@ -2146,6 +2151,8 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 		return -EAGAIN;
 	} else if (rt_prio(p->prio)) {
 		p->sched_class = &rt_sched_class;
+	} else if (e_prio(p->prio)) {
+		p->sched_class = &energy_sched_class;
 	} else {
 		p->sched_class = &fair_sched_class;
 	}
@@ -3574,6 +3581,8 @@ static void __setscheduler(struct rq *rq, struct task_struct *p,
 		p->sched_class = &dl_sched_class;
 	else if (rt_prio(p->prio))
 		p->sched_class = &rt_sched_class;
+	else if (e_prio(p->prio))
+		p->sched_class = &energy_sched_class;
 	else
 		p->sched_class = &fair_sched_class;
 }
@@ -3687,7 +3696,7 @@ recheck:
 		if (policy != SCHED_DEADLINE &&
 				policy != SCHED_FIFO && policy != SCHED_RR &&
 				policy != SCHED_NORMAL && policy != SCHED_BATCH &&
-				policy != SCHED_IDLE)
+				policy != SCHED_IDLE && policy != SCHED_ENERGY)
 			return -EINVAL;
 	}
 
@@ -7270,6 +7279,7 @@ void __init sched_init(void)
 		init_cfs_rq(&rq->cfs);
 		init_rt_rq(&rq->rt);
 		init_dl_rq(&rq->dl);
+		init_e_rq(&rq->en, i);
 #ifdef CONFIG_FAIR_GROUP_SCHED
 		root_task_group.shares = ROOT_TASK_GROUP_LOAD;
 		INIT_LIST_HEAD(&rq->leaf_cfs_rq_list);
@@ -7370,6 +7380,7 @@ void __init sched_init(void)
 	set_cpu_rq_start_time();
 #endif
 	init_sched_fair_class();
+	init_sched_energy_class();
 
 	scheduler_running = 1;
 }

@@ -18,11 +18,13 @@
  * MAX_RT_PRIO must not be smaller than MAX_USER_RT_PRIO.
  */
 
-#define MAX_USER_RT_PRIO	100
+#define MAX_USER_RT_PRIO	99
 #define MAX_RT_PRIO		MAX_USER_RT_PRIO
 
-#define MAX_PRIO		(MAX_RT_PRIO + NICE_WIDTH)
-#define DEFAULT_PRIO		(MAX_RT_PRIO + NICE_WIDTH / 2)
+#define ENERGY_PRIO		100
+
+#define MAX_PRIO		(MAX_RT_PRIO + 1 + NICE_WIDTH)
+#define DEFAULT_PRIO		(MAX_RT_PRIO + 1 + NICE_WIDTH / 2)
 
 /*
  * Convert user-nice values [ -20 ... 0 ... 19 ]

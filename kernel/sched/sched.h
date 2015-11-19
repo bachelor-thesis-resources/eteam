@@ -3,6 +3,7 @@
 #include <linux/sched/sysctl.h>
 #include <linux/sched/rt.h>
 #include <linux/sched/deadline.h>
+#include <linux/sched/energy.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/stop_machine.h>
@@ -99,6 +100,11 @@ static inline int dl_policy(int policy)
 	return policy == SCHED_DEADLINE;
 }
 
+static inline int e_policy(int policy)
+{
+	return policy == SCHED_ENERGY;
+}
+
 static inline int task_has_rt_policy(struct task_struct *p)
 {
 	return rt_policy(p->policy);
@@ -107,6 +113,11 @@ static inline int task_has_rt_policy(struct task_struct *p)
 static inline int task_has_dl_policy(struct task_struct *p)
 {
 	return dl_policy(p->policy);
+}
+
+static inline int task_has_e_policy(struct task_struct *p)
+{
+	return e_policy(p->policy);
 }
 
 static inline bool dl_time_before(u64 a, u64 b)
@@ -512,6 +523,36 @@ struct dl_rq {
 #endif
 };
 
+struct e_rq {
+	/* Local runqueue lock. */
+	raw_spinlock_t lock;
+
+	/* Is this runqueue the leader of the energy domain. */
+	int leader;
+
+	/* This is just a local reschedule. */
+	int local_resched;
+
+	/* This is just an energy task reschedule. */
+	int energy_resched;
+
+	/* The energy domain which should be measured. */
+	struct cpumask domain;
+
+	/* The threads which should run on this CPU. */
+	struct list_head threads;
+	int nr_threads;
+
+	/* Whether or not the idle task is currently running at this CPU. */
+	int runs_idle;
+
+	/* The currently running linux task. */
+	struct task_struct* curr;
+
+	/* The currently running energy task. */
+	struct task_struct* curr_task;
+};
+
 #ifdef CONFIG_SMP
 
 /*
@@ -591,6 +632,7 @@ struct rq {
 	struct cfs_rq cfs;
 	struct rt_rq rt;
 	struct dl_rq dl;
+	struct e_rq en;
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	/* list of leaf cfs_rq on this cpu: */
@@ -1255,6 +1297,7 @@ static inline void put_prev_task(struct rq *rq, struct task_struct *prev)
 extern const struct sched_class stop_sched_class;
 extern const struct sched_class dl_sched_class;
 extern const struct sched_class rt_sched_class;
+extern const struct sched_class energy_sched_class;
 extern const struct sched_class fair_sched_class;
 extern const struct sched_class idle_sched_class;
 
@@ -1305,6 +1348,7 @@ extern void update_max_interval(void);
 
 extern void init_sched_dl_class(void);
 extern void init_sched_rt_class(void);
+extern void init_sched_energy_class(void);
 extern void init_sched_fair_class(void);
 
 extern void resched_curr(struct rq *rq);
@@ -1709,6 +1753,7 @@ print_numa_stats(struct seq_file *m, int node, unsigned long tsf,
 extern void init_cfs_rq(struct cfs_rq *cfs_rq);
 extern void init_rt_rq(struct rt_rq *rt_rq);
 extern void init_dl_rq(struct dl_rq *dl_rq);
+extern void init_e_rq(struct e_rq *e_rq, unsigned int cpu);
 
 extern void cfs_bandwidth_usage_inc(void);
 extern void cfs_bandwidth_usage_dec(void);

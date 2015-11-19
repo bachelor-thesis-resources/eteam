@@ -1325,6 +1325,20 @@ struct sched_dl_entity {
 	struct hrtimer dl_timer;
 };
 
+struct sched_e_entity {
+	/* Is it queued in the runqueue of the energy sched class. */
+	int on_rq;
+
+	/* The energy task where it belongs to. */
+	struct list_head threads;
+
+	/* Is it running currently on the CPU. */
+	int running;
+
+	/* The CPU runqueue where it is queued. */
+	struct list_head cpu_rq;
+};
+
 union rcu_special {
 	struct {
 		bool blocked;
@@ -1368,6 +1382,7 @@ struct task_struct {
 	struct task_group *sched_task_group;
 #endif
 	struct sched_dl_entity dl;
+	struct sched_e_entity ee;
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	/* list of struct preempt_notifier: */
