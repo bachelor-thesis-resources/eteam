@@ -760,7 +760,8 @@ static void update_local_statistics(struct rq* rq, struct task_struct* t) {
 		return;
 
 	/* Update the maximum runtime. */
-	schedstat_set(t->se.statistics.exec_max, max(t->se.statistics.exec_max, delta_exec));
+	if (delta_exec > t->se.statistics.exec_max)
+		schedstat_set(t->se.statistics.exec_max, delta_exec);
 
 	/* Increase the total runtime of the linux task. */
 	t->se.sum_exec_runtime += delta_exec;
