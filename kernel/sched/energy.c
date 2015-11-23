@@ -1524,6 +1524,10 @@ void switched_from_energy(struct rq* rq, struct task_struct* t) {
 		/* Lower all the other threads belonging to the same task as the
 		 * given linux task. */
 		for_each_thread(task, thread) {
+			if (thread == t) {
+				continue;
+			}
+
 			lower_thread(thread, new_class);
 			dequeue_thread(task_rq(thread), e_task, thread);
 		}
@@ -1562,6 +1566,10 @@ void switched_to_energy(struct rq* rq, struct task_struct* t) {
 		/* Raise all the other threads belonging to the same task as the
 		 * given linux task. */
 		for_each_thread(task, thread) {
+			if (thread == t) {
+				continue;
+			}
+
 			raise_thread(thread);
 			enqueue_thread(task_rq(thread), e_task, thread);
 		}
