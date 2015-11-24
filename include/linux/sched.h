@@ -1327,7 +1327,7 @@ struct sched_dl_entity {
 
 struct sched_e_entity {
 	/* Is it queued in the runqueue of the energy sched class. */
-	int on_rq;
+	int queued;
 
 	/* The energy task where it belongs to. */
 	struct list_head threads;
