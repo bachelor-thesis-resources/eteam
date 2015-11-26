@@ -1789,6 +1789,80 @@ void update_curr_energy(struct rq* rq) {
 	update_local_statistics(rq, rq->curr);
 }
 
+/* Select the CPU where the linux task t should run.
+ *
+ * @t:		the task struct of the linux task for which a new runqueue should be
+ *		selected.
+ * @cpu:	the CPU where it is currently running.
+ * @sd_flags:	scheduler flags such as SD_BALANCE_FORK.
+ * @flags:	other flags like wake_up_flags.
+ *
+ * @returns:	the CPU number where the linux task t should run.
+ */
+int select_task_rq_energy(struct task_struct* t, int cpu, int sd_flags, int flags) {
+	if (t->sched_class == &energy_sched_class) {
+		return leader_cpu();
+	} else {
+		return cpu;
+	}
+}
+
+/* The linux task t is going to be migrated to a new CPU.
+ *
+ * @t:		the task struct of the linux task which is going to be migrated.
+ * @new_cpu:	the new CPU where the linux task will be migrated to.
+ */
+void migrate_task_rq_energy(struct task_struct* t, int new_cpu) {
+	/* This is not important for us. So do nothing here. */
+	return;
+}
+
+/* The linux task t is going to be woken up.
+ *
+ * @t:		the task struct of the linux task which is going to be woken up.
+ */
+void task_waking_energy(struct task_struct* t) {
+	/* This is not important for us. So do nothing here. */
+	return;
+}
+
+/* The linux task t was woken up.
+ *
+ * @rq:		the runqueue where the linux task was woken up.
+ * @t:		the task struct of the linux task which was woken up.
+ */
+void task_woken_energy(struct rq* rq, struct task_struct* t) {
+	/* This is not important for us. So do nothing here. */
+	return;
+}
+
+/* The CPUs where the linux task t is allowed to run changed.
+ *
+ * @t:		the task struct of the linux task which changed its CPUs.
+ * @newmask:	the new CPUs where the linux task is allowed to run.
+ */
+void set_cpus_allowed_energy(struct task_struct* t, const struct cpumask* newmask) {
+	/* TODO: Check if we need to reschedule the corresponding energy task. */
+	return;
+}
+
+/* A CPU was plugged in and became online.
+ *
+ * @rq:		the runqueue of the CPU which just came online.
+ */
+void rq_online_energy(struct rq* rq) {
+	/* Currently runqueues comming online is not interesting for us. */
+	return;
+}
+
+/* A CPU was plugged out and became offline.
+ *
+ * @rq:		the runqueue of the CPU which just came offline.
+ */
+void rq_offline_energy(struct rq* rq) {
+	/* TODO: We must handle this especially for the leader migration. */
+	return;
+}
 
 /***
  * The Energy Scheduling Class. 
@@ -1822,6 +1896,19 @@ const struct sched_class energy_sched_class = {
 	.get_rr_interval = get_rr_interval_energy,
 
 	.update_curr = update_curr_energy,
+
+#ifdef CONFIG_SMP
+	.select_task_rq = select_task_rq_energy,
+	.migrate_task_rq = migrate_task_rq_energy,
+
+	.task_waking = task_waking_energy,
+	.task_woken = task_woken_energy,
+
+	.set_cpus_allowed = set_cpus_allowed_energy,
+
+	.rq_online = rq_online_energy,
+	.rq_offline = rq_offline_energy,
+#endif
 };
 
 /***
