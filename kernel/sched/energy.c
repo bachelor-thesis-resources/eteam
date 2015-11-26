@@ -1411,7 +1411,7 @@ void dequeue_task_energy(struct rq* rq, struct task_struct* t, int flags) {
 
 /* The currently running linux task wants to give up the CPU.
  *
- * @rq:		the current runqueue of the CPU.
+ * @rq:		the runqueue of the current CPU.
  */
 void yield_task_energy(struct rq* rq) {
 	if (rq->en.nr_threads > 2) {
@@ -1422,9 +1422,9 @@ void yield_task_energy(struct rq* rq) {
 	}
 }
 
-/* The current running task wants to give up the CPU to another linux task t.
+/* The current running linux task wants to give up the CPU to another linux task t.
  *
- * @rq:		the current runqueue of the CPU.
+ * @rq:		the runqueue of the current CPU.
  * @t:		the task struct of the linux task which should run next.
  * @preemt:	whether or not preempting of another linux task is allowed.
  *
@@ -1437,7 +1437,7 @@ bool yield_to_task_energy(struct rq* rq, struct task_struct* t, bool preemt) {
 
 /* Preempt the current linux task in favor of the linux task t.
  *
- * @rq:		the current runqueue of the CPU.
+ * @rq:		the runqueue of the current CPU.
  * @t:		the task struct of the linux task which should be run in favor
  *		of the current one.
  * @flags:
@@ -1451,7 +1451,7 @@ void check_preempt_curr_energy(struct rq* rq, struct task_struct* t,
 
 /* Select a new linux task which should run instead of linux task prev.
  *
- * @rq:		the current runqueue of the CPU.
+ * @rq:		the runqueue of the current CPU.
  * @prev:	the task struct of the liunx task which should be replaced.
  *
  * @returns:	the task struct of the linux task which should run next.
@@ -1550,17 +1550,17 @@ struct task_struct* pick_next_task_energy(struct rq* rq,
 	return rq->en.curr;
 }
 
-/* Put a currently running task p back into the runqueue.
+/* Put a currently running linux task t back into the runqueue.
  *
- * @rq:		the current runqueue of the CPU.
- * @p:		the task which should give up the CPU.
+ * @rq:		the runqueue of the current CPU.
+ * @t:		the task struct of the linux task which should give up the CPU.
  */
-void put_prev_task_energy(struct rq* rq, struct task_struct* p) {
-	put_local_task(rq, p);
+void put_prev_task_energy(struct rq* rq, struct task_struct* t) {
+	put_local_task(rq, t);
 }
 
 /*
- * @rq:		the current runqueue of the CPU.
+ * @rq:		the runqueue of the current CPU.
  */
 void set_curr_task_energy(struct rq* rq) {
 	printk(KERN_INFO "[%u]Set curr task %p.\n", smp_processor_id(), rq->curr);
@@ -1568,8 +1568,9 @@ void set_curr_task_energy(struct rq* rq) {
 
 /* A scheduling tick happened with the linux task t running.
  *
- * @rq:		the current runqueue of the CPU.
- * @t:		the task for which the scheduling tick happened.
+ * @rq:		the runqueue of the current CPU.
+ * @t:		the task struct of the linux task for which the scheduling tick
+ *		happened.
  * @queued:	is the task still in a runqueue.
  */
 void task_tick_energy(struct rq* rq, struct task_struct* t, int queued) {
@@ -1665,7 +1666,7 @@ void task_dead_energy(struct task_struct* t) {
 
 /* The scheduling class of the linux task t changed to another one.
  *
- * @rq:		the current runqueue of the CPU.
+ * @rq:		the runqueue of the current CPU.
  * @t:		the linux task which was removed from our scheduling class.
  */
 void switched_from_energy(struct rq* rq, struct task_struct* t) {
@@ -1715,7 +1716,7 @@ void switched_from_energy(struct rq* rq, struct task_struct* t) {
 
 /* The scheduling class of the linux task t changed to this one.
  *
- * @rq:		the current runqueue of the CPU.
+ * @rq:		the runqueue of the current CPU.
  * @t:		the linux task which was added to our scheduling class.
  */
 void switched_to_energy(struct rq* rq, struct task_struct* t) {
@@ -1755,19 +1756,33 @@ void switched_to_energy(struct rq* rq, struct task_struct* t) {
 
 /* The priority of the linux task t changed.
  *
- * @rq:		the current runqueue of the CPU.
+ * @rq:		the runqueue of the current CPU.
  * @t:		the task struct of the linux task for which the priority was changed.
  * @old_prio:	the previous priority of the task.
  */
-void prio_changed_energy(struct rq* rq, struct task_struct* p, int old_prio) {
+void prio_changed_energy(struct rq* rq, struct task_struct* t, int old_prio) {
 	/* Currently we do not care about priority changes. */
 	return;
+}
+
+/* Get the round robin interval for the linux task t.
+ *
+ * This information is important for the POSIX RR-Scheduler.
+ *
+ * @rq:		the runqueue of the current CPU.
+ * @t:		the task struct of the linux task for which the RR interval should
+ *		be returned.
+ *
+ * @returns:	the RR interval for the given linux task.
+ */
+unsigned int get_rr_interval_energy(struct rq* rq, struct task_struct* t) {
+	return sched_slice_local(rq);
 }
 
 /* Update the runtime statistics of the currently running linux task outside
  * of a schedule tick.
  *
- * @rq:		the current runqueue of the CPU.
+ * @rq:		the runqueue of the current CPU.
  */
 void update_curr_energy(struct rq* rq) {
 	/* Update the local statistics. */
@@ -1780,31 +1795,33 @@ void update_curr_energy(struct rq* rq) {
  ***/
 
 const struct sched_class energy_sched_class = {
-    .next = &fair_sched_class,
+	.next = &fair_sched_class,
 
-    .enqueue_task = enqueue_task_energy,
-    .dequeue_task = dequeue_task_energy,
+	.enqueue_task = enqueue_task_energy,
+	.dequeue_task = dequeue_task_energy,
 
-    .yield_task = yield_task_energy,
-    .yield_to_task = yield_to_task_energy,
+	.yield_task = yield_task_energy,
+	.yield_to_task = yield_to_task_energy,
 
-    .check_preempt_curr = check_preempt_curr_energy,
+	.check_preempt_curr = check_preempt_curr_energy,
 
-    .pick_next_task = pick_next_task_energy,
+	.pick_next_task = pick_next_task_energy,
 
-    .put_prev_task = put_prev_task_energy,
+	.put_prev_task = put_prev_task_energy,
 
-    .set_curr_task = set_curr_task_energy,
+	.set_curr_task = set_curr_task_energy,
 
-    .task_tick = task_tick_energy,
-    .task_fork = task_fork_energy,
-    .task_dead = task_dead_energy,
+	.task_tick = task_tick_energy,
+	.task_fork = task_fork_energy,
+	.task_dead = task_dead_energy,
 
-    .switched_from = switched_from_energy,
-    .switched_to = switched_to_energy,
-    .prio_changed = prio_changed_energy,
+	.switched_from = switched_from_energy,
+	.switched_to = switched_to_energy,
+	.prio_changed = prio_changed_energy,
 
-    .update_curr = update_curr_energy,
+	.get_rr_interval = get_rr_interval_energy,
+
+	.update_curr = update_curr_energy,
 };
 
 /***
