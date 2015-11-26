@@ -523,6 +523,8 @@ struct dl_rq {
 #endif
 };
 
+struct energy_task;
+
 struct e_rq {
 	/* Local runqueue lock. */
 	raw_spinlock_t lock;
@@ -535,6 +537,9 @@ struct e_rq {
 
 	/* This is just an energy task reschedule. */
 	int energy_resched;
+
+	/* We need to make an switch to energy scheduling. */
+	int to_energy_resched;
 
 	/* The energy domain which should be measured. */
 	struct cpumask domain;
@@ -550,7 +555,7 @@ struct e_rq {
 	struct task_struct* curr;
 
 	/* The currently running energy task. */
-	struct task_struct* curr_task;
+	struct energy_task* curr_e_task;
 };
 
 #ifdef CONFIG_SMP
