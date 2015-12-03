@@ -529,17 +529,8 @@ struct e_rq {
 	/* Local runqueue lock. */
 	raw_spinlock_t lock;
 
-	/* Is this runqueue the leader of the energy domain. */
-	int leader;
-
-	/* This is just a local reschedule. */
-	int local_resched;
-
-	/* This is just an energy task reschedule. */
-	int energy_resched;
-
-	/* We need to make an switch to energy scheduling. */
-	int to_energy_resched;
+	/* Reschedule flags. */
+	int resched_flags;
 
 	/* The energy domain which should be measured. */
 	struct cpumask domain;
@@ -548,14 +539,14 @@ struct e_rq {
 	struct list_head threads;
 	int nr_threads;
 
-	/* Whether or not the idle task is currently running at this CPU. */
-	int runs_idle;
-
 	/* The currently running linux task. */
 	struct task_struct* curr;
 
 	/* The currently running energy task. */
 	struct energy_task* curr_e_task;
+
+	/* The idle task for this runqueue. */
+	struct task_struct* idle;
 };
 
 #ifdef CONFIG_SMP

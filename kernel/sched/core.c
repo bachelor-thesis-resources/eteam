@@ -2023,8 +2023,7 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 #endif
 	INIT_LIST_HEAD(&p->se.group_node);
 
-	p->ee.queued			= 0;
-	p->ee.running			= 0;
+	p->ee.state			= 0;
 
 #ifdef CONFIG_SCHEDSTATS
 	memset(&p->se.statistics, 0, sizeof(p->se.statistics));

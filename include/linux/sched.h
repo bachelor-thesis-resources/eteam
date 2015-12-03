@@ -1326,14 +1326,11 @@ struct sched_dl_entity {
 };
 
 struct sched_e_entity {
-	/* Is it queued in the runqueue of the energy sched class. */
-	int queued;
+	/* The state of the energy scheduling entity. */
+	unsigned int state;
 
-	/* The energy task where it belongs to. */
-	struct list_head threads;
-
-	/* Is it running currently on the CPU. */
-	int running;
+	/* The energy task runqueue where it is queued. */
+	struct list_head rq;
 
 	/* The CPU runqueue where it is queued. */
 	struct list_head cpu_rq;
