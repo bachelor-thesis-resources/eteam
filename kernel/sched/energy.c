@@ -844,18 +844,20 @@ static void update_energy_statistics(struct energy_task* e_task) {
  */
 static void update_local_statistics(struct rq* rq, struct task_struct* t) {
 	u64 now = rq_clock_task(rq);
-	s64 delta_exec;
+	u64 delta_exec;
+
+	if (unlikely(!t))
+		return;
 
 	/* Calculate how long the linux task has run. */
 	delta_exec = now - t->se.exec_start;
-	t->se.exec_start = now;
-
-	if (unlikely(delta_exec <= 0))
+	if (unlikely((s64)delta_exec <= 0))
 		return;
 
+	t->se.exec_start = now;
+
 	/* Update the maximum runtime. */
-	if (delta_exec > t->se.statistics.exec_max)
-		schedstat_set(t->se.statistics.exec_max, delta_exec);
+	schedstat_set(t->se.statistics.exec_max, max(delta_exec, t->se.statistics.exec_max));
 
 	/* Increase the total runtime of the linux task. */
 	t->se.sum_exec_runtime += delta_exec;
