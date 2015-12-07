@@ -33,8 +33,7 @@ enum {
 
 /* Reschedule states. */
 enum {
-	LOCAL_RESCHED = 0x1,
-	ENERGY_RESCHED = 0x2
+	LOCAL_RESCHED = 0x1
 };
 
 /* The default scheduling slice for one thread. --> 10ms <-- */
@@ -167,10 +166,6 @@ static bool should_redistribute_energy(struct energy_task*,
 		struct task_struct*);
 
 /* Set runqueue bits to perform scheduling operations. */
-static void resched_curr_energy(struct rq*);
-static bool need_resched_curr_energy(struct rq*);
-static void clear_resched_curr_energy(struct rq*);
-
 static void resched_curr_local(struct rq*);
 static bool need_resched_curr_local(struct rq*);
 static void clear_resched_curr_local(struct rq*);
@@ -766,37 +761,6 @@ static inline bool should_redistribute_energy(struct energy_task* e_task,
 	return e_task->running || thread_cpu_running(t);
 }
 
-/* Tell the given runqueue to perform an energy task rescheduling.
- *
- * @rq:		the runqueue which should perform an energy task rescheduling.
- */
-static inline void resched_curr_energy(struct rq* rq) {
-	if (this_rq() == rq)
-		resched_curr(rq);
-	else
-		set_tsk_need_resched(rq->curr);
-
-	rq->en.resched_flags |= ENERGY_RESCHED;
-}
-
-/* Check if we must perform an energy task rescheduling.
- *
- * @rq:		the runqueue of the current CPU.
- *
- * @returns:	whether or not we must reschedule the energy task.
- */
-static inline bool need_resched_curr_energy(struct rq* rq) {
-	return rq->en.resched_flags & ENERGY_RESCHED;
-}
-
-/* Clear the energy task reschedule flag again on the given runqueue.
- *
- * @rq:		the runqueue at which the flag should be cleared.
- */
-static inline void clear_resched_curr_energy(struct rq* rq) {
-	rq->en.resched_flags &= ~ENERGY_RESCHED;
-}
-
 /* Tell the given runqueue to perform a local rescheduling.
  *
  * @rq:		the runqueue which should perform a local rescheduling.
@@ -1059,8 +1023,6 @@ static void clear_energy_task(struct rq* rq, struct energy_task* e_task) {
 	for_each_cpu(cpu, &(e_task->domain)) {
 		clear_local_tasks(cpu_rq(cpu));
 	}
-
-	clear_resched_curr_energy(rq);
 }
 
 /* Clear the locally assigned linux tasks at the given runqueue rq.
@@ -1141,8 +1103,6 @@ static void put_local_task(struct rq* rq, struct task_struct* t) {
  */
 static struct energy_task* pick_next_energy_task(void) {
 	struct energy_task* head = list_first_entry(&(grq.tasks), struct energy_task, rq);
-
-	clear_resched_curr_energy(this_rq());
 
 	/* Go through the whole list by rotating it and try to find an energy task which is
 	 * not running already but has runnable threads. */
