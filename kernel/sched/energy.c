@@ -540,6 +540,7 @@ static void raise_thread(struct task_struct* t, struct energy_task* e_task) {
 
 	/* Lock the task's runqueue if necessary. */
 	if (task_rq(t) != this_rq()) {
+		lockdep_unpin_lock(this_rq()->lock);
 		double_lock_balance(this_rq(), task_rq(t));
 	}
 
@@ -562,6 +563,7 @@ static void raise_thread(struct task_struct* t, struct energy_task* e_task) {
 	/* Unlock the task's runqueue again if necessary. */
 	if (task_rq(t) != this_rq()) {
 		double_unlock_balance(this_rq(), task_rq(t));
+		lockdep_pin_lock(this_rq()->lock);
 	}
 }
 
@@ -585,6 +587,7 @@ static void lower_thread(struct task_struct* t, struct energy_task* e_task,
 
 	/* Lock the task's runqueue if necessary. */
 	if (task_rq(t) != this_rq()) {
+		lockdep_unpin_lock(this_rq()->lock);
 		double_lock_balance(this_rq(), task_rq(t));
 	}
 
@@ -607,6 +610,7 @@ static void lower_thread(struct task_struct* t, struct energy_task* e_task,
 	/* Unlock the task's runqueue again if necessary. */
 	if (task_rq(t) != this_rq()) {
 		double_unlock_balance(this_rq(), task_rq(t));
+		lockdep_pin_lock(this_rq()->lock);
 	}
 }
 
