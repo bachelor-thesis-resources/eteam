@@ -158,7 +158,7 @@ static u64 sched_slice_other(void);
 /* Should we perform a scheduling operation? */
 static bool should_switch_to_energy(struct rq*);
 static bool should_switch_from_energy(struct rq*);
-static bool should_switch_energy(struct rq*);
+static bool should_switch_in_energy(struct rq*);
 static bool should_switch_local(struct rq*);
 
 /* Should we redistribute an energy task again? */
@@ -193,6 +193,10 @@ static void put_local_task(struct rq*, struct task_struct*);
 
 static struct energy_task* pick_next_energy_task(void);
 static struct task_struct* pick_next_local_task(struct rq*);
+
+static void switch_to_energy(struct rq*, struct energy_task*);
+static void switch_from_energy(struct rq*, struct energy_task*);
+static void switch_in_energy(struct rq*, struct energy_task*, struct energy_task*);
 
 /* Initialize the energy domain. */
 static void init_energy_domain(struct cpumask*, unsigned int);
@@ -626,7 +630,7 @@ static inline u64 sched_slice_class(void) {
 static inline u64 sched_slice_energy(struct energy_task* e_task) {
 	/* The energy scheduling slice is simply the class scheduling slice
 	 * distributed equally between the energy tasks. */
-	return e_task->nr_runnable * THREAD_SCHED_SLICE;
+	return e_task == NULL ? 0 :  e_task->nr_runnable * THREAD_SCHED_SLICE;
 }
 
 /* Calculate the time which a thread assigned to CPU should run.
@@ -702,11 +706,15 @@ static inline bool should_switch_from_energy(struct rq* rq) {
  *
  * @returns:	whether we should switch or not.
  */
-static inline bool should_switch_energy(struct rq* rq) {
+static inline bool should_switch_in_energy(struct rq* rq) {
 	if (grq.nr_tasks <= 1) {
 		/* We can only switch between energy tasks if there are more than
 		 * one energy task in the global runqueue.*/
 		return false;
+	} else if (rq->en.curr_e_task == NULL) {
+		/* There is no current energy task any more, but we have other tasks
+		 * available, so switch in any case. */
+		return true;
 	} else {
 		/* Ok, we have more than one energy task. So decide based on the runtime
 		 * of the energy task. */
@@ -732,6 +740,10 @@ static inline bool should_switch_local(struct rq* rq) {
 		/* We can only switch locally if there are more than one thread assigned
 		 * to this runqueue. */
 		return false;
+	} else if (rq->en.curr == NULL) {
+		/* There is no current task any more, but we have other tasks available
+		 * on the CPU, so switch in any case. */
+		return true;
 	} else {
 		/* Ok, we have more than one thread assigned to this runqueue. So decide
 		 * based on how long the thread was running if we should switch to another
@@ -1151,6 +1163,52 @@ static struct task_struct* pick_next_local_task(struct rq* rq) {
 	return next;
 }
 
+/* Switch to the energy scheduling class from another scheduling class.
+ *
+ * @rq:		the runqueue of the current CPU.
+ * @to:		the energy task which we switch to.
+ */
+static void switch_to_energy(struct rq* rq, struct energy_task* to) {
+	if (!to)
+		BUG();
+
+	grq.running = 1;
+	grq.start_running = rq_clock(rq);
+
+	distribute_energy_task(rq, to);
+}
+
+/* Switch from the energy scheduling class to another scheduling class.
+ *
+ * @rq:		the runqueue of the current CPU.
+ * @from:	the energy task which we switch away from.
+ */
+static void switch_from_energy(struct rq* rq, struct energy_task* from) {
+	if (from)
+		put_energy_task(rq, from);
+
+	grq.running = 0;
+	grq.stop_running = rq_clock(rq);
+}
+
+/* Switch from one energy task to another one within the energy scheduling
+ * class.
+ *
+ * @rq:		the runqueue of the current CPU.
+ * @from:	the energy task which we switch away from.
+ * @to:		the energy task which we switch to.
+ */
+static void switch_in_energy(struct rq* rq, struct energy_task* from,
+		struct energy_task* to) {
+	if (from)
+		put_energy_task(rq, from);
+
+	if (!to)
+		BUG();
+
+	distribute_energy_task(rq, to);
+}
+
 /* The idle thread function. */
 static int idle_thread_fn(void* unused) {
 	while (!kthread_should_stop()) {
@@ -1297,40 +1355,15 @@ struct task_struct* pick_next_task_energy(struct rq* rq, struct task_struct* pre
 	lock_grq();
 
 	if (!grq.running) {
-		if (should_switch_to_energy(rq)) {
-			struct energy_task* next_e_task = pick_next_energy_task();
-
-			grq.running = 1;
-			grq.start_running = rq_clock(rq);
-
-			distribute_energy_task(rq, next_e_task);
-		}
+		if (should_switch_to_energy(rq))
+			switch_to_energy(rq, pick_next_energy_task());
 	} else {
 		struct energy_task* curr_e_task = rq->en.curr_e_task;
 
-		if (curr_e_task == NULL) {
-			if (should_switch_from_energy(rq)) {
-				grq.running = 0;
-				grq.stop_running = rq_clock(rq);
-			} else {
-				struct energy_task* next_e_task = pick_next_energy_task();
-
-				distribute_energy_task(rq, next_e_task);
-			}
-		} else {
-			if (should_switch_from_energy(rq)) {
-				grq.running = 0;
-				grq.stop_running = rq_clock(rq);
-
-				put_energy_task(rq, curr_e_task);
-			} else if (should_switch_energy(rq)) {
-				struct energy_task* next_e_task = pick_next_energy_task();
-
-				put_energy_task(rq, curr_e_task);
-
-				distribute_energy_task(rq, next_e_task);
-			}
-		}
+		if (should_switch_from_energy(rq))
+			switch_from_energy(rq, curr_e_task);
+		else if (should_switch_in_energy(rq))
+			switch_in_energy(rq, curr_e_task, pick_next_energy_task());
 	}
 
 	unlock_grq();
@@ -1383,7 +1416,7 @@ void task_tick_energy(struct rq* rq, struct task_struct* t, int queued) {
 
 	lock_grq();
 
-	if (should_switch_energy(rq) || should_switch_from_energy(rq)) {
+	if (should_switch_in_energy(rq) || should_switch_from_energy(rq)) {
 		resched_curr(rq);
 	}
 
