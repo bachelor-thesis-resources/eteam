@@ -459,6 +459,7 @@ static void enqueue_runnable(struct rq* rq, struct energy_task* e_task, struct t
 	grq.nr_threads++;
 
 	/* Remember in the runqueue that there is now a new runnable linux task. */
+	rq->en.nr_assigned++;
 	add_nr_running(rq, 1);
 }
 
@@ -475,8 +476,8 @@ static void enqueue_running(struct rq* rq, struct task_struct* t) {
 		BUG();
 	}
 
-	list_add(&(t->ee.cpu_rq), &(rq->en.threads));
-	rq->en.nr_threads++;
+	list_add(&(t->ee.cpu_rq), &(rq->en.runnable));
+	rq->en.nr_runnable++;
 
 	t->ee.state |= THREAD_CPU_RUNNABLE;
 }
@@ -502,6 +503,7 @@ static void dequeue_runnable(struct energy_task* e_task, struct task_struct* t) 
 	grq.nr_threads--;
 
 	/* Remember in the runqueue that the thread is no longer runnable. */
+	task_rq(t)->en.nr_assigned--;
 	sub_nr_running(task_rq(t), 1);
 }
 
@@ -518,7 +520,7 @@ static void dequeue_running(struct task_struct* t) {
 	}
 
 	list_del(&(t->ee.cpu_rq));
-	task_rq(t)->en.nr_threads--;
+	task_rq(t)->en.nr_runnable--;
 
 	t->ee.state &= ~THREAD_CPU_QUEUED;
 }
@@ -641,8 +643,8 @@ static inline u64 sched_slice_energy(struct energy_task* e_task) {
 static inline u64 sched_slice_local(struct rq* rq) {
 	/* The local scheduling slice is simply the energy scheduling slice
 	 * distributed equally between the threads assigned to one CPU. */
-	return rq->en.nr_threads != 0 ?
-		sched_slice_energy(rq->en.curr_e_task) / rq->en.nr_threads :
+	return rq->en.nr_runnable != 0 ?
+		sched_slice_energy(rq->en.curr_e_task) / rq->en.nr_runnable :
 		sched_slice_energy(rq->en.curr_e_task);
 }
 
@@ -731,7 +733,7 @@ static inline bool should_switch_energy(struct rq* rq) {
  * @returns:	whether we should switch or not.
  */
 static inline bool should_switch_local(struct rq* rq) {
-	if (rq->en.nr_threads <= 1) {
+	if (rq->en.nr_runnable <= 1) {
 		/* We can only switch locally if there are more than one thread assigned
 		 * to this runqueue. */
 		return false;
@@ -882,9 +884,11 @@ static inline void move_local_task(struct task_struct* t, unsigned int cpu) {
 	}
 
 	sub_nr_running(task_rq(t), 1);
+	task_rq(t)->en.nr_assigned--;
 
 	__set_task_cpu(t, cpu);
 
+	task_rq(t)->en.nr_assigned++;
 	add_nr_running(task_rq(t), 1);
 }
 
@@ -934,7 +938,7 @@ static void __distribute_energy_task(struct energy_task* e_task) {
 			struct rq* best_rq = NULL;
 
 			for_each_cpu_and(cpu, &(e_task->domain), &(thread->cpus_allowed)) {
-				int load = cpu_rq(cpu)->en.nr_threads;
+				int load = cpu_rq(cpu)->en.nr_runnable;
 
 				if (load < min_load) {
 					min_load = load;
@@ -1068,11 +1072,11 @@ static void clear_local_tasks(struct rq* rq) {
 	lock_local_rq(rq);
 
 	/* Clear the lits of threads assigned to this CPU. */
-	while (!list_empty(&(rq->en.threads))) {
-		struct task_struct* thread = list_first_entry(&(rq->en.threads), struct task_struct, ee.cpu_rq);
+	while (!list_empty(&(rq->en.runnable))) {
+		struct task_struct* thread = list_first_entry(&(rq->en.runnable), struct task_struct, ee.cpu_rq);
 		dequeue_running(thread);
 	}
-	rq->en.nr_threads = 0;
+	rq->en.nr_runnable = 0;
 
 	/* Reset the pointers to the currently running task and energy task. */
 	rq->en.curr = NULL;
@@ -1168,10 +1172,10 @@ static struct task_struct* pick_next_local_task(struct rq* rq) {
 
 	lock_local_rq(rq);
 
-	if (rq->en.nr_threads != 0) {
+	if (rq->en.nr_runnable != 0) {
 		/* We have available threads on the runqueue, so pick on of them. */
-		next = list_first_entry(&(rq->en.threads), struct task_struct, ee.cpu_rq);
-		list_rotate_left(&(rq->en.threads));
+		next = list_first_entry(&(rq->en.runnable), struct task_struct, ee.cpu_rq);
+		list_rotate_left(&(rq->en.runnable));
 	} else {
 		/* We have no threads to run, so run the idle task. */
 		next = rq->en.idle;
@@ -1286,7 +1290,7 @@ void dequeue_task_energy(struct rq* rq, struct task_struct* t, int flags) {
  * @rq:		the runqueue of the current CPU.
  */
 void yield_task_energy(struct rq* rq) {
-	if (rq->en.nr_threads > 2) {
+	if (rq->en.nr_runnable > 2) {
 		/* Yield in this scheduling class will only work if multiple
 		 * threads of the same task are assigned to the same CPU. If
 		 * this is the case, a local rescheduling is performed. */
@@ -1671,8 +1675,10 @@ void __init init_e_rq(struct e_rq* e_rq, unsigned int cpu) {
 
 	init_energy_domain(&(e_rq->domain), cpu);
 
-	INIT_LIST_HEAD(&(e_rq->threads));
-	e_rq->nr_threads = 0;
+	INIT_LIST_HEAD(&(e_rq->runnable));
+	e_rq->nr_runnable = 0;
+
+	e_rq->nr_assigned = 0;
 
 	e_rq->curr = NULL;
 	e_rq->curr_e_task = NULL;

@@ -536,8 +536,11 @@ struct e_rq {
 	struct cpumask domain;
 
 	/* The threads which should run on this CPU. */
-	struct list_head threads;
-	int nr_threads;
+	struct list_head runnable;
+	int nr_runnable;
+
+	/* The number of threads assigned to this CPU. */
+	int nr_assigned;
 
 	/* The currently running linux task. */
 	struct task_struct* curr;
