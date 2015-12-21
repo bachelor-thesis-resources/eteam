@@ -3,9 +3,9 @@
 #include <linux/cpumask.h>
 #include <linux/list.h>
 #include <linux/slab.h>
-#include <linux/smp.h>
 #include <linux/spinlock.h>
 #include <linux/kthread.h>
+#include <linux/syscalls.h>
 
 #include <linux/sched.h>
 
@@ -16,6 +16,11 @@
 /***
  * Internal constants
  ***/
+
+/* Energy task states. */
+enum {
+	ETASK_RUNNING = 0x1
+};
 
 /* Thread states. */
 enum {
@@ -28,7 +33,7 @@ enum {
 	THREAD_CPU_QUEUED = THREAD_CPU_RUNNABLE,
 
 	/* Thread running states. */
-	THREAD_CPU_RUNNING = 0x4
+	THREAD_RUNNING = 0x4
 };
 
 /* Reschedule states. */
@@ -56,7 +61,7 @@ struct global_rq;
  * enabled. */
 struct energy_task {
 	/* Is it currently running. */
-	int running;
+	int state;
 
 	/* The task struct belonging to the real task. */
 	struct task_struct* task;
@@ -133,8 +138,8 @@ static struct energy_task* create_energy_task(struct task_struct*);
 static void free_energy_task(struct energy_task*);
 
 /* Threads and energy tasks. */
-static bool thread_in_rq_queued(struct task_struct*);
-static bool thread_in_cpu_rq_queued(struct task_struct*);
+static bool thread_on_rq_queued(struct task_struct*);
+static bool thread_on_cpu_rq_queued(struct task_struct*);
 static bool thread_cpu_running(struct task_struct*);
 
 static void enqueue_runnable(struct rq*, struct energy_task*,
@@ -144,11 +149,6 @@ static void dequeue_runnable(struct energy_task*, struct task_struct*);
 static void enqueue_running(struct rq*, struct task_struct*);
 static void dequeue_running(struct task_struct*);
 
-/* Move threads between scheduling classes. */
-static void raise_thread(struct task_struct*, struct energy_task*);
-static void lower_thread(struct task_struct*, struct energy_task*,
-		unsigned int, const struct sched_class*);
-
 /* Determining the scheduling slices. */
 static u64 sched_slice_class(void);
 static u64 sched_slice_energy(struct energy_task*);
@@ -157,6 +157,7 @@ static u64 sched_slice_other(void);
 
 /* Should we perform a scheduling operation? */
 static bool should_switch_to_energy(struct rq*);
+static bool should_check_cpus(void);
 static bool should_switch_from_energy(struct rq*);
 static bool should_switch_in_energy(struct rq*);
 static bool should_switch_local(struct rq*);
@@ -185,7 +186,7 @@ static void redistribute_energy_task(struct rq*, struct energy_task*, bool);
 
 static void move_local_task(struct task_struct*, unsigned int);
 
-static void clear_energy_task(struct rq*, struct energy_task*);
+static void clear_energy_task(struct energy_task*);
 static void clear_local_tasks(struct rq*);
 
 static void put_energy_task(struct rq*, struct energy_task*);
@@ -193,6 +194,9 @@ static void put_local_task(struct rq*, struct task_struct*);
 
 static struct energy_task* pick_next_energy_task(void);
 static struct task_struct* pick_next_local_task(struct rq*);
+
+static void acquire_cpus(struct cpumask*);
+static void release_cpus(struct cpumask*);
 
 static void switch_to_energy(struct rq*, struct energy_task*);
 static void switch_from_energy(struct rq*, struct energy_task*);
@@ -203,6 +207,10 @@ static void init_energy_domain(struct cpumask*, unsigned int);
 
 /* Idle function. */
 static int idle_thread_fn(void*);
+
+/* Switch to and from the energy scheduling class. */
+static int do_start_energy(pid_t pid);
+static int do_stop_energy(pid_t pid);
 
 
 /***
@@ -246,6 +254,111 @@ void set_cpus_allowed_energy(struct task_struct*, const struct cpumask*);
 
 void rq_online_energy(struct rq*);
 void rq_offline_energy(struct rq*);
+
+
+/***
+ * Internal functions which are part of others.
+ ***/
+
+/* Properly increment the number of running tasks on a CPU runqueue.
+ *
+ * Requires that the local runqueue lock is taken.
+ *
+ * @rq:		the runqueue where the number of running tasks should be incremented.
+ */
+static inline void __inc_nr_running(struct rq* rq) {
+	if (!rq->en.blocked) {
+		add_nr_running(rq, 1);
+	}
+
+	rq->en.nr_assigned++;
+}
+
+/* Properly decrement the number of running tasks on a CPU runqueue.
+ *
+ * Requires that the local runqueue lock is taken.
+ *
+ * @rq:		the runqueue where the number of running tasks should be decremented.
+ */
+static inline void __dec_nr_running(struct rq* rq) {
+	if (!rq->en.blocked) {
+		sub_nr_running(rq, 1);
+	}
+
+	rq->en.nr_assigned--;
+}
+
+static void __distribute_energy_task(struct energy_task* e_task) {
+	struct task_struct* thread;
+	int cpu;
+
+	/* Distribute all runnable threads belonging to the current energy task
+	 * on the available CPUs in the energy domain. */
+	list_for_each_entry(thread, &(e_task->runnable), ee.rq) {
+		if (thread_on_cpu_rq_queued(thread)) {
+			/* This thread is already assigned to a CPU runqueue. No
+			 * need to do this again. */
+			continue;
+		} else {
+			/* Find the CPU where the thread can run and which has the lowest
+			 * load. Start with the one where the thread is already assigned to. */
+			struct rq* best_rq = task_rq(thread);
+			int min_load = best_rq->en.nr_runnable;
+
+			for_each_cpu_and(cpu, &(e_task->domain), &(thread->cpus_allowed)) {
+				int load = cpu_rq(cpu)->en.nr_runnable;
+
+				if (load < min_load) {
+					min_load = load;
+					best_rq = cpu_rq(cpu);
+				}
+			}
+
+			distribute_local_task(best_rq, thread);
+		}
+	}
+
+	/* Set on all runqueues that the current energy task is running. */
+	for_each_cpu(cpu, &(e_task->domain)) {
+		struct rq* c_rq = cpu_rq(cpu);
+		set_energy_task(c_rq, e_task);
+
+		resched_curr_local(c_rq);
+	}
+
+}
+
+static inline void __acquire_cpu(struct rq* rq) {
+	lock_local_rq(rq);
+
+	rq->en.blocked = false;
+	add_nr_running(rq, rq->en.nr_assigned);
+
+	unlock_local_rq(rq);
+}
+
+static inline void __release_cpu(struct rq* rq) {
+	lock_local_rq(rq);
+
+	rq->en.blocked = true;
+	sub_nr_running(rq, rq->en.nr_assigned);
+
+	unlock_local_rq(rq);
+}
+
+static inline void __switch_from_energy(struct rq* rq) {
+	release_cpus(&(rq->en.domain));
+
+	grq.running = 0;
+	grq.stop_running = rq_clock(rq);
+}
+
+static inline void __switch_to_energy(struct rq* rq) {
+	grq.running = 1;
+	grq.start_running = rq_clock(rq);
+
+	acquire_cpus(&(rq->en.domain));
+}
 
 
 /***
@@ -310,7 +423,7 @@ static struct task_struct* find_task(struct task_struct* t) {
  *		initialized.
  */
 static void init_energy_task(struct energy_task* e_task) {
-	e_task->running = 0;
+	e_task->state = 0;
 
 	e_task->task = NULL;
 
@@ -412,7 +525,7 @@ static void free_energy_task(struct energy_task* e_task) {
  *
  * @returns:	whether or not the thread is queued in the runqueue or not.
  */
-static inline bool thread_in_rq_queued(struct task_struct* t) {
+static inline bool thread_on_rq_queued(struct task_struct* t) {
 	return t->ee.state & THREAD_RQ_QUEUED;
 }
 
@@ -422,7 +535,7 @@ static inline bool thread_in_rq_queued(struct task_struct* t) {
  *
  * @returns:	whether or not the thread is queued in the CPU runqueue or not.
  */
-static inline bool thread_in_cpu_rq_queued(struct task_struct* t) {
+static inline bool thread_on_cpu_rq_queued(struct task_struct* t) {
 	return t->ee.state & THREAD_CPU_QUEUED;
 }
 
@@ -433,7 +546,7 @@ static inline bool thread_in_cpu_rq_queued(struct task_struct* t) {
  * @returns:	whether or not the thread is currently running on a CPU.
  */
 static inline bool thread_cpu_running(struct task_struct* t) {
-	return t->ee.state & THREAD_CPU_RUNNING;
+	return t->ee.state & THREAD_RUNNING;
 }
 
 /* Enqueue a thread into the list of running threads of the energy task.
@@ -444,7 +557,7 @@ static inline bool thread_cpu_running(struct task_struct* t) {
  * @t:		the task struct of the thread which should be enqueued.
  */
 static void enqueue_runnable(struct rq* rq, struct energy_task* e_task, struct task_struct* t) {
-	if (thread_in_rq_queued(t)) {
+	if (thread_on_rq_queued(t)) {
 		/* This thread is already enqueued in the runqueue. */
 		BUG();
 	}
@@ -458,8 +571,9 @@ static void enqueue_runnable(struct rq* rq, struct energy_task* e_task, struct t
 	grq.nr_threads++;
 
 	/* Remember in the runqueue that there is now a new runnable linux task. */
-	rq->en.nr_assigned++;
-	add_nr_running(rq, 1);
+	lock_local_rq(rq);
+	__inc_nr_running(rq);
+	unlock_local_rq(rq);
 }
 
 /* Enqueue a thread into the list of running threads of a CPU.
@@ -470,7 +584,7 @@ static void enqueue_runnable(struct rq* rq, struct energy_task* e_task, struct t
  * @t:		the task struct fo the thread which should be enqueued.
  */
 static void enqueue_running(struct rq* rq, struct task_struct* t) {
-	if (thread_in_cpu_rq_queued(t)) {
+	if (thread_on_cpu_rq_queued(t)) {
 		/* The thread is already enqueued in the runqueue. */
 		BUG();
 	}
@@ -488,7 +602,7 @@ static void enqueue_running(struct rq* rq, struct task_struct* t) {
  * @t:		the task struct of the thread which should be dequeued.
  */
 static void dequeue_runnable(struct energy_task* e_task, struct task_struct* t) {
-	if (!thread_in_rq_queued(t)) {
+	if (!thread_on_rq_queued(t)) {
 		/* This thread is not enqueued in the runqueue. */
 		BUG();
 	}
@@ -502,8 +616,9 @@ static void dequeue_runnable(struct energy_task* e_task, struct task_struct* t) 
 	grq.nr_threads--;
 
 	/* Remember in the runqueue that the thread is no longer runnable. */
-	task_rq(t)->en.nr_assigned--;
-	sub_nr_running(task_rq(t), 1);
+	lock_local_rq(task_rq(t));
+	__dec_nr_running(task_rq(t));
+	unlock_local_rq(task_rq(t));
 }
 
 /* Dequeue a thread from the list of running threads on a CPU runqueue.
@@ -513,7 +628,7 @@ static void dequeue_runnable(struct energy_task* e_task, struct task_struct* t) 
  * @t:		the task struct of the thread which should be dequeued.
  */
 static void dequeue_running(struct task_struct* t) {
-	if (!thread_in_cpu_rq_queued(t)) {
+	if (!thread_on_cpu_rq_queued(t)) {
 		/* This thread is not enqueued in the runqueue. */
 		BUG();
 	}
@@ -522,97 +637,6 @@ static void dequeue_running(struct task_struct* t) {
 	task_rq(t)->en.nr_runnable--;
 
 	t->ee.state &= ~THREAD_CPU_QUEUED;
-}
-
-/* Raise a thread from a different scheduling class into the energy scheduling class.
- *
- * @t:		the task struct of the thread which should be raised into the energy
- *		scheduling class.
- * @e_task:	the energy task to which the thread belongs.
- */
-static void raise_thread(struct task_struct* t, struct energy_task* e_task) {
-	int running, queued;
-
-	if (t->sched_class == &energy_sched_class) {
-		/* Nothing to do here, this thread is already part of our scheduling
-		 * class. */
-		return;
-	}
-
-	/* Lock the task's runqueue if necessary. */
-	if (task_rq(t) != this_rq()) {
-		lockdep_unpin_lock(&(this_rq()->lock));
-		double_lock_balance(this_rq(), task_rq(t));
-	}
-
-	running = task_current(task_rq(t), t);
-	queued = task_on_rq_queued(t);
-
-	if (queued)
-		t->sched_class->dequeue_task(task_rq(t), t, 0);
-	if (running)
-		t->sched_class->put_prev_task(task_rq(t), t);
-
-	t->sched_class = &energy_sched_class;
-	t->policy = SCHED_ENERGY;
-
-	if (running)
-		set_curr_task_energy(task_rq(t));
-	if (queued)
-		enqueue_runnable(task_rq(t), e_task, t);
-
-	/* Unlock the task's runqueue again if necessary. */
-	if (task_rq(t) != this_rq()) {
-		double_unlock_balance(this_rq(), task_rq(t));
-		lockdep_pin_lock(&(this_rq()->lock));
-	}
-}
-
-/* Lower a thread from the energy scheduling class into a different scheduling class.
- *
- * @t:		the task struct of the thread which should be lowered into a different
- *		scheduling class.
- * @e_task:	the energy task to which the thread belongs.
- * @policy:	the policy of the new scheduling class.
- * @class:	the new scheduling class.
- */
-static void lower_thread(struct task_struct* t, struct energy_task* e_task,
-		unsigned int policy, const struct sched_class* class) {
-	int running, queued;
-
-	if (t->sched_class != &energy_sched_class) {
-		/* Nothing to do here, this thread is not part anymore of the energy
-		 * scheduling class. */
-		return;
-	}
-
-	/* Lock the task's runqueue if necessary. */
-	if (task_rq(t) != this_rq()) {
-		lockdep_unpin_lock(&(this_rq()->lock));
-		double_lock_balance(this_rq(), task_rq(t));
-	}
-
-	running = task_current(task_rq(t), t);
-	queued = task_on_rq_queued(t);
-
-	if (queued)
-		dequeue_runnable(e_task, t);
-	if (running)
-		put_prev_task_energy(task_rq(t), t);
-
-	t->sched_class = class;
-	t->policy = policy;
-
-	if (running)
-		t->sched_class->set_curr_task(task_rq(t));
-	if (queued)
-		t->sched_class->enqueue_task(task_rq(t), t, 0);
-
-	/* Unlock the task's runqueue again if necessary. */
-	if (task_rq(t) != this_rq()) {
-		double_unlock_balance(this_rq(), task_rq(t));
-		lockdep_pin_lock(&(this_rq()->lock));
-	}
 }
 
 /* Calculate the time which the energy scheduling class should run.
@@ -630,7 +654,9 @@ static inline u64 sched_slice_class(void) {
 static inline u64 sched_slice_energy(struct energy_task* e_task) {
 	/* The energy scheduling slice is simply the class scheduling slice
 	 * distributed equally between the energy tasks. */
-	return e_task == NULL ? 0 :  e_task->nr_runnable * THREAD_SCHED_SLICE;
+	return e_task == NULL ?
+		0 :
+		e_task->nr_runnable * THREAD_SCHED_SLICE;
 }
 
 /* Calculate the time which a thread assigned to CPU should run.
@@ -642,9 +668,9 @@ static inline u64 sched_slice_energy(struct energy_task* e_task) {
 static inline u64 sched_slice_local(struct rq* rq) {
 	/* The local scheduling slice is simply the energy scheduling slice
 	 * distributed equally between the threads assigned to one CPU. */
-	return rq->en.nr_runnable != 0 ?
-		sched_slice_energy(rq->en.curr_e_task) / rq->en.nr_runnable :
-		sched_slice_energy(rq->en.curr_e_task);
+	return rq->en.nr_runnable == 0 ?
+		sched_slice_energy(rq->en.curr_e_task) :
+		sched_slice_energy(rq->en.curr_e_task) / rq->en.nr_runnable;
 }
 
 /* Calculate the time which other scheduling classes should run.
@@ -668,12 +694,23 @@ static inline bool should_switch_to_energy(struct rq* rq) {
 	} else if (nr_running() == grq.nr_threads) {
 		/* There are only threads of energy tasks in the system. */
 		return true;
+	} else if (nr_running() == rq->en.nr_assigned) {
+		/* All other runqueues run the idle thread in this runqueue only has
+		 * threads from energy tasks. */
+		return true;
+	} else if (nr_running() == 0) {
+		/* Everyone runs the idle thread, but there are energy tasks available. */
+		return true;
 	} else {
 		u64 now = rq_clock(rq);
 		u64 not_running = now <= grq.stop_running ? 0 : now - grq.stop_running;
 
 		return not_running > sched_slice_other();
 	}
+}
+
+static inline bool should_check_cpus(void) {
+	return grq.nr_tasks != 0;
 }
 
 /* Decide if we should switch away from the energy scheduling class to another
@@ -764,13 +801,12 @@ static inline bool should_switch_local(struct rq* rq) {
  *		redistributed.
  * @t:		the task struct of the thread of the energy task which changed its
  *		state.
- * @arrived:	whether or not the thread was added or removed from the runqueue.
  *
  * @retruns:	whether or not it is necessary to redistribute the enregy task.
  */
 static inline bool should_redistribute_energy(struct energy_task* e_task,
 		struct task_struct* t) {
-	return e_task->running || thread_cpu_running(t);
+	return e_task->state == ETASK_RUNNING || thread_cpu_running(t);
 }
 
 /* Tell the given runqueue to perform a local rescheduling.
@@ -778,12 +814,9 @@ static inline bool should_redistribute_energy(struct energy_task* e_task,
  * @rq:		the runqueue which should perform a local rescheduling.
  */
 static inline void resched_curr_local(struct rq* rq) {
-	if (this_rq() == rq)
-		resched_curr(rq);
-	else
-		set_tsk_need_resched(rq->curr);
-
 	rq->en.resched_flags |= LOCAL_RESCHED;
+
+	set_tsk_need_resched(rq->curr);
 }
 
 /* Check if we must perform a local rescheduling.
@@ -861,13 +894,15 @@ static inline void move_local_task(struct task_struct* t, unsigned int cpu) {
 		return;
 	}
 
-	sub_nr_running(task_rq(t), 1);
-	task_rq(t)->en.nr_assigned--;
+	lock_local_rq(task_rq(t));
+	__dec_nr_running(task_rq(t));
+	unlock_local_rq(task_rq(t));
 
 	__set_task_cpu(t, cpu);
 
-	task_rq(t)->en.nr_assigned++;
-	add_nr_running(task_rq(t), 1);
+	lock_local_rq(task_rq(t));
+	__inc_nr_running(task_rq(t));
+	unlock_local_rq(task_rq(t));
 }
 
 /* Set on the given runqueue that the given energy task is now running there.
@@ -891,57 +926,11 @@ static void set_energy_task(struct rq* rq, struct energy_task* e_task) {
  * @t:		the task struct of the thread which should run next.
  */
 static inline void set_local_task(struct rq* rq, struct task_struct* t) {
-	t->ee.state |= THREAD_CPU_RUNNING;
+	t->ee.state |= THREAD_RUNNING;
 	rq->en.curr = t;
 
 	t->se.exec_start = rq_clock_task(rq);
 	t->se.prev_sum_exec_runtime = t->se.sum_exec_runtime;
-}
-
-static void __distribute_energy_task(struct energy_task* e_task) {
-	struct task_struct* thread;
-	int cpu;
-
-	/* Distribute all runnable threads belonging to the current energy task
-	 * on the available CPUs in the energy domain. */
-	list_for_each_entry(thread, &(e_task->runnable), ee.rq) {
-		if (thread_in_cpu_rq_queued(thread)) {
-			/* This thread is already assigned to a CPU runqueue. No
-			 * need to do this again. */
-			continue;
-		} else {
-			/* Find the CPU where the thread can run and which has the lowest
-			 * load. */
-			int min_load = INT_MAX;
-			struct rq* best_rq = NULL;
-
-			for_each_cpu_and(cpu, &(e_task->domain), &(thread->cpus_allowed)) {
-				int load = cpu_rq(cpu)->en.nr_runnable;
-
-				if (load < min_load) {
-					min_load = load;
-					best_rq = cpu_rq(cpu);
-				}
-			}
-
-			if (best_rq == NULL) {
-				/* We could not find any CPU suited for the thread. Assign it to
-				 * the first one in our energy domain. */
-				best_rq = cpu_rq(cpumask_first(&(e_task->domain)));
-			}
-
-			distribute_local_task(best_rq, thread);
-		}
-	}
-
-	/* Set on all runqueues that the current energy task is running. */
-	for_each_cpu(cpu, &(e_task->domain)) {
-		struct rq* c_rq = cpu_rq(cpu);
-		set_energy_task(c_rq, e_task);
-
-		resched_curr_local(c_rq);
-	}
-
 }
 
 /* Tell all CPUs belonging to the current energy domain, that a new energy
@@ -954,7 +943,7 @@ static void __distribute_energy_task(struct energy_task* e_task) {
  */
 static void distribute_energy_task(struct rq* rq, struct energy_task* e_task) {
 	/* Mark the energy task running. */
-	e_task->running = 1;
+	e_task->state = ETASK_RUNNING;
 	e_task->start_running = rq_clock(rq);
 
 	/* Copy the current energy domain. */
@@ -972,10 +961,10 @@ static void distribute_energy_task(struct rq* rq, struct energy_task* e_task) {
 static void distribute_local_task(struct rq* rq, struct task_struct* t) {
 	clear_resched_curr_local(rq);
 
-	lock_local_rq(rq);
-
 	/* Update the CPU assigned to the local task. */
 	move_local_task(t, cpu_of(rq));
+
+	lock_local_rq(rq);
 
 	/* Enqueue in the local runqueue. */
 	enqueue_running(rq, t);
@@ -989,18 +978,17 @@ static void distribute_local_task(struct rq* rq, struct task_struct* t) {
  *
  * @rq:		the runqueue of the current CPU.
  * @e_task:	the energy task struct of the energy task which should be redistributed.
+ * @arrived:	whether the energy task has new threads or some if its threads vanished.
  */
 static void redistribute_energy_task(struct rq* rq, struct energy_task* e_task, bool arrived) {
 	if (arrived) {
 		if (!grq.running) {
-			/* The scheduling class is not running yet. Switch to it. */
-			grq.running = 1;
-			grq.start_running = rq_clock(rq);
+			__switch_to_energy(rq);
 		}
 
-		if (!e_task->running) {
-			/* The energy task is not running yet. Switch to it. */
-			distribute_energy_task(rq, e_task);
+		if (e_task->state != ETASK_RUNNING) {
+			/* Make an internal switch. */
+			switch_in_energy(rq, rq->en.curr_e_task, e_task);
 		} else {
 			/* The energy task is already running, so just redistribute it. */
 			__distribute_energy_task(e_task);
@@ -1014,10 +1002,7 @@ static void redistribute_energy_task(struct rq* rq, struct energy_task* e_task, 
 			put_energy_task(rq, e_task);
 
 			if (grq.nr_tasks == 0 ) {
-				/* This was the last task of the scheduling class, so we have to switch
-				 * back to the other scheduling classes. */
-				grq.running = 0;
-				grq.stop_running = rq_clock(rq);
+				__switch_from_energy(rq);
 			}
 		}
 	}
@@ -1026,10 +1011,9 @@ static void redistribute_energy_task(struct rq* rq, struct energy_task* e_task, 
 /* Tell all CPUs belonging to the current energy domain, that the energy
  * task is not going to run any more.
  *
- * @rq:		the runqueue of the current CPU.
  * @e_task:	the energy task which is going to stop.
  */
-static void clear_energy_task(struct rq* rq, struct energy_task* e_task) {
+static void clear_energy_task(struct energy_task* e_task) {
 	int cpu;
 
 	for_each_cpu(cpu, &(e_task->domain)) {
@@ -1075,11 +1059,11 @@ static void put_energy_task(struct rq* rq, struct energy_task* e_task) {
 	/* Update the energy task's statistics. */
 	update_energy_statistics(e_task);
 
-	/* Tell all CPU's to stop executing the threads of the current
+	/* Tell all CPUs to stop executing the threads of the current
 	 * energy task. */
-	clear_energy_task(rq, e_task);
+	clear_energy_task(e_task);
 
-	e_task->running = 0;
+	e_task->state = 0;
 
 	cpumask_clear(&(e_task->domain));
 
@@ -1096,12 +1080,11 @@ static void put_energy_task(struct rq* rq, struct energy_task* e_task) {
  *		any more.
  */
 static void put_local_task(struct rq* rq, struct task_struct* t) {
-	update_local_statistics(rq, t);
-
 	lock_local_rq(rq);
 
-	t->ee.state &= ~THREAD_CPU_RUNNING;
+	update_local_statistics(rq, t);
 
+	t->ee.state &= ~THREAD_RUNNING;
 	rq->en.curr = NULL;
 
 	unlock_local_rq(rq);
@@ -1123,9 +1106,8 @@ static struct energy_task* pick_next_energy_task(void) {
 				struct energy_task, rq);
 		list_rotate_left(&(grq.tasks));
 
-		if ((next_e_task->running == 0) && (next_e_task->nr_runnable != 0)) {
+		if ((next_e_task->state == 0) && (next_e_task->nr_runnable != 0)) {
 			/* We have found our next energy task. */
-
 			return next_e_task;
 		}
 	} while (head != list_first_entry(&(grq.tasks), struct energy_task, rq));
@@ -1147,7 +1129,7 @@ static struct task_struct* pick_next_local_task(struct rq* rq) {
 	lock_local_rq(rq);
 
 	if (rq->en.nr_runnable != 0) {
-		/* We have available threads on the runqueue, so pick on of them. */
+		/* We have threads available on the runqueue, so pick on of them. */
 		next = list_first_entry(&(rq->en.runnable), struct task_struct, ee.cpu_rq);
 		list_rotate_left(&(rq->en.runnable));
 	} else {
@@ -1163,19 +1145,55 @@ static struct task_struct* pick_next_local_task(struct rq* rq) {
 	return next;
 }
 
+static void acquire_cpus(struct cpumask* domain) {
+	unsigned int cpu;
+
+	for_each_cpu(cpu, domain) {
+		struct rq* c_rq = cpu_rq(cpu);
+
+		if (c_rq->en.blocked) {
+			__acquire_cpu(c_rq);
+		}
+	}
+ }
+
+static void release_cpus(struct cpumask* domain) {
+	unsigned int cpu;
+
+	for_each_cpu(cpu, domain) {
+		struct rq* c_rq = cpu_rq(cpu);
+
+		if (!c_rq->en.blocked && c_rq->nr_running == c_rq->en.nr_assigned) {
+			__release_cpu(c_rq);
+		}
+	}
+}
+
+static void check_cpus(struct cpumask* domain) {
+	unsigned int cpu;
+
+	for_each_cpu(cpu, domain) {
+		struct rq* c_rq = cpu_rq(cpu);
+
+		if (c_rq->en.blocked && c_rq->nr_running > 0) {
+			__acquire_cpu(c_rq);
+		} else if (!c_rq->en.blocked && c_rq->nr_running == c_rq->en.nr_assigned) {
+			__release_cpu(c_rq);
+		}
+	}
+}
+
 /* Switch to the energy scheduling class from another scheduling class.
  *
  * @rq:		the runqueue of the current CPU.
  * @to:		the energy task which we switch to.
  */
 static void switch_to_energy(struct rq* rq, struct energy_task* to) {
-	if (!to)
-		BUG();
+	if (to) {
+		__switch_to_energy(rq);
 
-	grq.running = 1;
-	grq.start_running = rq_clock(rq);
-
-	distribute_energy_task(rq, to);
+		distribute_energy_task(rq, to);
+	}
 }
 
 /* Switch from the energy scheduling class to another scheduling class.
@@ -1184,11 +1202,11 @@ static void switch_to_energy(struct rq* rq, struct energy_task* to) {
  * @from:	the energy task which we switch away from.
  */
 static void switch_from_energy(struct rq* rq, struct energy_task* from) {
-	if (from)
+	if (from) {
 		put_energy_task(rq, from);
+	}
 
-	grq.running = 0;
-	grq.stop_running = rq_clock(rq);
+	__switch_from_energy(rq);
 }
 
 /* Switch from one energy task to another one within the energy scheduling
@@ -1203,10 +1221,19 @@ static void switch_in_energy(struct rq* rq, struct energy_task* from,
 	if (from)
 		put_energy_task(rq, from);
 
-	if (!to)
-		BUG();
+	if (to)
+		distribute_energy_task(rq, to);
+}
 
-	distribute_energy_task(rq, to);
+/* Set and initialize the energy domain of a given CPU.
+ *
+ * @domain:	the pointer to the cpumask where the energy domain should be
+ *		set.
+ * @cpu:	the CPU for which we need to initialize the energy domain.
+ */
+static void init_energy_domain(struct cpumask* domain, unsigned int cpu) {
+	/* TODO: Really find the energy domain of the current CPU. */
+	cpumask_setall(domain);
 }
 
 /* The idle thread function. */
@@ -1221,17 +1248,79 @@ static int idle_thread_fn(void* unused) {
 	return 0;
 }
 
-/* Set and initialize the energy domain of a given CPU.
+/* Start managing a linux task in our scheduling class.
  *
- * @domain:	the pointer to the cpumask where the energy domain should be
- *		set.
- * @cpu:	the CPU for which we need to initialize the energy domain.
+ * @pid:	the pid of the linux task which should be managed now.
+ *
+ * @returns:	0 on success or -ERROR on an error.
  */
-static void init_energy_domain(struct cpumask* domain, unsigned int cpu) {
-	/* TODO: Really find the energy domain of the current CPU. */
-	cpumask_setall(domain);
+static int do_start_energy(pid_t pid) {
+	struct task_struct* p;
+	int ret;
+
+	if (pid < 0) {
+		return -EINVAL;
+	}
+
+	ret = -ESRCH;
+	p = pid == 0 ? current : find_task_by_vpid(pid);
+
+	if (p) {
+		/* Determine the actual task to the linux task and insert all its threads
+		 * into the energy scheduling class. */
+		struct task_struct* task = find_task(p);
+		struct task_struct* thread;
+
+		printk(KERN_INFO "Start energy for %d.\n", task->pid);
+
+		for_each_thread(task, thread) {
+			struct sched_param param = { .sched_priority = 0 };
+
+			printk(KERN_INFO "Move %d to energy.\n", thread->pid);
+
+			ret = sched_setscheduler_nocheck(thread, SCHED_ENERGY, &param);
+		}
+	}
+
+	return ret;
 }
 
+/* Stop managing a linux task in our scheduling class.
+ *
+ * @pid:	the pid of the linux task which should no longer be managed.
+ *
+ * @returns:	0 on success or -ERROR on an error.
+ */
+static int do_stop_energy(pid_t pid) {
+	struct task_struct* p;
+	int ret;
+
+	if (pid < 0) {
+		return -EINVAL;
+	}
+
+	ret = -ESRCH;
+	p = pid == 0 ? current : find_task_by_vpid(pid);
+
+	if (p) {
+		/* Determine the actual task to the linux task and remove all its threads
+		 * from the energy scheduling class. */
+		struct task_struct* task = find_task(p);
+		struct task_struct* thread;
+
+		printk(KERN_INFO "Stop energy for %d.\n", task->pid);
+
+		for_each_thread(task, thread) {
+			struct sched_param param = { .sched_priority = 0 };
+
+			printk(KERN_INFO "Move %d from energy.\n", thread->pid);
+
+			ret = sched_setscheduler_nocheck(thread, SCHED_NORMAL, &param);
+		}
+	}
+
+	return ret;
+}
 
 /***
  * External function definitions.
@@ -1287,7 +1376,7 @@ void dequeue_task_energy(struct rq* rq, struct task_struct* t, int flags) {
 	}
 
 	/* Remove the thread from the CPU runqueue. */
-	if (thread_in_cpu_rq_queued(t)) {
+	if (thread_on_cpu_rq_queued(t)) {
 		lock_local_rq(task_rq(t));
 
 		dequeue_running(t);
@@ -1357,6 +1446,8 @@ struct task_struct* pick_next_task_energy(struct rq* rq, struct task_struct* pre
 	if (!grq.running) {
 		if (should_switch_to_energy(rq))
 			switch_to_energy(rq, pick_next_energy_task());
+		else if (should_check_cpus())
+			check_cpus(&(rq->en.domain));
 	} else {
 		struct energy_task* curr_e_task = rq->en.curr_e_task;
 
@@ -1379,7 +1470,7 @@ struct task_struct* pick_next_task_energy(struct rq* rq, struct task_struct* pre
 	return rq->en.curr;
 }
 
-/* Put a currently running linux task t back into the runqueue.
+/* Tell the scheduling class that the linux task t is going to lose its CPU share.
  *
  * @rq:		the runqueue of the current CPU.
  * @t:		the task struct of the linux task which should give up the CPU.
@@ -1388,7 +1479,8 @@ void put_prev_task_energy(struct rq* rq, struct task_struct* t) {
 	put_local_task(rq, t);
 }
 
-/*
+/* Tell the scheduling class, that the currently running task will continue running.
+ *
  * @rq:		the runqueue of the current CPU.
  */
 void set_curr_task_energy(struct rq* rq) {
@@ -1396,7 +1488,7 @@ void set_curr_task_energy(struct rq* rq) {
 
 	lock_local_rq(rq);
 
-	if (!thread_in_rq_queued(curr)) {
+	if (!thread_on_rq_queued(curr)) {
 		enqueue_running(rq, curr);
 	}
 	set_local_task(rq, curr);
@@ -1455,24 +1547,8 @@ void task_dead_energy(struct task_struct* t) {
  * @t:		the linux task which was removed from our scheduling class.
  */
 void switched_from_energy(struct rq* rq, struct task_struct* t) {
-	struct energy_task* e_task;
-	struct task_struct* thread;
-
-	lock_grq();
-
-	e_task = find_energy_task(t);
-
-	if (e_task) {
-		for_each_thread(e_task->task, thread) {
-			lower_thread(thread, e_task, t->policy, t->sched_class);
-		}
-
-		if (e_task->running) {
-			redistribute_energy_task(rq, e_task, false);
-		}
-	}
-
-	unlock_grq();
+	/* We have nothing to do here currently. */
+	return;
 }
 
 /* The scheduling class of the linux task t changed to this one.
@@ -1481,24 +1557,8 @@ void switched_from_energy(struct rq* rq, struct task_struct* t) {
  * @t:		the linux task which was added to our scheduling class.
  */
 void switched_to_energy(struct rq* rq, struct task_struct* t) {
-	struct energy_task* e_task;
-	struct task_struct* thread;
-
-	lock_grq();
-
-	e_task = find_energy_task(t);
-
-	if (e_task) {
-		for_each_thread(e_task->task, thread) {
-			raise_thread(thread, e_task);
-		}
-
-		if (e_task->running) {
-			redistribute_energy_task(rq, e_task, true);
-		}
-	}
-
-	unlock_grq();
+	/* We have nothing to do here currently. */
+	return;
 }
 
 /* The priority of the linux task t changed.
@@ -1593,7 +1653,7 @@ void set_cpus_allowed_energy(struct task_struct* t, const struct cpumask* newmas
  * @rq:		the runqueue of the CPU which just came online.
  */
 void rq_online_energy(struct rq* rq) {
-	/* TODO: Check if we need can reschedule the current energy task. */
+	/* TODO: Check if we can reschedule the current energy task. */
 	return;
 }
 
@@ -1602,7 +1662,7 @@ void rq_online_energy(struct rq* rq) {
  * @rq:		the runqueue of the CPU which just came offline.
  */
 void rq_offline_energy(struct rq* rq) {
-	/* TODO: Handle this properly. */
+	/* TODO: Check if we need to reschedule the current energy task. */
 	return;
 }
 
@@ -1675,12 +1735,15 @@ void __init init_e_rq(struct e_rq* e_rq, unsigned int cpu) {
 
 	e_rq->nr_assigned = 0;
 
+	e_rq->blocked = false;
+
 	e_rq->curr = NULL;
 	e_rq->curr_e_task = NULL;
 
 	e_rq->idle = NULL;
 }
 
+/* Initialize the idle threads for each available runqueue. */
 int __init init_e_idle_threads(void) {
 	int cpu;
 
@@ -1708,4 +1771,26 @@ late_initcall(init_e_idle_threads);
 /* Initialize the energy scheduling class. */
 void __init init_sched_energy_class(void) {
 	init_grq();
+}
+
+/* The system call to start energy measurements.
+ *
+ * @pid:	the pid of the linux task which should be measured.
+ *
+ * @returns:	0 on success or -ERROR on an error.
+ */
+SYSCALL_DEFINE1(start_energy, pid_t, pid) {
+	return do_start_energy(pid);
+}
+
+
+/* The system call to stop energy measurements.
+ *
+ * @pid:	the pid of the linux task which should not be measured
+ *		any more.
+ *
+ * @returns:	0 on success or -ERROR on an error.
+ */
+SYSCALL_DEFINE1(stop_energy, pid_t, pid) {
+	return do_stop_energy(pid);
 }

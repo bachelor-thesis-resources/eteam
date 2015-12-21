@@ -542,6 +542,9 @@ struct e_rq {
 	/* The number of threads assigned to this CPU. */
 	int nr_assigned;
 
+	/* Whether or not we are currently blocked on the CPU. */
+	bool blocked;
+
 	/* The currently running linux task. */
 	struct task_struct* curr;
 

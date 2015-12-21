@@ -329,6 +329,8 @@
 320	common	kexec_file_load		sys_kexec_file_load
 321	common	bpf			sys_bpf
 322	64	execveat		stub_execveat
+323	common	start_energy		sys_start_energy
+324	common	stop_energy		sys_stop_energy
 
 #
 # x32-specific system call numbers start at 512 to avoid cache impact
