@@ -2735,6 +2735,32 @@ static int proc_pid_personality(struct seq_file *m, struct pid_namespace *ns,
 	return err;
 }
 
+static int proc_energy_statistics(struct seq_file *m, struct pid_namespace *ns,
+				  struct pid *pid, struct task_struct *task)
+{
+	int err = lock_trace(task);
+	if (!err) {
+		struct energy_statistics* stats = &(task->e_statistics);
+		seq_printf(m, "-- Energy --\n"
+			      "package (uJ)   : %llu\n"
+			      "dram (uJ)      : %llu\n"
+			      "core (uJ)      : %llu\n"
+			      "gpu (uJ)       : %llu\n"
+			      "\n"
+			      "-- Statistics --\n"
+			      "updates        : %llu\n"
+			      "loops          : %llu\n"
+			      "loop_time (us) : %llu\n",
+			   stats->uj_package, stats->uj_dram, stats->uj_core,
+			   stats->uj_gpu, stats->nr_updates, stats->nr_defers,
+			   stats->us_defered);
+
+		unlock_trace(task);
+	}
+
+	return err;
+}
+
 /*
  * Thread groups
  */
@@ -2835,6 +2861,7 @@ static const struct pid_entry tgid_base_stuff[] = {
 #ifdef CONFIG_CHECKPOINT_RESTORE
 	REG("timers",	  S_IRUGO, proc_timers_operations),
 #endif
+	ONE("energystat", S_IRUGO, proc_energy_statistics),
 };
 
 static int proc_tgid_base_readdir(struct file *file, struct dir_context *ctx)
