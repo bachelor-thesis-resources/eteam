@@ -1,11 +1,16 @@
 /* vim: set noet ts=8 sw=8 sts=8 : */
 
+#include <asm/msr.h>
+#include <asm/processor.h>
+
 #include <linux/cpumask.h>
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/kthread.h>
+#include <linux/ktime.h>
 #include <linux/syscalls.h>
+#include <linux/timekeeping.h>
 
 #include <linux/sched.h>
 
@@ -42,7 +47,42 @@ enum {
 };
 
 /* The default scheduling slice for one thread. --> 10ms <-- */
-#define THREAD_SCHED_SLICE 10000000ULL
+static const u64 THREAD_SCHED_SLICE = 10000000ULL;
+
+/* The MSR numbers of the different RAPL counters. */
+enum {
+	/* The different counters. */
+	ENERGY_PKG = MSR_PKG_ENERGY_STATUS,
+	ENERGY_DRAM = MSR_DRAM_ENERGY_STATUS,
+	ENERGY_CORE = MSR_PP0_ENERGY_STATUS,
+	ENERGY_GPU = MSR_PP1_ENERGY_STATUS,
+
+	/* The unit for the energy counters. */
+	ENERGY_UNIT = MSR_RAPL_POWER_UNIT
+};
+
+/* Offsets and masks for the RAPL counters. */
+enum {
+	/* The different counters. */
+	MASK_PKG = 0xffffffff,		/* Bits 31-0 */
+	OFFSET_PKG = 0,			/* No shift needed. */
+
+	MASK_DRAM = MASK_PKG,
+	OFFSET_DRAM = OFFSET_PKG,
+
+	MASK_CORE = MASK_PKG,
+	OFFSET_CORE = OFFSET_PKG,
+
+	MASK_GPU = MASK_PKG,
+	OFFSET_GPU = OFFSET_PKG,
+
+	/* The unit for the energy counters. */
+	MASK_UNIT = 0x1f00,		/* Bits 12-8 */
+	OFFSET_UNIT = 8			/* Shift by 8 bits. */
+};
+
+static const int ITERATIONS_INTERVAL_LENGTH = 100;
+static const int ITERATIONS_LOOP_ENERGY = 50;
 
 
 /***
@@ -51,6 +91,8 @@ enum {
 
 struct energy_task;
 struct global_rq;
+struct rapl_counters;
+struct rapl_info;
 
 
 /***
@@ -101,6 +143,38 @@ struct global_rq {
 	u64 stop_running;
 };
 
+/* The RAPL counter state. */
+struct rapl_counters {
+	/* The time at which the counters were last updated. */
+	ktime_t last_update;
+
+	/* The value of the package counter. */
+	u32 package;
+
+	/* The value of the dram counter. */
+	u32 dram;
+
+	/* The value of the core counter. */
+	u32 core;
+
+	/* The value of the gpu counter. */
+	u32 gpu;
+};
+
+/* The RAPL subsystem state. */
+struct rapl_info {
+	/* How long is an average update interval. */
+	u32 update_interval;
+
+	/* What is the energy unit of the RAPL counters. */
+	u32 unit;
+
+	/* How much energy is spent during looping at each counter. */
+	u32 loop_package;
+	u32 loop_dram;
+	u32 loop_core;
+	u32 loop_gpu;
+};
 
 /***
  * Internal variables.
@@ -108,6 +182,8 @@ struct global_rq {
 
 static struct global_rq grq;
 
+static struct rapl_counters grc;
+static struct rapl_info gri;
 
 /***
  * Internal function prototypes.
@@ -117,6 +193,16 @@ static struct global_rq grq;
 static void init_grq(void);
 static void lock_grq(void);
 static void unlock_grq(void);
+
+/* Working with the rapl counters. */
+static void init_rapl_counters(struct rapl_counters*);
+static u64 read_rapl_counters(struct rapl_counters*, bool);
+
+/* Working with the global rapl counters. */
+static void init_grc(void);
+
+/* Working with the global rapl info. */
+static void init_gri(void);
 
 /* Working with the energy runqueues. */
 static void lock_local_rq(struct rq*);
@@ -360,6 +446,64 @@ static inline void __switch_to_energy(struct rq* rq) {
 	acquire_cpus(&(rq->en.domain));
 }
 
+static inline u32 __diff_wa(u32 first, u32 second) {
+	if (first < second) {
+		return (U32_MAX - second) + first;
+	} else {
+		return first - second;
+	}
+}
+
+static inline int __read_rapl_msr(u32* value, u32 msr_nr, u64 mask, u64 offset) {
+	u64 val;
+	int err;
+
+	if (!value) {
+		return -EINVAL;
+	}
+
+	if ((err = rdmsrl_safe(msr_nr, &val)) != 0) {
+		return err;
+	}
+
+	*value = (val & mask) >> offset;
+	return 0;
+}
+
+static inline int __read_rapl_msr_until_update(u32* value, u32 msr_nr,
+		u64 mask, u64 offset, ktime_t* tick, u64* duration) {
+	u32 start_val, tmp_val;
+	ktime_t start_tick, end_tick;
+	int err;
+
+	start_tick = ktime_get();
+	if ((err = __read_rapl_msr(&tmp_val, msr_nr, mask, offset)) != 0) goto fail;
+
+	start_val = tmp_val;
+
+	while (tmp_val == start_val) {
+		if ((err = __read_rapl_msr(&tmp_val, msr_nr, mask, offset)) != 0) goto fail;
+	}
+
+	end_tick = ktime_get();
+
+	if (tick) {
+		*tick = end_tick;
+	}
+
+	if (value) {
+		*value = tmp_val;
+	}
+
+	if (duration) {
+		*duration = ktime_us_delta(end_tick, start_tick);
+	}
+
+	err = 0;
+fail:
+	return err;
+}
+
 
 /***
  * Internal function definitions.
@@ -385,6 +529,89 @@ static void lock_grq(void) __acquires(grq.lock) {
 /* Unlock the global runqueue. */
 static void unlock_grq(void) __releases(grq.lock) {
 	do_raw_spin_unlock(&(grq.lock));
+}
+
+static void init_rapl_counters(struct rapl_counters* counters) {
+	counters->last_update = ktime_set(0, 0);
+	counters->package = 0;
+	counters->dram = 0;
+	counters->core = 0;
+	counters->gpu = 0;
+}
+
+static u64 read_rapl_counters(struct rapl_counters* counters,
+		bool wait_for_update) {
+	u64 duration = 0;
+
+	if (wait_for_update) {
+		__read_rapl_msr_until_update(&(counters->package), ENERGY_PKG,
+				MASK_PKG, OFFSET_PKG, &(counters->last_update),
+				&duration);
+	} else {
+		__read_rapl_msr(&(counters->package), ENERGY_PKG, MASK_PKG,
+				OFFSET_PKG);
+		counters->last_update = ktime_get();
+		duration = 0;
+	}
+
+	/* Read the other counter values. */
+	__read_rapl_msr(&(counters->dram), ENERGY_DRAM, MASK_DRAM, OFFSET_DRAM);
+	__read_rapl_msr(&(counters->core), ENERGY_CORE, MASK_CORE, OFFSET_CORE);
+	__read_rapl_msr(&(counters->gpu), ENERGY_GPU, MASK_GPU, OFFSET_GPU);
+
+	return duration;
+}
+
+static void read_rapl_unit(u32* unit) {
+	u32 val = 0;
+
+	__read_rapl_msr(&val, ENERGY_UNIT, MASK_UNIT, OFFSET_UNIT);
+
+	/* The corresponding unit is (1/2) ^ val Joules. Hence calculate (10 ^ 6) /
+	 * (2 ^ val) and thereby get mirco Joules. */
+	*unit = 1000000 / (1 << val);
+}
+
+static void __init init_grc(void) {
+	init_rapl_counters(&grc);
+	read_rapl_counters(&grc, true);
+}
+
+/* Initialize the global RAPL info. */
+static void __init init_gri(void) {
+	ktime_t time_begin, time_end;
+	struct rapl_counters counters_begin, counters_end;
+	int i;
+
+	__read_rapl_msr_until_update(NULL, ENERGY_PKG, MASK_PKG, OFFSET_PKG,
+			&time_begin, NULL);
+
+	for (i = 0; i < ITERATIONS_INTERVAL_LENGTH; ++i) {
+		__read_rapl_msr_until_update(NULL, ENERGY_PKG, MASK_PKG, OFFSET_PKG,
+				&time_end, NULL);
+	}
+
+	gri.update_interval = ktime_us_delta(time_end, time_begin) /
+		ITERATIONS_INTERVAL_LENGTH;
+
+
+	read_rapl_counters(&counters_begin, true);
+
+	for (i = 0; i < ITERATIONS_LOOP_ENERGY; ++i) {
+		read_rapl_counters(&counters_end, true);
+	}
+
+	gri.loop_package = __diff_wa(counters_end.package, counters_begin.package) /
+		ITERATIONS_LOOP_ENERGY;
+	gri.loop_dram = __diff_wa(counters_end.dram, counters_begin.dram) /
+		ITERATIONS_LOOP_ENERGY;
+	gri.loop_core = __diff_wa(counters_end.core, counters_begin.core) /
+		ITERATIONS_LOOP_ENERGY;
+	gri.loop_gpu = __diff_wa(counters_end.gpu, counters_begin.gpu) /
+		ITERATIONS_LOOP_ENERGY;
+
+
+	read_rapl_unit(&(gri.unit));
 }
 
 /* Lock the local energy rq embedded in the CPU runqueues.
@@ -842,8 +1069,25 @@ static inline void clear_resched_curr_local(struct rq* rq) {
  * @e_task:	the energy task struct of the energy task.
  */
 static void update_energy_statistics(struct energy_task* e_task) {
-	/* TODO: Implement energy accounting. */
-	return;
+	struct task_struct* task = e_task->task;
+	struct rapl_counters last_grc;
+	u64 duration;
+
+	last_grc = grc;
+	duration = read_rapl_counters(&grc, true);
+
+	task->e_statistics.nr_updates++;
+	task->e_statistics.nr_defers++;
+	task->e_statistics.us_defered += duration;
+
+	task->e_statistics.uj_package += (__diff_wa(grc.package, last_grc.package) -
+		((duration * gri.loop_package) / gri.update_interval)) * gri.unit;
+	task->e_statistics.uj_dram += (__diff_wa(grc.dram, last_grc.dram) -
+		((duration * gri.loop_dram) / gri.update_interval)) * gri.unit;
+	task->e_statistics.uj_core += (__diff_wa(grc.core, last_grc.core) -
+		((duration * gri.loop_core) / gri.update_interval)) * gri.unit;
+	task->e_statistics.uj_gpu += (__diff_wa(grc.gpu, last_grc.gpu) -
+		((duration * gri.loop_gpu) / gri.update_interval)) * gri.unit;
 }
 
 /* Update the runtime statistics of a thread of an energy task.
@@ -1322,6 +1566,7 @@ static int do_stop_energy(pid_t pid) {
 	return ret;
 }
 
+
 /***
  * External function definitions.
  ***/
@@ -1767,6 +2012,20 @@ int __init init_e_idle_threads(void) {
 }
 
 late_initcall(init_e_idle_threads);
+
+/* Initialize the RAPL subsystem. */
+int __init init_rapl_subsystem(void) {
+	init_gri();
+	init_grc();
+
+	printk(KERN_INFO "RAPL-subsystem initialized: %u %u %u %u %u\n",
+			gri.update_interval, gri.loop_package, gri.loop_dram,
+			gri.loop_core, gri.loop_gpu);
+
+	return 0;
+}
+
+late_initcall(init_rapl_subsystem);
 
 /* Initialize the energy scheduling class. */
 void __init init_sched_energy_class(void) {

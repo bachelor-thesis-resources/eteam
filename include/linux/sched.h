@@ -1336,6 +1336,23 @@ struct sched_e_entity {
 	struct list_head cpu_rq;
 };
 
+struct energy_statistics {
+	/* How many updates have been done already. */
+	u64 nr_updates;
+
+	/* How often have we waited for an update. */
+	u64 nr_defers;
+
+	/* How much time have we spent waiting for updates. */
+	u64 us_defered;
+
+	/* The energy consumed by the task. */
+	u64 uj_package;
+	u64 uj_dram;
+	u64 uj_core;
+	u64 uj_gpu;
+};
+
 union rcu_special {
 	struct {
 		bool blocked;
@@ -1380,6 +1397,8 @@ struct task_struct {
 #endif
 	struct sched_dl_entity dl;
 	struct sched_e_entity ee;
+
+	struct energy_statistics e_statistics;
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	/* list of struct preempt_notifier: */

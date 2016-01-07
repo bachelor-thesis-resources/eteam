@@ -2025,6 +2025,8 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 
 	p->ee.state			= 0;
 
+	memset(&(p->e_statistics), 0, sizeof(struct energy_statistics));
+
 #ifdef CONFIG_SCHEDSTATS
 	memset(&p->se.statistics, 0, sizeof(p->se.statistics));
 #endif
