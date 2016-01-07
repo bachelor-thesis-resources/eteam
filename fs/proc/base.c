@@ -2741,19 +2741,15 @@ static int proc_energy_statistics(struct seq_file *m, struct pid_namespace *ns,
 	int err = lock_trace(task);
 	if (!err) {
 		struct energy_statistics* stats = &(task->e_statistics);
-		seq_printf(m, "-- Energy --\n"
-			      "package (uJ)   : %llu\n"
+		seq_printf(m, "package (uJ)   : %llu\n"
 			      "dram (uJ)      : %llu\n"
 			      "core (uJ)      : %llu\n"
 			      "gpu (uJ)       : %llu\n"
-			      "\n"
-			      "-- Statistics --\n"
-			      "updates        : %llu\n"
-			      "loops          : %llu\n"
+			      "updates (#)    : %llu\n"
 			      "loop_time (us) : %llu\n",
 			   stats->uj_package, stats->uj_dram, stats->uj_core,
-			   stats->uj_gpu, stats->nr_updates, stats->nr_defers,
-			   stats->us_defered);
+			   stats->uj_gpu, stats->nr_updates,
+			   stats->us_defered / stats->nr_defers);
 
 		unlock_trace(task);
 	}
