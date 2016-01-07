@@ -1538,12 +1538,8 @@ static int do_start_energy(pid_t pid) {
 		struct task_struct* task = find_task(p);
 		struct task_struct* thread;
 
-		printk(KERN_INFO "Start energy for %d.\n", task->pid);
-
 		for_each_thread(task, thread) {
 			struct sched_param param = { .sched_priority = 0 };
-
-			printk(KERN_INFO "Move %d to energy.\n", thread->pid);
 
 			ret = sched_setscheduler_nocheck(thread, SCHED_ENERGY, &param);
 		}
@@ -1575,12 +1571,8 @@ static int do_stop_energy(pid_t pid) {
 		struct task_struct* task = find_task(p);
 		struct task_struct* thread;
 
-		printk(KERN_INFO "Stop energy for %d.\n", task->pid);
-
 		for_each_thread(task, thread) {
 			struct sched_param param = { .sched_priority = 0 };
-
-			printk(KERN_INFO "Move %d from energy.\n", thread->pid);
 
 			ret = sched_setscheduler_nocheck(thread, SCHED_NORMAL, &param);
 		}
