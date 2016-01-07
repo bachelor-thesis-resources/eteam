@@ -510,7 +510,7 @@ fail:
  ***/
 
 /* Initialize the global runqueue. */
-static void init_grq(void) {
+static void __init init_grq(void) {
 	raw_spin_lock_init(&(grq.lock));
 
 	INIT_LIST_HEAD(&(grq.tasks));
@@ -1133,8 +1133,7 @@ static void update_local_statistics(struct rq* rq, struct task_struct* t) {
  */
 static inline void move_local_task(struct task_struct* t, unsigned int cpu) {
 	if (task_cpu(t) == cpu) {
-		/* Do not move from the task if it is already at the wanted
-		 * CPU. */
+		/* Do not move the task if it is already at the correct CPU. */
 		return;
 	}
 
@@ -1475,7 +1474,7 @@ static void switch_in_energy(struct rq* rq, struct energy_task* from,
  *		set.
  * @cpu:	the CPU for which we need to initialize the energy domain.
  */
-static void init_energy_domain(struct cpumask* domain, unsigned int cpu) {
+static void __init init_energy_domain(struct cpumask* domain, unsigned int cpu) {
 	/* TODO: Really find the energy domain of the current CPU. */
 	cpumask_setall(domain);
 }
