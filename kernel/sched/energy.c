@@ -197,6 +197,7 @@ static void unlock_grq(void);
 /* Working with the rapl counters. */
 static void init_rapl_counters(struct rapl_counters*);
 static u64 read_rapl_counters(struct rapl_counters*, bool);
+static void copy_rapl_counters(struct rapl_counters*, struct rapl_counters*);
 
 /* Working with the global rapl counters. */
 static void init_grc(void);
@@ -504,6 +505,29 @@ fail:
 	return err;
 }
 
+static inline int __read_rapl_unit(u32* unit) {
+	u32 val = 0;
+	int err;
+
+	if ((err = __read_rapl_msr(&val, ENERGY_UNIT, MASK_UNIT, OFFSET_UNIT)) != 0) {
+		return err;
+	}
+
+	/* The corresponding unit is (1/2) ^ val Joules. Hence calculate (10 ^ 6) /
+	 * (2 ^ val) and thereby get mirco Joules. */
+	*unit = 1000000 / (1 << val);
+
+	return 0;
+}
+
+static inline void __update_rapl_counter(u64* value, u32 consumption, u32 loop_duration,
+		u32 avg_loop_consumption) {
+	u32 loop_consumption = (avg_loop_consumption * loop_duration) / gri.update_interval;
+	u32 final_consumption = loop_consumption > consumption ? 0 : consumption - loop_consumption;
+
+	*value += final_consumption * gri.unit;
+}
+
 
 /***
  * Internal function definitions.
@@ -562,14 +586,13 @@ static u64 read_rapl_counters(struct rapl_counters* counters,
 	return duration;
 }
 
-static void read_rapl_unit(u32* unit) {
-	u32 val = 0;
+static void copy_rapl_counters(struct rapl_counters* from, struct rapl_counters* to) {
+	to->last_update = from->last_update;
 
-	__read_rapl_msr(&val, ENERGY_UNIT, MASK_UNIT, OFFSET_UNIT);
-
-	/* The corresponding unit is (1/2) ^ val Joules. Hence calculate (10 ^ 6) /
-	 * (2 ^ val) and thereby get mirco Joules. */
-	*unit = 1000000 / (1 << val);
+	to->package = from->package;
+	to->dram = from->dram;
+	to->core = from->core;
+	to->gpu = from->gpu;
 }
 
 static void __init init_grc(void) {
@@ -611,7 +634,7 @@ static void __init init_gri(void) {
 		ITERATIONS_LOOP_ENERGY;
 
 
-	read_rapl_unit(&(gri.unit));
+	__read_rapl_unit(&(gri.unit));
 }
 
 /* Lock the local energy rq embedded in the CPU runqueues.
@@ -1070,24 +1093,25 @@ static inline void clear_resched_curr_local(struct rq* rq) {
  */
 static void update_energy_statistics(struct energy_task* e_task) {
 	struct task_struct* task = e_task->task;
+	struct energy_statistics* stats = &(task->e_statistics);
 	struct rapl_counters last_grc;
 	u64 duration;
 
-	last_grc = grc;
+	copy_rapl_counters(&grc, &last_grc);
 	duration = read_rapl_counters(&grc, true);
 
-	task->e_statistics.nr_updates++;
-	task->e_statistics.nr_defers++;
-	task->e_statistics.us_defered += duration;
+	stats->nr_updates++;
+	stats->nr_defers++;
+	stats->us_defered += duration;
 
-	task->e_statistics.uj_package += (__diff_wa(grc.package, last_grc.package) -
-		((duration * gri.loop_package) / gri.update_interval)) * gri.unit;
-	task->e_statistics.uj_dram += (__diff_wa(grc.dram, last_grc.dram) -
-		((duration * gri.loop_dram) / gri.update_interval)) * gri.unit;
-	task->e_statistics.uj_core += (__diff_wa(grc.core, last_grc.core) -
-		((duration * gri.loop_core) / gri.update_interval)) * gri.unit;
-	task->e_statistics.uj_gpu += (__diff_wa(grc.gpu, last_grc.gpu) -
-		((duration * gri.loop_gpu) / gri.update_interval)) * gri.unit;
+	__update_rapl_counter(&(stats->uj_package), __diff_wa(grc.package, last_grc.package),
+			duration, gri.loop_package);
+	__update_rapl_counter(&(stats->uj_dram), __diff_wa(grc.dram, last_grc.dram),
+			duration, gri.loop_dram);
+	__update_rapl_counter(&(stats->uj_core), __diff_wa(grc.core, last_grc.core),
+			duration, gri.loop_core);
+	__update_rapl_counter(&(stats->uj_gpu), __diff_wa(grc.gpu, last_grc.gpu),
+			duration, gri.loop_gpu);
 }
 
 /* Update the runtime statistics of a thread of an energy task.
