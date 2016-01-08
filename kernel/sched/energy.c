@@ -46,6 +46,15 @@ enum {
 	LOCAL_RESCHED = 0x1
 };
 
+/* Local runqueue states. */
+enum {
+	LOCAL_RQ_BLOCKED = 0x1,
+	LOCAL_RQ_BLOCKING = 0x2,
+
+	LOCAL_RQ_UNBLOCKED = 0x4,
+	LOCAL_RQ_UNBLOCKING = 0x8
+};
+
 /* The default scheduling slice for one thread. --> 10ms <-- */
 static const u64 THREAD_SCHED_SLICE = 10000000ULL;
 
@@ -415,29 +424,57 @@ static void __distribute_energy_task(struct energy_task* e_task) {
 
 }
 
-static inline void __acquire_cpu(struct rq* rq) {
-	lock_local_rq(rq);
-
-	rq->en.blocked = false;
-	add_nr_running(rq, rq->en.nr_assigned);
-
-	unlock_local_rq(rq);
+static inline bool __is_unblocked_cpu(struct rq* rq) {
+	return rq->en.state == LOCAL_RQ_UNBLOCKED || rq->en.state == LOCAL_RQ_UNBLOCKING;
 }
 
-static inline void __release_cpu(struct rq* rq) {
-	lock_local_rq(rq);
+static inline void __unblock_cpu_local(struct rq* rq) {
+	if (rq->en.blocked) {
+		add_nr_running(rq, rq->en.nr_assigned);
+	}
 
+	rq->en.state = LOCAL_RQ_UNBLOCKED;
+	rq->en.blocked = false;
+}
+
+static inline void __unblock_cpu(struct rq* rq) {
+	if (rq->en.state == LOCAL_RQ_BLOCKING) {
+		rq->en.state = LOCAL_RQ_UNBLOCKED;
+	} else if (rq->en.state == LOCAL_RQ_BLOCKED) {
+		rq->en.state = LOCAL_RQ_UNBLOCKING;
+	}
+
+	set_tsk_need_resched(rq->curr);
+}
+
+static inline bool __is_blocked_cpu(struct rq* rq) {
+	return rq->en.state == LOCAL_RQ_BLOCKED || rq->en.state == LOCAL_RQ_BLOCKING;
+}
+
+static inline void __block_cpu_local(struct rq* rq) {
+	if (!rq->en.blocked) {
+		sub_nr_running(rq, rq->en.nr_assigned);
+	}
+
+	rq->en.state = LOCAL_RQ_BLOCKED;
 	rq->en.blocked = true;
-	sub_nr_running(rq, rq->en.nr_assigned);
+}
 
-	unlock_local_rq(rq);
+static inline void __block_cpu(struct rq* rq) {
+	if (rq->en.state == LOCAL_RQ_UNBLOCKING) {
+		rq->en.state = LOCAL_RQ_BLOCKED;
+	} else if (rq->en.state == LOCAL_RQ_UNBLOCKED) {
+		rq->en.state = LOCAL_RQ_BLOCKING;
+	}
+
+	set_tsk_need_resched(rq->curr);
 }
 
 static inline void __switch_from_energy(struct rq* rq) {
-	release_cpus(&(rq->en.domain));
-
 	grq.running = 0;
 	grq.stop_running = rq_clock(rq);
+
+	release_cpus(&(rq->en.domain));
 }
 
 static inline void __switch_to_energy(struct rq* rq) {
@@ -1418,9 +1455,13 @@ static void acquire_cpus(struct cpumask* domain) {
 	for_each_cpu(cpu, domain) {
 		struct rq* c_rq = cpu_rq(cpu);
 
-		if (c_rq->en.blocked) {
-			__acquire_cpu(c_rq);
+		lock_local_rq(c_rq);
+
+		if (__is_blocked_cpu(c_rq)) {
+			__unblock_cpu(c_rq);
 		}
+
+		unlock_local_rq(c_rq);
 	}
  }
 
@@ -1430,10 +1471,27 @@ static void release_cpus(struct cpumask* domain) {
 	for_each_cpu(cpu, domain) {
 		struct rq* c_rq = cpu_rq(cpu);
 
-		if (!c_rq->en.blocked && c_rq->nr_running == c_rq->en.nr_assigned) {
-			__release_cpu(c_rq);
+		lock_local_rq(c_rq);
+
+		if (__is_unblocked_cpu(c_rq) &&
+				c_rq->nr_running == c_rq->en.nr_assigned) {
+			__block_cpu(c_rq);
 		}
+
+		unlock_local_rq(c_rq);
 	}
+}
+
+static void check_local_cpu(struct rq* rq) {
+	lock_local_rq(rq);
+
+	if (rq->en.state == LOCAL_RQ_BLOCKING) {
+		__block_cpu_local(rq);
+	} else if (rq->en.state == LOCAL_RQ_UNBLOCKING) {
+		__unblock_cpu_local(rq);
+	}
+
+	unlock_local_rq(rq);
 }
 
 static void check_cpus(struct cpumask* domain) {
@@ -1442,11 +1500,15 @@ static void check_cpus(struct cpumask* domain) {
 	for_each_cpu(cpu, domain) {
 		struct rq* c_rq = cpu_rq(cpu);
 
-		if (c_rq->en.blocked && c_rq->nr_running > 0) {
-			__acquire_cpu(c_rq);
-		} else if (!c_rq->en.blocked && c_rq->nr_running == c_rq->en.nr_assigned) {
-			__release_cpu(c_rq);
+		lock_local_rq(c_rq);
+
+		if (c_rq->en.state == LOCAL_RQ_BLOCKED && c_rq->nr_running > 0) {
+			__unblock_cpu(c_rq);
+		} else if (c_rq->en.state == LOCAL_RQ_UNBLOCKED && c_rq->nr_running == c_rq->en.nr_assigned) {
+			__block_cpu(c_rq);
 		}
+
+		unlock_local_rq(c_rq);
 	}
 }
 
@@ -1716,6 +1778,8 @@ struct task_struct* pick_next_task_energy(struct rq* rq, struct task_struct* pre
 		else if (should_switch_in_energy(rq))
 			switch_in_energy(rq, curr_e_task, pick_next_energy_task());
 	}
+
+	check_local_cpu(rq);
 
 	unlock_grq();
 
@@ -1988,14 +2052,15 @@ void __init init_e_rq(struct e_rq* e_rq, unsigned int cpu) {
 
 	e_rq->resched_flags = 0;
 
+	e_rq->state = LOCAL_RQ_BLOCKED;
+	e_rq->blocked = true;
+
 	init_energy_domain(&(e_rq->domain), cpu);
 
 	INIT_LIST_HEAD(&(e_rq->runnable));
 	e_rq->nr_runnable = 0;
 
 	e_rq->nr_assigned = 0;
-
-	e_rq->blocked = false;
 
 	e_rq->curr = NULL;
 	e_rq->curr_e_task = NULL;

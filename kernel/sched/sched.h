@@ -532,6 +532,10 @@ struct e_rq {
 	/* Reschedule flags. */
 	int resched_flags;
 
+	/* The state of this runqueue. */
+	int state;
+	bool blocked;
+
 	/* The energy domain which should be measured. */
 	struct cpumask domain;
 
@@ -541,9 +545,6 @@ struct e_rq {
 
 	/* The number of threads assigned to this CPU. */
 	int nr_assigned;
-
-	/* Whether or not we are currently blocked on the CPU. */
-	bool blocked;
 
 	/* The currently running linux task. */
 	struct task_struct* curr;
