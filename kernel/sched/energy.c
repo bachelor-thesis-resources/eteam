@@ -98,15 +98,33 @@ static const int ITERATIONS_LOOP_ENERGY = 50;
  * Internal data structure prototypes.
  ***/
 
+struct rapl_counters;
 struct energy_task;
 struct global_rq;
-struct rapl_counters;
 struct rapl_info;
 
 
 /***
  * Internal data structure definitions.
  ***/
+
+/* The RAPL counter state. */
+struct rapl_counters {
+	/* The time at which the counters were last updated. */
+	ktime_t last_update;
+
+	/* The value of the package counter. */
+	u32 package;
+
+	/* The value of the dram counter. */
+	u32 dram;
+
+	/* The value of the core counter. */
+	u32 core;
+
+	/* The value of the gpu counter. */
+	u32 gpu;
+};
 
 /* The representation of a task which should be run which energy accounting
  * enabled. */
@@ -119,6 +137,9 @@ struct energy_task {
 
 	/* The energy domain where the task should run. */
 	struct cpumask domain;
+
+	/* The RAPL counters state for the task. */
+	struct rapl_counters counters;
 
 	/* All runnable threads. */
 	struct list_head runnable;
@@ -152,24 +173,6 @@ struct global_rq {
 	u64 stop_running;
 };
 
-/* The RAPL counter state. */
-struct rapl_counters {
-	/* The time at which the counters were last updated. */
-	ktime_t last_update;
-
-	/* The value of the package counter. */
-	u32 package;
-
-	/* The value of the dram counter. */
-	u32 dram;
-
-	/* The value of the core counter. */
-	u32 core;
-
-	/* The value of the gpu counter. */
-	u32 gpu;
-};
-
 /* The RAPL subsystem state. */
 struct rapl_info {
 	/* How long is an average update interval. */
@@ -191,7 +194,6 @@ struct rapl_info {
 
 static struct global_rq grq;
 
-static struct rapl_counters grc;
 static struct rapl_info gri;
 
 /***
@@ -207,9 +209,6 @@ static void unlock_grq(void);
 static void init_rapl_counters(struct rapl_counters*);
 static u64 read_rapl_counters(struct rapl_counters*, bool);
 static void copy_rapl_counters(struct rapl_counters*, struct rapl_counters*);
-
-/* Working with the global rapl counters. */
-static void init_grc(void);
 
 /* Working with the global rapl info. */
 static void init_gri(void);
@@ -632,11 +631,6 @@ static void copy_rapl_counters(struct rapl_counters* from, struct rapl_counters*
 	to->gpu = from->gpu;
 }
 
-static void __init init_grc(void) {
-	init_rapl_counters(&grc);
-	read_rapl_counters(&grc, true);
-}
-
 /* Initialize the global RAPL info. */
 static void __init init_gri(void) {
 	ktime_t time_begin, time_end;
@@ -715,6 +709,7 @@ static void init_energy_task(struct energy_task* e_task) {
 	e_task->task = NULL;
 
 	cpumask_clear(&(e_task->domain));
+	init_rapl_counters(&(e_task->counters));
 
 	INIT_LIST_HEAD(&(e_task->runnable));
 	e_task->nr_runnable = 0;
@@ -1131,23 +1126,24 @@ static inline void clear_resched_curr_local(struct rq* rq) {
 static void update_energy_statistics(struct energy_task* e_task) {
 	struct task_struct* task = e_task->task;
 	struct energy_statistics* stats = &(task->e_statistics);
-	struct rapl_counters last_grc;
+	struct rapl_counters* cur_counters = &(e_task->counters);
+	struct rapl_counters old_counters;
 	u64 duration;
 
-	copy_rapl_counters(&grc, &last_grc);
-	duration = read_rapl_counters(&grc, true);
+	copy_rapl_counters(cur_counters, &old_counters);
+	duration = read_rapl_counters(cur_counters, true);
 
 	stats->nr_updates++;
 	stats->nr_defers++;
 	stats->us_defered += duration;
 
-	__update_rapl_counter(&(stats->uj_package), __diff_wa(grc.package, last_grc.package),
+	__update_rapl_counter(&(stats->uj_package), __diff_wa(cur_counters->package, old_counters.package),
 			duration, gri.loop_package);
-	__update_rapl_counter(&(stats->uj_dram), __diff_wa(grc.dram, last_grc.dram),
+	__update_rapl_counter(&(stats->uj_dram), __diff_wa(cur_counters->dram, old_counters.dram),
 			duration, gri.loop_dram);
-	__update_rapl_counter(&(stats->uj_core), __diff_wa(grc.core, last_grc.core),
+	__update_rapl_counter(&(stats->uj_core), __diff_wa(cur_counters->core, old_counters.core),
 			duration, gri.loop_core);
-	__update_rapl_counter(&(stats->uj_gpu), __diff_wa(grc.gpu, last_grc.gpu),
+	__update_rapl_counter(&(stats->uj_gpu), __diff_wa(cur_counters->gpu, old_counters.gpu),
 			duration, gri.loop_gpu);
 }
 
@@ -1253,7 +1249,8 @@ static void distribute_energy_task(struct rq* rq, struct energy_task* e_task) {
 	/* Copy the current energy domain. */
 	cpumask_copy(&(e_task->domain), &(rq->en.domain));
 
-	read_rapl_counters(&grc, true);
+	/* Get the current RAPL counters. */
+	read_rapl_counters(&(e_task->counters), true);
 
 	__distribute_energy_task(e_task);
 }
@@ -2098,7 +2095,6 @@ late_initcall(init_e_idle_threads);
 /* Initialize the RAPL subsystem. */
 int __init init_rapl_subsystem(void) {
 	init_gri();
-	init_grc();
 
 	printk(KERN_INFO "RAPL-subsystem initialized: %u %u %u %u %u\n",
 			gri.update_interval, gri.loop_package, gri.loop_dram,
