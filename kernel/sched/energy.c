@@ -1253,6 +1253,8 @@ static void distribute_energy_task(struct rq* rq, struct energy_task* e_task) {
 	/* Copy the current energy domain. */
 	cpumask_copy(&(e_task->domain), &(rq->en.domain));
 
+	read_rapl_counters(&grc, true);
+
 	__distribute_energy_task(e_task);
 }
 
