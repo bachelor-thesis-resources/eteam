@@ -3,6 +3,7 @@
 #include <asm/msr.h>
 #include <asm/processor.h>
 
+#include <linux/cpuidle.h>
 #include <linux/cpumask.h>
 #include <linux/list.h>
 #include <linux/slab.h>
@@ -1553,8 +1554,8 @@ static void __init init_energy_domain(struct cpumask* domain, unsigned int cpu) 
 /* The idle thread function. */
 static int idle_thread_fn(void* unused) {
 	while (!kthread_should_stop()) {
-		while (!tif_need_resched())
-			cpu_relax();
+		while (!need_resched())
+			default_idle_call();
 
 		schedule();
 	}
