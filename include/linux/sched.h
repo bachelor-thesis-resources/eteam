@@ -3189,3 +3189,5 @@ static inline unsigned long rlimit_max(unsigned int limit)
 }
 
 #endif
+
+extern bool energy_tick_sync(struct hrtimer* timer);

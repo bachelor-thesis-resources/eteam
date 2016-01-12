@@ -1070,6 +1070,7 @@ static enum hrtimer_restart tick_sched_timer(struct hrtimer *timer)
 		container_of(timer, struct tick_sched, sched_timer);
 	struct pt_regs *regs = get_irq_regs();
 	ktime_t now = ktime_get();
+	bool synced = false;
 
 	tick_sched_do_timer(now);
 
@@ -1077,14 +1078,17 @@ static enum hrtimer_restart tick_sched_timer(struct hrtimer *timer)
 	 * Do not call, when we are not in irq context and have
 	 * no valid regs pointer
 	 */
-	if (regs)
+	if (regs) {
 		tick_sched_handle(ts, regs);
+		synced = energy_tick_sync(timer);
+	}
 
 	/* No need to reprogram if we are in idle or full dynticks mode */
 	if (unlikely(ts->tick_stopped))
 		return HRTIMER_NORESTART;
 
-	hrtimer_forward(timer, now, tick_period);
+	if (!synced)
+		hrtimer_forward(timer, now, tick_period);
 
 	return HRTIMER_RESTART;
 }

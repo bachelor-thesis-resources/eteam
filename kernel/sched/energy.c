@@ -93,6 +93,8 @@ enum {
 
 static const int ITERATIONS_INTERVAL_LENGTH = 100;
 static const int ITERATIONS_LOOP_ENERGY = 50;
+static const int MAX_LOOP_DELAY = 200;
+static const int TARGET_LOOP_DELAY = 100;
 
 
 /***
@@ -268,7 +270,7 @@ static bool need_resched_curr_local(struct rq*);
 static void clear_resched_curr_local(struct rq*);
 
 /* Update runtime statistics. */
-static void update_energy_statistics(struct energy_task*);
+static void update_energy_statistics(struct rq*, struct energy_task*);
 static void update_local_statistics(struct rq*, struct task_struct*);
 
 /* Schedule and remove energy tasks. */
@@ -537,7 +539,7 @@ static inline int __read_rapl_unit(u32* unit) {
 	}
 
 	/* The corresponding unit is (1/2) ^ val Joules. Hence calculate (10 ^ 6) /
-	 * (2 ^ val) and thereby get mirco Joules. */
+	 * (2 ^ val) and thereby get micro Joules. */
 	*unit = 1000000 / (1 << val);
 
 	return 0;
@@ -1108,9 +1110,10 @@ static inline void clear_resched_curr_local(struct rq* rq) {
 
 /* Update the energy statistics of an energy task.
  *
+ * @rq:		the runqueue of the current CPU.
  * @e_task:	the energy task struct of the energy task.
  */
-static void update_energy_statistics(struct energy_task* e_task) {
+static void update_energy_statistics(struct rq* rq, struct energy_task* e_task) {
 	struct task_struct* task = e_task->task;
 	struct energy_statistics* stats = &(task->e_statistics);
 	struct rapl_counters* cur_counters = &(e_task->counters);
@@ -1132,6 +1135,17 @@ static void update_energy_statistics(struct energy_task* e_task) {
 			duration, gri.loop_core);
 	__update_rapl_counter(&(stats->uj_gpu), __diff_wa(cur_counters->gpu, old_counters.gpu),
 			duration, gri.loop_gpu);
+
+	/* Advance the timer tick, so that the RAPL counter updates
+	 * are shortly after the timer tick. */
+	if (duration > MAX_LOOP_DELAY) {
+		lock_local_rq(rq);
+
+		rq->en.need_tick_sync = true;
+		rq->en.tick_shift_ns = NSEC_PER_USEC * duration;
+
+		unlock_local_rq(rq);
+	}
 }
 
 /* Update the runtime statistics of a thread of an energy task.
@@ -1347,7 +1361,7 @@ static void clear_local_tasks(struct rq* rq) {
  */
 static void put_energy_task(struct rq* rq, struct energy_task* e_task) {
 	/* Update the energy task's statistics. */
-	update_energy_statistics(e_task);
+	update_energy_statistics(rq, e_task);
 
 	/* Tell all CPUs to stop executing the threads of the current
 	 * energy task. */
@@ -2052,6 +2066,9 @@ void __init init_e_rq(struct e_rq* e_rq, unsigned int cpu) {
 	e_rq->curr_e_task = NULL;
 
 	e_rq->idle = NULL;
+
+	e_rq->need_tick_sync = false;
+	e_rq->tick_shift_ns = 0;
 }
 
 /* Initialize the idle threads for each available runqueue. */
@@ -2095,6 +2112,35 @@ late_initcall(init_rapl_subsystem);
 /* Initialize the energy scheduling class. */
 void __init init_sched_energy_class(void) {
 	init_grq();
+}
+
+/* Synchronize the RAPL and the timer ticks.
+ *
+ * @timer:	The timer which must be forwarded.
+ */
+bool energy_tick_sync(struct hrtimer* timer) {
+	struct rq* rq = this_rq();
+	bool synced = false;
+
+	lock_local_rq(rq);
+
+	if (rq->en.need_tick_sync) {
+		u64 tick_adapt_ns;
+
+		tick_adapt_ns = rq->en.tick_shift_ns + (
+					gri.update_interval -
+					TARGET_LOOP_DELAY
+				) * NSEC_PER_USEC;
+		hrtimer_add_expires_ns(timer, tick_adapt_ns);
+
+		rq->en.need_tick_sync = false;
+
+		synced = true;
+	}
+
+	unlock_local_rq(rq);
+
+	return synced;
 }
 
 /* The system call to start energy measurements.
