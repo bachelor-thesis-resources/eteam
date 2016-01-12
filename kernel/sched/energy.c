@@ -397,8 +397,27 @@ static void __distribute_energy_task(struct energy_task* e_task) {
 			/* This thread is already assigned to a CPU runqueue. No
 			 * need to do this again. */
 			continue;
-		} else {
+		} else if (thread_cpu_running(thread)) {
+			/* The thread was not yet descheduled. So we can not move it
+			 * around, as this would cause damage. Keep it at the runqueue
+			 * where it was assigned to previously. */
 			distribute_local_task(task_rq(thread), thread);
+		} else {
+			/* Find the CPU where the thread can run and which has the lowest
+			 * load. Start with the one where the thread is already assigned to. */
+			struct rq* best_rq = task_rq(thread);
+			int min_load = best_rq->en.nr_runnable;
+
+			for_each_cpu_and(cpu, &(e_task->domain), &(thread->cpus_allowed)) {
+				int load = cpu_rq(cpu)->en.nr_runnable;
+
+				if (load < min_load) {
+					min_load = load;
+					best_rq = cpu_rq(cpu);
+				}
+			}
+
+			distribute_local_task(best_rq, thread);
 		}
 	}
 
