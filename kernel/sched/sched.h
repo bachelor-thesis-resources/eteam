@@ -554,10 +554,6 @@ struct e_rq {
 
 	/* The idle task for this runqueue. */
 	struct task_struct* idle;
-
-	/* The information for the tick synchronization. */
-	bool need_tick_sync;
-	u64 tick_shift_ns;
 };
 
 #ifdef CONFIG_SMP

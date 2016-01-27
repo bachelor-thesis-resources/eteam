@@ -93,8 +93,6 @@ enum {
 
 static const int ITERATIONS_INTERVAL_LENGTH = 100;
 static const int ITERATIONS_LOOP_ENERGY = 50;
-static const int MAX_LOOP_DELAY = 200;
-static const int TARGET_LOOP_DELAY = 100;
 
 
 /***
@@ -1155,16 +1153,6 @@ static void update_energy_statistics(struct rq* rq, struct energy_task* e_task) 
 	__update_rapl_counter(&(stats->uj_gpu), __diff_wa(cur_counters->gpu, old_counters.gpu),
 			duration, gri.loop_gpu);
 
-	/* Advance the timer tick, so that the RAPL counter updates
-	 * are shortly after the timer tick. */
-	if (duration > MAX_LOOP_DELAY) {
-		lock_local_rq(rq);
-
-		rq->en.need_tick_sync = true;
-		rq->en.tick_shift_ns = NSEC_PER_USEC * duration;
-
-		unlock_local_rq(rq);
-	}
 }
 
 /* Update the runtime statistics of a thread of an energy task.
@@ -2085,9 +2073,6 @@ void __init init_e_rq(struct e_rq* e_rq, unsigned int cpu) {
 	e_rq->curr_e_task = NULL;
 
 	e_rq->idle = NULL;
-
-	e_rq->need_tick_sync = false;
-	e_rq->tick_shift_ns = 0;
 }
 
 /* Initialize the idle threads for each available runqueue. */
@@ -2131,35 +2116,6 @@ late_initcall(init_rapl_subsystem);
 /* Initialize the energy scheduling class. */
 void __init init_sched_energy_class(void) {
 	init_grq();
-}
-
-/* Synchronize the RAPL and the timer ticks.
- *
- * @timer:	The timer which must be forwarded.
- */
-bool energy_tick_sync(struct hrtimer* timer) {
-	struct rq* rq = this_rq();
-	bool synced = false;
-
-	lock_local_rq(rq);
-
-	if (rq->en.need_tick_sync) {
-		u64 tick_adapt_ns;
-
-		tick_adapt_ns = rq->en.tick_shift_ns + (
-					gri.update_interval -
-					TARGET_LOOP_DELAY
-				) * NSEC_PER_USEC;
-		hrtimer_add_expires_ns(timer, tick_adapt_ns);
-
-		rq->en.need_tick_sync = false;
-
-		synced = true;
-	}
-
-	unlock_local_rq(rq);
-
-	return synced;
 }
 
 /* The system call to start energy measurements.
