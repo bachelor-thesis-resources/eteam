@@ -2741,6 +2741,7 @@ static int proc_energy_statistics(struct seq_file *m, struct pid_namespace *ns,
 	int err = lock_trace(task);
 	if (!err) {
 		struct energy_statistics* stats = &(task->e_statistics);
+
 		seq_printf(m, "package (uJ)   : %llu\n"
 			      "dram (uJ)      : %llu\n"
 			      "core (uJ)      : %llu\n"
@@ -2749,7 +2750,26 @@ static int proc_energy_statistics(struct seq_file *m, struct pid_namespace *ns,
 			      "loop_time (us) : %llu\n",
 			   stats->uj_package, stats->uj_dram, stats->uj_core,
 			   stats->uj_gpu, stats->nr_updates,
-			   stats->us_defered / stats->nr_defers);
+			   stats->us_looped / stats->nr_updates);
+
+		seq_printf(m, "\nLoop Statistics\n"
+			      "0-99    : %d\n"
+			      "100-199 : %d\n"
+			      "200-299 : %d\n"
+			      "300-399 : %d\n"
+			      "400-499 : %d\n"
+			      "500-599 : %d\n"
+			      "600-699 : %d\n"
+			      "700-799 : %d\n"
+			      "800-899 : %d\n"
+			      "900-999 : %d\n"
+			      ">1000   : %d\n",
+			   stats->loop_stats[0], stats->loop_stats[1],
+			   stats->loop_stats[2], stats->loop_stats[3],
+			   stats->loop_stats[4], stats->loop_stats[5],
+			   stats->loop_stats[6], stats->loop_stats[7],
+			   stats->loop_stats[8], stats->loop_stats[9],
+			   stats->loop_stats[10]);
 
 		unlock_trace(task);
 	}

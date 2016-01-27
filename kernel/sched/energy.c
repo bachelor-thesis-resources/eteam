@@ -570,6 +570,14 @@ static inline void __update_rapl_counter(u64* value, u32 consumption, u32 loop_d
 	*value += final_consumption * gri.unit;
 }
 
+static inline void __update_loop_statistics(struct energy_statistics* stats, u64 duration) {
+	if ((duration / 100) >= 10) {
+		stats->loop_stats[10]++;
+	} else {
+		stats->loop_stats[duration/100]++;
+	}
+}
+
 
 /***
  * Internal function definitions.
@@ -1141,8 +1149,7 @@ static void update_energy_statistics(struct rq* rq, struct energy_task* e_task) 
 	duration = read_rapl_counters(cur_counters, true);
 
 	stats->nr_updates++;
-	stats->nr_defers++;
-	stats->us_defered += duration;
+	stats->us_looped += duration;
 
 	__update_rapl_counter(&(stats->uj_package), __diff_wa(cur_counters->package, old_counters.package),
 			duration, gri.loop_package);
@@ -1153,6 +1160,7 @@ static void update_energy_statistics(struct rq* rq, struct energy_task* e_task) 
 	__update_rapl_counter(&(stats->uj_gpu), __diff_wa(cur_counters->gpu, old_counters.gpu),
 			duration, gri.loop_gpu);
 
+	__update_loop_statistics(stats, duration);
 }
 
 /* Update the runtime statistics of a thread of an energy task.

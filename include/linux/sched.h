@@ -1340,17 +1340,17 @@ struct energy_statistics {
 	/* How many updates have been done already. */
 	u64 nr_updates;
 
-	/* How often have we waited for an update. */
-	u64 nr_defers;
-
 	/* How much time have we spent waiting for updates. */
-	u64 us_defered;
+	u64 us_looped;
 
 	/* The energy consumed by the task. */
 	u64 uj_package;
 	u64 uj_dram;
 	u64 uj_core;
 	u64 uj_gpu;
+
+	/* The loop duration statistics. */
+	int loop_stats[11];
 };
 
 union rcu_special {
