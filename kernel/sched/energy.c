@@ -605,6 +605,10 @@ static void unlock_grq(void) __releases(grq.lock) {
 	do_raw_spin_unlock(&(grq.lock));
 }
 
+/* Initialize the given RAPL counter structure.
+ *
+ * @counters:	the structure which should be initialized.
+ */
 static void init_rapl_counters(struct rapl_counters* counters) {
 	counters->last_update = ktime_set(0, 0);
 	counters->package = 0;
@@ -613,6 +617,15 @@ static void init_rapl_counters(struct rapl_counters* counters) {
 	counters->gpu = 0;
 }
 
+/* Read the latest RAPL counters from the hardware.
+ *
+ * @counters:	the structure where the latest values should be stored.
+ * @wait_for_update: whether or not it should be waited until a new RAPL
+ *		     update is available.
+ *
+ * @returns:	the duration in us which was waited, or 0 if no waiting was
+ *		performed at all.
+ */
 static u64 read_rapl_counters(struct rapl_counters* counters,
 		bool wait_for_update) {
 	u64 duration = 0;
@@ -636,6 +649,11 @@ static u64 read_rapl_counters(struct rapl_counters* counters,
 	return duration;
 }
 
+/* Copy RAPL counters.
+ *
+ * @from:	the structure where we should copy the information from.
+ * @to:		the structure where we should copy the information to.
+ */
 static void copy_rapl_counters(struct rapl_counters* from, struct rapl_counters* to) {
 	to->last_update = from->last_update;
 
@@ -1005,6 +1023,10 @@ static inline bool should_switch_to_energy(struct rq* rq) {
 	}
 }
 
+/* Decide if we need to release or acquire the CPUs while waiting.
+ *
+ * @returns:	whether or not we should check the CPUs.
+ */
 static inline bool should_check_cpus(void) {
 	return grq.nr_tasks != 0;
 }
@@ -1464,6 +1486,10 @@ static struct task_struct* pick_next_local_task(struct rq* rq) {
 	return next;
 }
 
+/* Mark CPUs as unblocked while not executing an energy task on them.
+ *
+ * @domain:	the information which CPUs should be unblocked.
+ */
 static void acquire_cpus(struct cpumask* domain) {
 	unsigned int cpu;
 
@@ -1480,6 +1506,10 @@ static void acquire_cpus(struct cpumask* domain) {
 	}
  }
 
+/* Mark CPUs as blocked while not executing an energy task on them.
+ *
+ * @domain:	the information which CPUs should be blocked.
+ */
 static void release_cpus(struct cpumask* domain) {
 	unsigned int cpu;
 
@@ -1497,6 +1527,11 @@ static void release_cpus(struct cpumask* domain) {
 	}
 }
 
+/* Check if we need to block or unblock the current CPU. Do it if
+ * necessary.
+ *
+ * @rq:		the runqueue of the current CPU.
+ */
 static void check_local_cpu(struct rq* rq) {
 	lock_local_rq(rq);
 
@@ -1509,6 +1544,11 @@ static void check_local_cpu(struct rq* rq) {
 	unlock_local_rq(rq);
 }
 
+/* Check if CPUs need to be blocked or unblocked, to maintain a working
+ * system. Do it if necessary.
+ *
+ * @domain:	the information which CPUs should be checked.
+ */
 static void check_cpus(struct cpumask* domain) {
 	unsigned int cpu;
 
