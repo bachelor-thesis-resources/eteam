@@ -430,8 +430,6 @@ static void __distribute_energy_task(struct energy_task* e_task) {
 	for_each_cpu(cpu, &(e_task->domain)) {
 		struct rq* c_rq = cpu_rq(cpu);
 		set_energy_task(c_rq, e_task);
-
-		resched_curr_local(c_rq);
 	}
 
 }
@@ -1131,7 +1129,11 @@ static inline bool should_switch_in_energy(struct rq* rq, char* reason) {
  * @returns:	whether we should switch or not.
  */
 static inline bool should_switch_local(struct rq* rq) {
-	if (rq->en.nr_runnable <= 1) {
+	if (rq->en.curr == rq->en.idle && rq->en.nr_runnable != 0) {
+		/* The idle task is currently running, although we are having a different
+		 * task which can run. */
+		return true;
+	} else if (rq->en.nr_runnable <= 1) {
 		/* We can only switch locally if there are more than one thread assigned
 		 * to this runqueue. */
 		return false;
@@ -1293,6 +1295,11 @@ static void set_energy_task(struct rq* rq, struct energy_task* e_task) {
 
 	rq->en.curr_e_task = e_task;
 
+	/* We need to mark the runqueue to reschedule, as the idle thread must run now. */
+	if (rq->en.nr_runnable == 0) {
+		resched_curr_local(rq);
+	}
+
 	unlock_local_rq(rq);
 }
 
@@ -1342,8 +1349,6 @@ static void distribute_energy_task(struct rq* rq, struct energy_task* e_task) {
  * @t:		the linux task which should be assigned.
  */
 static void distribute_local_task(struct rq* rq, struct task_struct* t) {
-	clear_resched_curr_local(rq);
-
 	/* Update the CPU assigned to the local task. */
 	move_local_task(t, cpu_of(rq));
 
@@ -1351,6 +1356,11 @@ static void distribute_local_task(struct rq* rq, struct task_struct* t) {
 
 	/* Enqueue in the local runqueue. */
 	enqueue_running(rq, t);
+
+	/* Mark that we need to reschedule the current runqueue. */
+	if (rq->en.nr_runnable == 1) {
+		resched_curr_local(rq);
+	}
 
 	unlock_local_rq(rq);
 }
@@ -1377,6 +1387,10 @@ static void redistribute_energy_task(struct rq* rq, struct energy_task* e_task, 
 			__distribute_energy_task(e_task);
 		}
 	} else {
+		/* In any case, we need to reschedule the current runqueue, if a thread vanished. */
+		resched_curr_local(rq);
+		resched_curr(rq);
+
 		if (e_task->nr_runnable != 0) {
 			/* The energy task still has threads to run, so just redistribute them. */
 			__distribute_energy_task(e_task);
@@ -1831,6 +1845,7 @@ void yield_task_energy(struct rq* rq) {
 		 * threads of the same task are assigned to the same CPU. If
 		 * this is the case, a local rescheduling is performed. */
 		resched_curr_local(rq);
+		resched_curr(rq);
 	}
 }
 
@@ -1949,6 +1964,7 @@ void task_tick_energy(struct rq* rq, struct task_struct* t, int queued) {
 
 	if (should_switch_local(rq)) {
 		resched_curr_local(rq);
+		resched_curr(rq);
 	}
 
 	unlock_local_rq(rq);
