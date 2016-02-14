@@ -63,8 +63,8 @@ enum {
 	LOCAL_RQ_UNBLOCKING = 0x8
 };
 
-/* The default scheduling slice for one thread. --> 10ms <-- */
-static const u64 THREAD_SCHED_SLICE = 10000000ULL;
+/* The default scheduling slice for one thread in us. --> 100ms <-- */
+static const u64 THREAD_SCHED_SLICE = 100000ULL;
 
 /* The MSR numbers of the different RAPL counters. */
 enum {
@@ -157,7 +157,7 @@ struct energy_task {
 	struct list_head rq;
 
 	/* Runtime statistics */
-	u64 start_running;
+	ktime_t start_running;
 };
 
 /* The global runqueue for all task with their corresponding threads which
@@ -177,8 +177,8 @@ struct global_rq {
 	u32 nr_threads;
 
 	/* Runtime statistics */
-	u64 start_running;
-	u64 stop_running;
+	ktime_t start_running;
+	ktime_t stop_running;
 };
 
 /* The RAPL subsystem state. */
@@ -486,7 +486,7 @@ static inline void __switch_from_energy(struct rq* rq, char reason) {
 	trace_sched_energy_switch_from(grq.nr_threads, nr_running(), reason);
 
 	grq.running = 0;
-	grq.stop_running = rq_clock(rq);
+	grq.stop_running = ktime_get();
 
 	release_cpus(&(rq->en.domain));
 }
@@ -495,7 +495,7 @@ static inline void __switch_to_energy(struct rq* rq, char reason) {
 	trace_sched_energy_switch_to(grq.nr_threads, nr_running(), reason);
 
 	grq.running = 1;
-	grq.start_running = rq_clock(rq);
+	grq.start_running = ktime_get();
 
 	acquire_cpus(&(rq->en.domain));
 }
@@ -602,8 +602,8 @@ static void __init init_grq(void) {
 	grq.nr_tasks = 0;
 	grq.nr_threads = 0;
 
-	grq.stop_running = 0;
-	grq.start_running = 0;
+	grq.start_running = ktime_set(0, 0);
+	grq.stop_running = ktime_set(0, 0);
 }
 
 /* Lock the global runqueue. */
@@ -757,7 +757,7 @@ static void init_energy_task(struct energy_task* e_task) {
 	INIT_LIST_HEAD(&(e_task->runnable));
 	e_task->nr_runnable = 0;
 
-	e_task->start_running = 0;
+	e_task->start_running = ktime_set(0, 0);
 }
 
 /* Enqueue an energy task in the global runqueue.
@@ -1039,8 +1039,8 @@ static inline bool should_switch_to_energy(struct rq* rq, char* reason) {
 		if (reason) *reason = 'Z';
 		return true;
 	} else {
-		u64 now = rq_clock(rq);
-		u64 not_running = now <= grq.stop_running ? 0 : now - grq.stop_running;
+		ktime_t now = ktime_get();
+		u64 not_running = ktime_us_delta(now, grq.stop_running);
 
 		if (not_running > sched_slice_other()) {
 			if (reason) *reason = 'T';
@@ -1075,8 +1075,8 @@ static inline bool should_switch_from_energy(struct rq* rq, char* reason) {
 		/* There are only threads of energy tasks in the system. */
 		return false;
 	} else {
-		u64 now = rq_clock(rq);
-		u64 running = now <= grq.start_running ? 0 : now - grq.start_running;
+		ktime_t now = ktime_get();
+		u64 running = ktime_us_delta(now, grq.start_running);
 
 		if (running > sched_slice_class()) {
 			if (reason) *reason = 'T';
@@ -1110,8 +1110,8 @@ static inline bool should_switch_in_energy(struct rq* rq, char* reason) {
 		 * of the energy task. */
 		struct energy_task* e_task = rq->en.curr_e_task;
 
-		u64 now = rq_clock(rq);
-		u64 running = now <= e_task->start_running ? 0 : now - e_task->start_running;
+		ktime_t now = ktime_get();
+		u64 running = ktime_us_delta(now, e_task->start_running);
 
 		if (running > sched_slice_energy(e_task)) {
 			if (reason) *reason = 'T';
@@ -1322,7 +1322,7 @@ static inline void set_local_task(struct rq* rq, struct task_struct* t) {
 static void distribute_energy_task(struct rq* rq, struct energy_task* e_task) {
 	/* Mark the energy task running. */
 	e_task->state = ETASK_RUNNING;
-	e_task->start_running = rq_clock(rq);
+	e_task->start_running = ktime_get();
 
 	/* Copy the current energy domain. */
 	cpumask_copy(&(e_task->domain), &(rq->en.domain));
