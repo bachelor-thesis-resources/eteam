@@ -2750,7 +2750,7 @@ static int proc_energy_statistics(struct seq_file *m, struct pid_namespace *ns,
 			      "loop_time (us) : %llu\n",
 			   stats->uj_package, stats->uj_dram, stats->uj_core,
 			   stats->uj_gpu, stats->nr_updates,
-			   stats->us_looped / stats->nr_updates);
+			   stats->nr_updates != 0 ? stats->us_looped / stats->nr_updates : 0);
 
 		seq_printf(m, "\nLoop Statistics\n"
 			      "0-99    : %d\n"
