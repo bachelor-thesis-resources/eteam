@@ -18,6 +18,8 @@
 #include "sched.h"
 #include "cpuacct.h"
 
+//#define ENERGY_ACCOUNTING
+
 
 /***
  * Internal constants
@@ -1287,8 +1289,10 @@ static void distribute_energy_task(struct rq* rq, struct energy_task* e_task) {
 	/* Copy the current energy domain. */
 	cpumask_copy(&(e_task->domain), &(rq->en.domain));
 
+#ifdef ENERGY_ACCOUNTING
 	/* Get the current RAPL counters. */
-	read_rapl_counters(&(e_task->counters), true);
+	read_rapl_counters(&(e_task->counters), false);
+#endif
 
 	__distribute_energy_task(e_task);
 }
@@ -1397,8 +1401,10 @@ static void clear_local_tasks(struct rq* rq) {
  * @e_task:	the energy task which should not run any more.
  */
 static void put_energy_task(struct rq* rq, struct energy_task* e_task) {
+#ifdef ENERGY_ACCOUNTING
 	/* Update the energy task's statistics. */
 	update_energy_statistics(rq, e_task);
+#endif
 
 	/* Tell all CPUs to stop executing the threads of the current
 	 * energy task. */
@@ -2159,7 +2165,9 @@ int __init init_rapl_subsystem(void) {
 	return 0;
 }
 
+#ifdef ENERGY_ACCOUNTING
 late_initcall(init_rapl_subsystem);
+#endif
 
 /* Initialize the energy scheduling class. */
 void __init init_sched_energy_class(void) {
