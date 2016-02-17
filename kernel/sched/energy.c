@@ -1459,21 +1459,9 @@ static void redistribute_energy_task(struct rq* rq, struct energy_task* e_task, 
 			__distribute_energy_task(e_task);
 		}
 	} else {
-		/* In any case, we need to reschedule the current runqueue, if a thread vanished. */
-		resched_curr_local(rq);
-		resched_curr(rq);
-
-		if (e_task->nr_runnable != 0) {
-			/* The energy task still has threads to run, so just redistribute them. */
-			__distribute_energy_task(e_task);
-		} else {
-			/* The energy task has no threads to run anymore. Remove the task. */
-			put_energy_task(rq, e_task);
-
-			if (grq.nr_tasks == 0 ) {
-				__switch_from_energy(rq, 'R');
-			}
-		}
+		/* A currently executed energy task was dequeued from the runqueue. So stop
+		 * the whole execution and let other tasks running. */
+		switch_from_energy(rq, e_task, 'R');
 	}
 }
 
@@ -1956,6 +1944,8 @@ void check_preempt_curr_energy(struct rq* rq, struct task_struct* t, int flags) 
 struct task_struct* pick_next_task_energy(struct rq* rq, struct task_struct* prev) {
 	lock_grq();
 
+	check_local_cpu(rq);
+
 	if (!grq.running) {
 		char reason;
 		if (should_switch_to_energy(rq, &reason))
@@ -1971,8 +1961,6 @@ struct task_struct* pick_next_task_energy(struct rq* rq, struct task_struct* pre
 		else if (should_switch_in_energy(rq, &reason))
 			switch_in_energy(rq, curr_e_task, pick_next_energy_task(), reason);
 	}
-
-	check_local_cpu(rq);
 
 	unlock_grq();
 
