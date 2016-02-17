@@ -5,11 +5,12 @@
 
 #include <linux/cpuidle.h>
 #include <linux/cpumask.h>
-#include <linux/list.h>
-#include <linux/slab.h>
-#include <linux/spinlock.h>
 #include <linux/kthread.h>
 #include <linux/ktime.h>
+#include <linux/list.h>
+#include <linux/slab.h>
+#include <linux/smp.h>
+#include <linux/spinlock.h>
 #include <linux/syscalls.h>
 #include <linux/timekeeping.h>
 
