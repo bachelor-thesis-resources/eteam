@@ -196,6 +196,14 @@ struct rapl_info {
 	u32 loop_gpu;
 };
 
+/* The remote reschedule request struct. */
+struct remote_resched_request {
+	/* The smp_call data structure. */
+	struct call_single_data csd;
+	volatile bool done;
+};
+
+
 /***
  * Internal variables.
  ***/
@@ -203,6 +211,9 @@ struct rapl_info {
 static struct global_rq grq;
 
 static struct rapl_info gri;
+
+static DEFINE_PER_CPU(struct remote_resched_request, remote_rescheds);
+
 
 /***
  * Internal function prototypes.
@@ -212,6 +223,9 @@ static struct rapl_info gri;
 static void init_grq(void);
 static void lock_grq(void);
 static void unlock_grq(void);
+
+/* Init the remote resched requests. */
+static void init_remote_rescheds(void);
 
 /* Working with the rapl counters. */
 static void init_rapl_counters(struct rapl_counters*);
@@ -391,6 +405,52 @@ static inline void __dec_nr_running(struct rq* rq) {
 	rq->en.nr_assigned--;
 }
 
+/* Function used to reschedule the runqueue remotely. */
+static inline void __remote_resched_func(void* data) {
+	struct rq* rq = this_rq();
+
+	trace_sched_energy_remote_resched(rq->nr_running, rq->en.nr_runnable, rq->en.nr_assigned);
+
+	raw_spin_lock(&rq->lock);
+	resched_curr(rq);
+	raw_spin_unlock(&rq->lock);
+
+	((struct remote_resched_request*)data)->done = true;
+}
+
+/* Remotely reschedule a runqueue.
+ *
+ * @rq:		the remote runqueue which should be rescheduled.
+ */
+static inline void __resched_remote_rq(struct rq* rq) {
+	unsigned int cpu = cpu_of(rq);
+	struct remote_resched_request* request = &per_cpu(remote_rescheds, cpu);
+
+	if (request->done) {
+		request->csd.func = __remote_resched_func;
+		request->csd.info = request;
+		request->csd.flags = 0;
+
+		request->done = false;
+
+		smp_call_function_single_async(cpu, &(request->csd));
+	}
+}
+
+/* Properly reschedule a runqueue.
+ *
+ * This handles also all cases where the runqueue is not on the current core.
+ *
+ * @rq:		the runqueue which should be rescheduled.
+ */
+static inline void __resched_rq(struct rq* rq) {
+	if (cpu_of(rq) == smp_processor_id()) {
+		resched_curr(rq);
+	} else {
+		__resched_remote_rq(rq);
+	}
+}
+
 static void __distribute_energy_task(struct energy_task* e_task) {
 	struct task_struct* thread;
 	int cpu;
@@ -454,7 +514,7 @@ static inline void __unblock_cpu(struct rq* rq) {
 		rq->en.state = LOCAL_RQ_UNBLOCKING;
 	}
 
-	set_tsk_need_resched(rq->curr);
+	__resched_rq(rq);
 }
 
 static inline bool __is_blocked_cpu(struct rq* rq) {
@@ -477,7 +537,7 @@ static inline void __block_cpu(struct rq* rq) {
 		rq->en.state = LOCAL_RQ_BLOCKING;
 	}
 
-	set_tsk_need_resched(rq->curr);
+	__resched_rq(rq);
 }
 
 static inline void __switch_from_energy(struct rq* rq, char reason) {
@@ -612,6 +672,17 @@ static void lock_grq(void) __acquires(grq.lock) {
 /* Unlock the global runqueue. */
 static void unlock_grq(void) __releases(grq.lock) {
 	do_raw_spin_unlock(&(grq.lock));
+}
+
+/* Initialize the per CPU remote resched request structs. */
+static void __init init_remote_rescheds(void) {
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct remote_resched_request* request = &per_cpu(remote_rescheds, cpu);
+
+		request->done = true;
+	}
 }
 
 /* Initialize the given RAPL counter structure.
@@ -1176,7 +1247,7 @@ static inline bool should_redistribute_energy(struct energy_task* e_task,
 static inline void resched_curr_local(struct rq* rq) {
 	rq->en.resched_flags |= LOCAL_RESCHED;
 
-	set_tsk_need_resched(rq->curr);
+	__resched_rq(rq);
 }
 
 /* Check if we must perform a local rescheduling.
@@ -1444,7 +1515,7 @@ static void clear_local_tasks(struct rq* rq) {
 	unlock_local_rq(rq);
 
 	/* Force rescheduling on the runqueue. */
-	set_tsk_need_resched(rq->curr);
+	__resched_rq(rq);
 }
 
 /* Remove the energy task e_task as currently running one.
@@ -1845,7 +1916,6 @@ void yield_task_energy(struct rq* rq) {
 		 * threads of the same task are assigned to the same CPU. If
 		 * this is the case, a local rescheduling is performed. */
 		resched_curr_local(rq);
-		resched_curr(rq);
 	}
 }
 
@@ -1977,7 +2047,6 @@ void task_tick_energy(struct rq* rq, struct task_struct* t, int queued) {
 
 	if (should_switch_local(rq)) {
 		resched_curr_local(rq);
-		resched_curr(rq);
 	}
 
 	unlock_local_rq(rq);
@@ -2247,6 +2316,7 @@ late_initcall(init_rapl_subsystem);
 /* Initialize the energy scheduling class. */
 void __init init_sched_energy_class(void) {
 	init_grq();
+	init_remote_rescheds();
 }
 
 /* The system call to start energy measurements.
