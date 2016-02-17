@@ -194,6 +194,105 @@ TRACE_EVENT(sched_energy_local_dequeue,
 		__entry->nr_runnable, __entry->nr_assigned)
 );
 
+/* Executed a remote reschedule request. */
+TRACE_EVENT(sched_energy_remote_resched,
+	TP_PROTO(int nr_normal, int nr_runnable, int nr_assigned),
+
+	TP_ARGS(nr_normal, nr_runnable, nr_assigned),
+
+	TP_STRUCT__entry(
+		__field(int,	nr_normal)
+		__field(int,	nr_runnable)
+		__field(int,	nr_assigned)
+	),
+
+	TP_fast_assign(
+		__entry->nr_normal = nr_normal;
+		__entry->nr_runnable = nr_runnable;
+		__entry->nr_assigned = nr_assigned;
+	),
+
+	TP_printk("normal=%d runnable=%d assigned=%d", __entry->nr_normal, __entry->nr_runnable,
+		__entry->nr_assigned)
+);
+
+/* An energy scheduling task gets removed from the CPU. */
+TRACE_EVENT(sched_energy_put_prev,
+	TP_PROTO(struct task_struct* tsk),
+
+	TP_ARGS(tsk),
+
+	TP_STRUCT__entry(
+		__field(pid_t,	pid)
+	),
+
+	TP_fast_assign(
+		__entry->pid = tsk->pid;
+	),
+
+	TP_printk("pid=%d", __entry->pid)
+);
+
+/* An energy scheduling task gets assigned to a CPU. */
+TRACE_EVENT(sched_energy_set_curr,
+	TP_PROTO(struct task_struct* tsk),
+
+	TP_ARGS(tsk),
+
+	TP_STRUCT__entry(
+		__field(pid_t,	pid)
+	),
+
+	TP_fast_assign(
+		__entry->pid = tsk->pid;
+	),
+
+	TP_printk("pid=%d", __entry->pid)
+);
+
+/* The energy scheduling class's pick_next_task was called. */
+TRACE_EVENT(sched_energy_missing_resched_curr_local,
+	TP_PROTO(int nr_normal, int nr_runnable),
+
+	TP_ARGS(nr_normal, nr_runnable),
+
+	TP_STRUCT__entry(
+		__field(int,	nr_normal)
+		__field(int,	nr_runnable)
+	),
+
+	TP_fast_assign(
+		__entry->nr_normal = nr_normal;
+		__entry->nr_runnable = nr_runnable;
+	),
+
+	TP_printk("normal=%d runnable=%d", __entry->nr_normal, __entry->nr_runnable)
+);
+
+/* The energy scheduling class's pick_next_task was called. */
+TRACE_EVENT(sched_energy_pick_next_task,
+	TP_PROTO(struct task_struct* tsk, int nr_normal, int nr_runnable, int nr_assigned),
+
+	TP_ARGS(tsk, nr_normal, nr_runnable, nr_assigned),
+
+	TP_STRUCT__entry(
+		__field(pid_t,	pid)
+		__field(int,	nr_normal)
+		__field(int,	nr_runnable)
+		__field(int,	nr_assigned)
+	),
+
+	TP_fast_assign(
+		__entry->pid = tsk ? tsk->pid : -1;
+		__entry->nr_normal = nr_normal;
+		__entry->nr_runnable = nr_runnable;
+		__entry->nr_assigned = nr_assigned;
+	),
+
+	TP_printk("pid=%d normal=%d runnable=%d assigned=%d", __entry->pid,
+		__entry->nr_normal, __entry->nr_runnable, __entry->nr_assigned)
+);
+
 #endif /* _TRACE_SCHED_ENERGY_H */
 
 /* This part must be outside protection */

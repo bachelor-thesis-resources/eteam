@@ -1911,7 +1911,16 @@ struct task_struct* pick_next_task_energy(struct rq* rq, struct task_struct* pre
 
 		/* Select a new thread which should run on this CPU. */
 		pick_next_local_task(rq);
+	} else if (rq->en.curr == NULL && grq.running == 1) {
+		trace_sched_energy_missing_resched_curr_local(rq->nr_running, rq->en.nr_runnable);
+
+		put_prev_task(rq, prev);
+
+		pick_next_local_task(rq);
 	}
+
+	trace_sched_energy_pick_next_task(rq->en.curr, rq->nr_running, rq->en.nr_runnable,
+			rq->en.nr_assigned);
 
 	return rq->en.curr;
 }
@@ -1922,6 +1931,8 @@ struct task_struct* pick_next_task_energy(struct rq* rq, struct task_struct* pre
  * @t:		the task struct of the linux task which should give up the CPU.
  */
 void put_prev_task_energy(struct rq* rq, struct task_struct* t) {
+	trace_sched_energy_put_prev(t);
+
 	put_local_task(rq, t);
 }
 
@@ -1931,6 +1942,8 @@ void put_prev_task_energy(struct rq* rq, struct task_struct* t) {
  */
 void set_curr_task_energy(struct rq* rq) {
 	struct task_struct* curr = rq->curr;
+
+	trace_sched_energy_set_curr(curr);
 
 	lock_local_rq(rq);
 
