@@ -1408,7 +1408,7 @@ static void distribute_energy_task(struct rq* rq, struct energy_task* e_task) {
 
 #ifdef ENERGY_ACCOUNTING
 	/* Get the current RAPL counters. */
-	read_rapl_counters(&(e_task->counters), false);
+	read_rapl_counters(&(e_task->counters), true);
 #endif
 
 	__distribute_energy_task(e_task);
