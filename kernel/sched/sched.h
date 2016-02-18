@@ -534,7 +534,6 @@ struct e_rq {
 
 	/* The state of this runqueue. */
 	int state;
-	bool blocked;
 
 	/* The energy domain which should be measured. */
 	struct cpumask domain;

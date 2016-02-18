@@ -195,25 +195,53 @@ TRACE_EVENT(sched_energy_local_dequeue,
 );
 
 /* Executed a remote reschedule request. */
-TRACE_EVENT(sched_energy_remote_resched,
-	TP_PROTO(int nr_normal, int nr_runnable, int nr_assigned),
+TRACE_EVENT(sched_energy_resched_cpu,
+	TP_PROTO(int nr_normal, int nr_runnable, int nr_assigned, int remote),
 
-	TP_ARGS(nr_normal, nr_runnable, nr_assigned),
+	TP_ARGS(nr_normal, nr_runnable, nr_assigned, remote),
 
 	TP_STRUCT__entry(
 		__field(int,	nr_normal)
 		__field(int,	nr_runnable)
 		__field(int,	nr_assigned)
+		__field(int,	remote)
 	),
 
 	TP_fast_assign(
 		__entry->nr_normal = nr_normal;
 		__entry->nr_runnable = nr_runnable;
 		__entry->nr_assigned = nr_assigned;
+		__entry->remote = remote;
 	),
 
-	TP_printk("normal=%d runnable=%d assigned=%d", __entry->nr_normal, __entry->nr_runnable,
-		__entry->nr_assigned)
+	TP_printk("normal=%d runnable=%d assigned=%d remote=%d", __entry->nr_normal,
+		__entry->nr_runnable, __entry->nr_assigned, __entry->remote)
+);
+
+/* The CPU is managed to enable time sharing with CFS. */
+TRACE_EVENT(sched_energy_manage_cpu,
+	TP_PROTO(int state, int new_state, int nr_normal, int nr_assigned, int remote),
+
+	TP_ARGS(state, new_state, nr_normal, nr_assigned, remote),
+
+	TP_STRUCT__entry(
+		__field(char,	state)
+		__field(char,	new_state)
+		__field(int,	nr_normal)
+		__field(int,	nr_assigned)
+		__field(int,	remote)
+	),
+
+	TP_fast_assign(
+		__entry->state = state == 0x1 ? 'B' : 'U';
+		__entry->new_state = new_state == 0x1 ? 'B' : 'U';
+		__entry->nr_normal = nr_normal;
+		__entry->nr_assigned = nr_assigned;
+		__entry->remote = remote;
+	),
+
+	TP_printk("%c->%c normal=%d assigned=%d remote=%d", __entry->state, __entry->new_state,
+		__entry->nr_normal, __entry->nr_assigned, __entry->remote)
 );
 
 /* An energy scheduling task gets removed from the CPU. */

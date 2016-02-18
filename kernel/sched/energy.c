@@ -58,10 +58,7 @@ enum {
 /* Local runqueue states. */
 enum {
 	LOCAL_RQ_BLOCKED = 0x1,
-	LOCAL_RQ_BLOCKING = 0x2,
-
-	LOCAL_RQ_UNBLOCKED = 0x4,
-	LOCAL_RQ_UNBLOCKING = 0x8
+	LOCAL_RQ_UNBLOCKED = 0x2,
 };
 
 /* The default scheduling slice for one thread in us. --> 100ms <-- */
@@ -199,9 +196,35 @@ struct rapl_info {
 
 /* The remote reschedule request struct. */
 struct remote_resched_request {
+	/* Lock for the data structure. */
+	raw_spinlock_t lock;
+
 	/* The smp_call data structure. */
 	struct call_single_data csd;
-	volatile bool done;
+
+	/* Whether or not the request is currently on the fly or not. */
+	bool requested;
+
+	/* Whether or not the remote request was obsoleted by a local one. */
+	bool obsolete;
+};
+
+/* The remote CPU management request struct. */
+struct remote_cpu_management_request {
+	/* Lock for the data structure. */
+	raw_spinlock_t lock;
+
+	/* The smp_call data structure. */
+	struct call_single_data csd;
+
+	/* The state into which the CPU should be put. */
+	int new_state;
+
+	/* Whether or not the request is currently on the fly or not. */
+	bool requested;
+
+	/* Whether or not the remote request was obsoleted by a local one. */
+	bool obsolete;
 };
 
 
@@ -214,6 +237,7 @@ static struct global_rq grq;
 static struct rapl_info gri;
 
 static DEFINE_PER_CPU(struct remote_resched_request, remote_rescheds);
+static DEFINE_PER_CPU(struct remote_cpu_management_request, remote_cpu_managements);
 
 
 /***
@@ -227,6 +251,9 @@ static void unlock_grq(void);
 
 /* Init the remote resched requests. */
 static void init_remote_rescheds(void);
+
+/* Init the remote cpu management requests. */
+static void init_remote_cpu_managements(void);
 
 /* Working with the rapl counters. */
 static void init_rapl_counters(struct rapl_counters*);
@@ -315,6 +342,7 @@ static struct task_struct* pick_next_local_task(struct rq*);
 
 static void acquire_cpus(struct cpumask*);
 static void release_cpus(struct cpumask*);
+static void check_cpus(struct cpumask*);
 
 static void switch_to_energy(struct rq*, struct energy_task*, char);
 static void switch_from_energy(struct rq*, struct energy_task*, char);
@@ -385,7 +413,7 @@ void rq_offline_energy(struct rq*);
  * @rq:		the runqueue where the number of running tasks should be incremented.
  */
 static inline void __inc_nr_running(struct rq* rq) {
-	if (!rq->en.blocked) {
+	if (rq->en.state != LOCAL_RQ_BLOCKED) {
 		add_nr_running(rq, 1);
 	}
 
@@ -399,24 +427,47 @@ static inline void __inc_nr_running(struct rq* rq) {
  * @rq:		the runqueue where the number of running tasks should be decremented.
  */
 static inline void __dec_nr_running(struct rq* rq) {
-	if (!rq->en.blocked) {
+	if (rq->en.state != LOCAL_RQ_BLOCKED) {
 		sub_nr_running(rq, 1);
 	}
 
 	rq->en.nr_assigned--;
 }
 
+static inline void __obsolete_resched(struct rq* rq) {
+	struct remote_resched_request* r = &per_cpu(remote_rescheds, cpu_of(rq));
+
+	raw_spin_lock(&r->lock);
+	r->obsolete = true;
+	raw_spin_unlock(&r->lock);
+}
+
+static inline void __resched_rq(struct rq* rq, bool remote) {
+	if (!remote) {
+		__obsolete_resched(rq);
+	}
+
+	trace_sched_energy_resched_cpu(rq->nr_running, rq->en.nr_runnable, rq->en.nr_assigned, remote);
+
+	resched_curr(rq);
+}
+
 /* Function used to reschedule the runqueue remotely. */
 static inline void __remote_resched_func(void* data) {
 	struct rq* rq = this_rq();
-
-	trace_sched_energy_remote_resched(rq->nr_running, rq->en.nr_runnable, rq->en.nr_assigned);
+	struct remote_resched_request* r = data;
 
 	raw_spin_lock(&rq->lock);
-	resched_curr(rq);
+	raw_spin_lock(&r->lock);
+
+	if (!r->obsolete) {
+		__resched_rq(rq, true);
+	}
+	r->requested = false;
+
+	raw_spin_unlock(&r->lock);
 	raw_spin_unlock(&rq->lock);
 
-	((struct remote_resched_request*)data)->done = true;
 }
 
 /* Remotely reschedule a runqueue.
@@ -427,15 +478,18 @@ static inline void __resched_remote_rq(struct rq* rq) {
 	unsigned int cpu = cpu_of(rq);
 	struct remote_resched_request* request = &per_cpu(remote_rescheds, cpu);
 
-	if (request->done) {
+	raw_spin_lock(&request->lock);
+	request->obsolete = false;
+	if (!request->requested) {
 		request->csd.func = __remote_resched_func;
 		request->csd.info = request;
 		request->csd.flags = 0;
 
-		request->done = false;
+		request->requested = true;
 
 		smp_call_function_single_async(cpu, &(request->csd));
 	}
+	raw_spin_unlock(&request->lock);
 }
 
 /* Properly reschedule a runqueue.
@@ -444,11 +498,87 @@ static inline void __resched_remote_rq(struct rq* rq) {
  *
  * @rq:		the runqueue which should be rescheduled.
  */
-static inline void __resched_rq(struct rq* rq) {
+static inline void __resched_curr(struct rq* rq) {
 	if (cpu_of(rq) == smp_processor_id()) {
-		resched_curr(rq);
+		__resched_rq(rq, false);
 	} else {
 		__resched_remote_rq(rq);
+	}
+}
+
+static inline void __manage_cpu(struct rq* rq, int new_state, bool remote) {
+	if (!remote) {
+		struct remote_cpu_management_request* r = &per_cpu(remote_cpu_managements, cpu_of(rq));
+
+		raw_spin_lock(&r->lock);
+		r->obsolete = true;
+		raw_spin_unlock(&r->lock);
+	}
+
+	if (rq->en.state != new_state) {
+		trace_sched_energy_manage_cpu(rq->en.state, new_state, rq->nr_running,
+				rq->en.nr_assigned, remote);
+
+		if (new_state == LOCAL_RQ_BLOCKED) {
+			sub_nr_running(rq, rq->en.nr_assigned);
+		} else if (new_state == LOCAL_RQ_UNBLOCKED) {
+			add_nr_running(rq, rq->en.nr_assigned);
+		}
+		rq->en.state = new_state;
+	}
+}
+
+static inline void __remote_manage_cpu_func(void* data) {
+	struct rq* rq = this_rq();
+	struct remote_cpu_management_request* r = data;
+
+	raw_spin_lock(&rq->lock);
+	lock_local_rq(rq);
+	raw_spin_lock(&r->lock);
+
+	if (!r->obsolete) {
+		__manage_cpu(rq, r->new_state, true);
+	}
+	r->requested = false;
+
+	raw_spin_unlock(&r->lock);
+	unlock_local_rq(rq);
+	raw_spin_unlock(&rq->lock);
+}
+
+static inline void __manage_remote_cpu(struct rq* rq, int new_state) {
+	unsigned int cpu = cpu_of(rq);
+	struct remote_cpu_management_request* request = &per_cpu(remote_cpu_managements, cpu);
+
+	raw_spin_lock(&request->lock);
+	request->new_state = new_state;
+	request->obsolete = false;
+
+	if (!request->requested) {
+		request->csd.func = __remote_manage_cpu_func;
+		request->csd.info = request;
+		request->csd.flags = 0;
+
+		request->requested = true;
+
+		smp_call_function_single_async(cpu, &(request->csd));
+	}
+	raw_spin_unlock(&request->lock);
+}
+
+static inline void __acquire_rq(struct rq* rq) {
+	if (cpu_of(rq) == smp_processor_id()) {
+		__manage_cpu(rq, LOCAL_RQ_UNBLOCKED, false);
+	} else {
+		__manage_remote_cpu(rq, LOCAL_RQ_UNBLOCKED);
+	}
+}
+
+static inline void __release_rq(struct rq* rq) {
+	if (cpu_of(rq) == smp_processor_id()) {
+		__manage_cpu(rq, LOCAL_RQ_BLOCKED, false);
+	} else {
+		__manage_remote_cpu(rq, LOCAL_RQ_BLOCKED);
 	}
 }
 
@@ -493,52 +623,6 @@ static void __distribute_energy_task(struct energy_task* e_task) {
 		set_energy_task(c_rq, e_task);
 	}
 
-}
-
-static inline bool __is_unblocked_cpu(struct rq* rq) {
-	return rq->en.state == LOCAL_RQ_UNBLOCKED || rq->en.state == LOCAL_RQ_UNBLOCKING;
-}
-
-static inline void __unblock_cpu_local(struct rq* rq) {
-	if (rq->en.blocked) {
-		add_nr_running(rq, rq->en.nr_assigned);
-	}
-
-	rq->en.state = LOCAL_RQ_UNBLOCKED;
-	rq->en.blocked = false;
-}
-
-static inline void __unblock_cpu(struct rq* rq) {
-	if (rq->en.state == LOCAL_RQ_BLOCKING) {
-		rq->en.state = LOCAL_RQ_UNBLOCKED;
-	} else if (rq->en.state == LOCAL_RQ_BLOCKED) {
-		rq->en.state = LOCAL_RQ_UNBLOCKING;
-	}
-
-	__resched_rq(rq);
-}
-
-static inline bool __is_blocked_cpu(struct rq* rq) {
-	return rq->en.state == LOCAL_RQ_BLOCKED || rq->en.state == LOCAL_RQ_BLOCKING;
-}
-
-static inline void __block_cpu_local(struct rq* rq) {
-	if (!rq->en.blocked) {
-		sub_nr_running(rq, rq->en.nr_assigned);
-	}
-
-	rq->en.state = LOCAL_RQ_BLOCKED;
-	rq->en.blocked = true;
-}
-
-static inline void __block_cpu(struct rq* rq) {
-	if (rq->en.state == LOCAL_RQ_UNBLOCKING) {
-		rq->en.state = LOCAL_RQ_BLOCKED;
-	} else if (rq->en.state == LOCAL_RQ_UNBLOCKED) {
-		rq->en.state = LOCAL_RQ_BLOCKING;
-	}
-
-	__resched_rq(rq);
 }
 
 static inline void __switch_from_energy(struct rq* rq, char reason) {
@@ -682,7 +766,22 @@ static void __init init_remote_rescheds(void) {
 	for_each_possible_cpu(cpu) {
 		struct remote_resched_request* request = &per_cpu(remote_rescheds, cpu);
 
-		request->done = true;
+		raw_spin_lock_init(&request->lock);
+		request->requested = false;
+		request->obsolete = false;
+	}
+}
+
+/* Initialize the per CPU remote CPU management request structs. */
+static void __init init_remote_cpu_managements(void) {
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct remote_cpu_management_request* request = &per_cpu(remote_cpu_managements, cpu);
+
+		raw_spin_lock_init(&request->lock);
+		request->requested = false;
+		request->obsolete = false;
 	}
 }
 
@@ -1248,7 +1347,7 @@ static inline bool should_redistribute_energy(struct energy_task* e_task,
 static inline void resched_curr_local(struct rq* rq) {
 	rq->en.resched_flags |= LOCAL_RESCHED;
 
-	__resched_rq(rq);
+	__resched_curr(rq);
 }
 
 /* Check if we must perform a local rescheduling.
@@ -1504,7 +1603,7 @@ static void clear_local_tasks(struct rq* rq) {
 	unlock_local_rq(rq);
 
 	/* Force rescheduling on the runqueue. */
-	__resched_rq(rq);
+	__resched_curr(rq);
 }
 
 /* Remove the energy task e_task as currently running one.
@@ -1619,11 +1718,9 @@ static void acquire_cpus(struct cpumask* domain) {
 		struct rq* c_rq = cpu_rq(cpu);
 
 		lock_local_rq(c_rq);
-
-		if (__is_blocked_cpu(c_rq)) {
-			__unblock_cpu(c_rq);
+		if (c_rq->en.state == LOCAL_RQ_BLOCKED) {
+			__acquire_rq(c_rq);
 		}
-
 		unlock_local_rq(c_rq);
 	}
  }
@@ -1639,31 +1736,11 @@ static void release_cpus(struct cpumask* domain) {
 		struct rq* c_rq = cpu_rq(cpu);
 
 		lock_local_rq(c_rq);
-
-		if (__is_unblocked_cpu(c_rq) &&
-				c_rq->nr_running == c_rq->en.nr_assigned) {
-			__block_cpu(c_rq);
+		if (c_rq->en.state == LOCAL_RQ_UNBLOCKED && c_rq->nr_running == c_rq->en.nr_assigned) {
+			__release_rq(c_rq);
 		}
-
 		unlock_local_rq(c_rq);
 	}
-}
-
-/* Check if we need to block or unblock the current CPU. Do it if
- * necessary.
- *
- * @rq:		the runqueue of the current CPU.
- */
-static void check_local_cpu(struct rq* rq) {
-	lock_local_rq(rq);
-
-	if (rq->en.state == LOCAL_RQ_BLOCKING) {
-		__block_cpu_local(rq);
-	} else if (rq->en.state == LOCAL_RQ_UNBLOCKING) {
-		__unblock_cpu_local(rq);
-	}
-
-	unlock_local_rq(rq);
 }
 
 /* Check if CPUs need to be blocked or unblocked, to maintain a working
@@ -1678,13 +1755,11 @@ static void check_cpus(struct cpumask* domain) {
 		struct rq* c_rq = cpu_rq(cpu);
 
 		lock_local_rq(c_rq);
-
 		if (c_rq->en.state == LOCAL_RQ_BLOCKED && c_rq->nr_running > 0) {
-			__unblock_cpu(c_rq);
+			__acquire_rq(c_rq);
 		} else if (c_rq->en.state == LOCAL_RQ_UNBLOCKED && c_rq->nr_running == c_rq->en.nr_assigned) {
-			__block_cpu(c_rq);
+			__release_rq(c_rq);
 		}
-
 		unlock_local_rq(c_rq);
 	}
 }
@@ -1942,9 +2017,9 @@ void check_preempt_curr_energy(struct rq* rq, struct task_struct* t, int flags) 
  * @returns:	the task struct of the linux task which should run next.
  */
 struct task_struct* pick_next_task_energy(struct rq* rq, struct task_struct* prev) {
-	lock_grq();
+	__obsolete_resched(rq);
 
-	check_local_cpu(rq);
+	lock_grq();
 
 	if (!grq.running) {
 		char reason;
@@ -2247,7 +2322,6 @@ void __init init_e_rq(struct e_rq* e_rq, unsigned int cpu) {
 	e_rq->resched_flags = 0;
 
 	e_rq->state = LOCAL_RQ_BLOCKED;
-	e_rq->blocked = true;
 
 	init_energy_domain(&(e_rq->domain), cpu);
 
@@ -2306,6 +2380,7 @@ late_initcall(init_rapl_subsystem);
 void __init init_sched_energy_class(void) {
 	init_grq();
 	init_remote_rescheds();
+	init_remote_cpu_managements();
 }
 
 /* The system call to start energy measurements.
