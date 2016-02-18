@@ -1551,8 +1551,17 @@ static void redistribute_energy_task(struct rq* rq, struct energy_task* e_task, 
 		}
 
 		if (e_task->state != ETASK_RUNNING) {
-			/* Make an internal switch. */
-			switch_in_energy(rq, rq->en.curr_e_task, e_task, 'R');
+			lock_local_rq(rq);
+			if (rq->en.curr_e_task == NULL) {
+				unlock_local_rq(rq);
+
+				distribute_energy_task(rq, e_task);
+			} else {
+				struct energy_task* curr_e_task = rq->en.curr_e_task;
+				unlock_local_rq(rq);
+
+				switch_in_energy(rq, curr_e_task, e_task, 'D');
+			}
 		} else {
 			/* The energy task is already running, so just redistribute it. */
 			__distribute_energy_task(e_task);
@@ -1560,7 +1569,14 @@ static void redistribute_energy_task(struct rq* rq, struct energy_task* e_task, 
 	} else {
 		/* A currently executed energy task was dequeued from the runqueue. So stop
 		 * the whole execution and let other tasks running. */
-		switch_from_energy(rq, e_task, 'R');
+		lock_local_rq(rq);
+		if (rq->en.curr_e_task == e_task) {
+			unlock_local_rq(rq);
+			switch_from_energy(rq, e_task, 'R');
+		} else {
+			resched_curr_local(rq);
+			unlock_local_rq(rq);
+		}
 	}
 }
 
@@ -2081,7 +2097,7 @@ void set_curr_task_energy(struct rq* rq) {
 
 	lock_local_rq(rq);
 
-	if (!thread_on_rq_queued(curr)) {
+	if (!thread_on_cpu_rq_queued(curr)) {
 		enqueue_running(rq, curr);
 	}
 	set_local_task(rq, curr);
