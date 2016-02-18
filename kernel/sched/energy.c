@@ -1815,11 +1815,13 @@ static void switch_from_energy(struct rq* rq, struct energy_task* from, char rea
  */
 static void switch_in_energy(struct rq* rq, struct energy_task* from,
 		struct energy_task* to, char reason) {
-	if (from)
+	if (from) {
 		put_energy_task(rq, from);
+	}
 
-	if (to)
+	if (to) {
 		distribute_energy_task(rq, to);
+	}
 
 	trace_sched_energy_switch_in(reason);
 }
