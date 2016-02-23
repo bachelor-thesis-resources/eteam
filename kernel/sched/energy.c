@@ -155,7 +155,8 @@ struct energy_task {
 	struct list_head rq;
 
 	/* Runtime statistics */
-	ktime_t start_running;
+	ktime_t start_exec;
+	u64 exec_time;
 };
 
 /* The global runqueue for all task with their corresponding threads which
@@ -926,7 +927,8 @@ static void init_energy_task(struct energy_task* e_task) {
 	INIT_LIST_HEAD(&(e_task->runnable));
 	e_task->nr_runnable = 0;
 
-	e_task->start_running = ktime_set(0, 0);
+	e_task->start_exec = ktime_set(0, 0);
+	e_task->exec_time = 0;
 }
 
 /* Enqueue an energy task in the global runqueue.
@@ -1279,10 +1281,7 @@ static inline bool should_switch_in_energy(struct rq* rq, char* reason) {
 		 * of the energy task. */
 		struct energy_task* e_task = rq->en.curr_e_task;
 
-		ktime_t now = ktime_get();
-		u64 running = ktime_us_delta(now, e_task->start_running);
-
-		if (running > sched_slice_energy(e_task)) {
+		if (e_task->exec_time >= sched_slice_energy(e_task)) {
 			if (reason) *reason = 'T';
 			return true;
 		} else {
@@ -1321,7 +1320,7 @@ static inline bool should_switch_local(struct rq* rq) {
 
 		exec_time = curr->se.sum_exec_runtime - curr->se.prev_sum_exec_runtime;
 
-		return exec_time > sched_slice_local(rq);
+		return exec_time >= sched_slice_local(rq);
 	}
 }
 
@@ -1396,6 +1395,22 @@ static void update_energy_statistics(struct rq* rq, struct energy_task* e_task) 
 			duration, gri.loop_gpu);
 
 	__update_loop_statistics(stats, duration);
+}
+
+/* Update the runtime statistics of an energy task.
+ *
+ * @rq:		the runqueue of the current CPU.
+ * @e_task:	the energy task struct of the energy task.
+ */
+static void update_task_statistics(struct rq* rq, struct energy_task* e_task) {
+	ktime_t now = ktime_get();
+
+	if (!e_task) {
+		return;
+	}
+
+	e_task->exec_time += ktime_us_delta(now, e_task->start_exec);
+	e_task->start_exec = now;
 }
 
 /* Update the runtime statistics of a thread of an energy task.
@@ -1500,7 +1515,7 @@ static inline void set_local_task(struct rq* rq, struct task_struct* t) {
 static void distribute_energy_task(struct rq* rq, struct energy_task* e_task) {
 	/* Mark the energy task running. */
 	e_task->state = ETASK_RUNNING;
-	e_task->start_running = ktime_get();
+	e_task->start_exec = ktime_get();
 
 	/* Copy the current energy domain. */
 	cpumask_copy(&(e_task->domain), &(rq->en.domain));
@@ -1632,6 +1647,8 @@ static void put_energy_task(struct rq* rq, struct energy_task* e_task) {
 	/* Update the energy task's statistics. */
 	update_energy_statistics(rq, e_task);
 #endif
+	/* Update the runtime statistics of the energy task. */
+	update_task_statistics(rq, e_task);
 
 	/* Tell all CPUs to stop executing the threads of the current
 	 * energy task. */
@@ -1641,9 +1658,17 @@ static void put_energy_task(struct rq* rq, struct energy_task* e_task) {
 
 	cpumask_clear(&(e_task->domain));
 
-	/* Check if we can remove the energy task again. */
 	if (e_task->nr_runnable == 0) {
+		/* Check if we can remove the energy task again. */
 		free_energy_task(e_task);
+	} else if (e_task->exec_time >= sched_slice_energy(e_task)) {
+		/* The energy task has depleted its scheduling slice, so let another
+		 * task run instead. */
+		e_task->exec_time = 0;
+
+		/* Rotate the list of energy tasks so that next time another task
+		 * is selected to run. */
+		list_rotate_left(&(grq.tasks));
 	}
 }
 
@@ -1671,20 +1696,15 @@ static void put_local_task(struct rq* rq, struct task_struct* t) {
  * @returns:	the energy task which should run next.
  */
 static struct energy_task* pick_next_energy_task(void) {
-	struct energy_task* head = list_first_entry(&(grq.tasks), struct energy_task, rq);
+	struct energy_task* next_e_task;
 
-	/* Go through the whole list by rotating it and try to find an energy task which is
-	 * not running already but has runnable threads. */
-	do {
-		struct energy_task* next_e_task = list_first_entry(&(grq.tasks),
-				struct energy_task, rq);
-		list_rotate_left(&(grq.tasks));
-
-		if ((next_e_task->state == 0) && (next_e_task->nr_runnable != 0)) {
-			/* We have found our next energy task. */
+	/* Go through the list starting at the first one and find an energy task which
+	 * can be executed. */
+	list_for_each_entry(next_e_task, &(grq.tasks), rq) {
+		if (next_e_task->state != ETASK_RUNNING && next_e_task->nr_runnable != 0) {
 			return next_e_task;
 		}
-	} while (head != list_first_entry(&(grq.tasks), struct energy_task, rq));
+	}
 
 	/* We could not find any task. */
 	return NULL;
@@ -2118,6 +2138,8 @@ void task_tick_energy(struct rq* rq, struct task_struct* t, int queued) {
 	update_local_statistics(rq, t);
 
 	lock_grq();
+
+	update_task_statistics(rq, rq->en.curr_e_task);
 
 	if (should_switch_in_energy(rq, NULL) || should_switch_from_energy(rq, NULL)) {
 		resched_curr(rq);
