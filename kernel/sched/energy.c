@@ -2003,6 +2003,8 @@ void dequeue_task_energy(struct rq* rq, struct task_struct* t, int flags) {
 
 	if (should_redistribute_energy(e_task, t)) {
 		redistribute_energy_task(rq, e_task, false);
+	} else if (e_task->nr_runnable == 0) {
+		free_energy_task(e_task);
 	}
 
 	unlock_grq();
