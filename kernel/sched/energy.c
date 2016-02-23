@@ -625,8 +625,8 @@ static void __distribute_energy_task(struct energy_task* e_task) {
 
 }
 
-static inline void __switch_from_energy(struct rq* rq, char reason) {
-	trace_sched_energy_switch_from(grq.nr_threads, nr_running(), reason);
+static inline void __switch_from_energy(struct rq* rq, struct energy_task* e_task, char reason) {
+	trace_sched_energy_switch_from(grq.nr_threads, nr_running(), e_task, reason);
 
 	grq.running = 0;
 	grq.stop_running = ktime_get();
@@ -634,8 +634,8 @@ static inline void __switch_from_energy(struct rq* rq, char reason) {
 	release_cpus(&(rq->en.domain));
 }
 
-static inline void __switch_to_energy(struct rq* rq, char reason) {
-	trace_sched_energy_switch_to(grq.nr_threads, nr_running(), reason);
+static inline void __switch_to_energy(struct rq* rq, struct energy_task* e_task, char reason) {
+	trace_sched_energy_switch_to(grq.nr_threads, nr_running(), e_task, reason);
 
 	grq.running = 1;
 	grq.start_running = ktime_get();
@@ -1547,7 +1547,7 @@ static void distribute_local_task(struct rq* rq, struct task_struct* t) {
 static void redistribute_energy_task(struct rq* rq, struct energy_task* e_task, bool arrived) {
 	if (arrived) {
 		if (!grq.running) {
-			__switch_to_energy(rq, 'R');
+			__switch_to_energy(rq, e_task, 'R');
 		}
 
 		if (e_task->state != ETASK_RUNNING) {
@@ -1787,7 +1787,7 @@ static void check_cpus(struct cpumask* domain) {
  */
 static void switch_to_energy(struct rq* rq, struct energy_task* to, char reason) {
 	if (to) {
-		__switch_to_energy(rq, reason);
+		__switch_to_energy(rq, to, reason);
 
 		distribute_energy_task(rq, to);
 	}
@@ -1803,7 +1803,7 @@ static void switch_from_energy(struct rq* rq, struct energy_task* from, char rea
 		put_energy_task(rq, from);
 	}
 
-	__switch_from_energy(rq, reason);
+	__switch_from_energy(rq, from, reason);
 }
 
 /* Switch from one energy task to another one within the energy scheduling
@@ -1823,7 +1823,7 @@ static void switch_in_energy(struct rq* rq, struct energy_task* from,
 		distribute_energy_task(rq, to);
 	}
 
-	trace_sched_energy_switch_in(reason);
+	trace_sched_energy_switch_in(from, to, reason);
 }
 
 /* Set and initialize the energy domain of a given CPU.

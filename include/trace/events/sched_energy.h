@@ -13,63 +13,72 @@
 
 /* Switching to the energy scheduling class. */
 TRACE_EVENT(sched_energy_switch_from,
-	TP_PROTO(int nr_energy, int nr_total, char reason),
+	TP_PROTO(int nr_energy, int nr_total, void* e_task, char reason),
 
-	TP_ARGS(nr_energy, nr_total, reason),
+	TP_ARGS(nr_energy, nr_total, e_task, reason),
 
 	TP_STRUCT__entry(
 		__field(int,	nr_energy)
 		__field(int,	nr_total)
+		__field(void*,	e_task)
 		__field(char,	reason)
 	),
 
 	TP_fast_assign(
 		__entry->nr_energy = nr_energy;
 		__entry->nr_total = nr_total;
+		__entry->e_task = e_task;
 		__entry->reason = reason;
 	),
 
-	TP_printk("energy=%d total=%d reason=%c", __entry->nr_energy, __entry->nr_total,
-		__entry->reason)
+	TP_printk("energy=%d total=%d task=%p reason=%c", __entry->nr_energy, __entry->nr_total,
+		__entry->e_task, __entry->reason)
 );
 
 /* Switching from the energy scheduling class. */
 TRACE_EVENT(sched_energy_switch_to,
-	TP_PROTO(int nr_energy, int nr_total, char reason),
+	TP_PROTO(int nr_energy, int nr_total, void* e_task, char reason),
 
-	TP_ARGS(nr_energy, nr_total, reason),
+	TP_ARGS(nr_energy, nr_total, e_task, reason),
 
 	TP_STRUCT__entry(
 		__field(int,	nr_energy)
 		__field(int,	nr_total)
+		__field(void*,	e_task)
 		__field(char,	reason)
 	),
 
 	TP_fast_assign(
 		__entry->nr_energy = nr_energy;
 		__entry->nr_total = nr_total;
+		__entry->e_task = e_task;
 		__entry->reason = reason;
 	),
 
-	TP_printk("energy=%d total=%d reason=%c", __entry->nr_energy, __entry->nr_total,
-		__entry->reason)
+	TP_printk("energy=%d total=%d task=%p reason=%c", __entry->nr_energy, __entry->nr_total,
+		__entry->e_task, __entry->reason)
 );
 
 /* Switching inside the energy scheduling class. */
 TRACE_EVENT(sched_energy_switch_in,
-	TP_PROTO(char reason),
+	TP_PROTO(void* e_task1, void* e_task2, char reason),
 
-	TP_ARGS(reason),
+	TP_ARGS(e_task1, e_task2, reason),
 
 	TP_STRUCT__entry(
+		__field(void*,	e_task1)
+		__field(void*,	e_task2)
 		__field(char,	reason)
 	),
 
 	TP_fast_assign(
+		__entry->e_task1 = e_task1;
+		__entry->e_task2 = e_task2;
 		__entry->reason = reason;
 	),
 
-	TP_printk("reason=%c", __entry->reason)
+	TP_printk("task1=%p task2=%p reason=%c", __entry->e_task1, __entry->e_task2,
+		__entry->reason)
 );
 
 /* Running the idle thread. */
