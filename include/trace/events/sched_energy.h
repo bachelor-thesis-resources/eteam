@@ -61,24 +61,26 @@ TRACE_EVENT(sched_energy_switch_to,
 
 /* Switching inside the energy scheduling class. */
 TRACE_EVENT(sched_energy_switch_in,
-	TP_PROTO(void* e_task1, void* e_task2, char reason),
+	TP_PROTO(void* e_task1, void* e_task2, int nr_tasks, char reason),
 
-	TP_ARGS(e_task1, e_task2, reason),
+	TP_ARGS(e_task1, e_task2, nr_tasks, reason),
 
 	TP_STRUCT__entry(
 		__field(void*,	e_task1)
 		__field(void*,	e_task2)
+		__field(int,	nr_tasks)
 		__field(char,	reason)
 	),
 
 	TP_fast_assign(
 		__entry->e_task1 = e_task1;
 		__entry->e_task2 = e_task2;
+		__entry->nr_tasks = nr_tasks;
 		__entry->reason = reason;
 	),
 
-	TP_printk("task1=%p task2=%p reason=%c", __entry->e_task1, __entry->e_task2,
-		__entry->reason)
+	TP_printk("task1=%p task2=%p tasks=%d reason=%c", __entry->e_task1, __entry->e_task2,
+		__entry->nr_tasks, __entry->reason)
 );
 
 /* Running the idle thread. */
