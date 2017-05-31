@@ -332,6 +332,40 @@ TRACE_EVENT(sched_energy_pick_next_task,
 		__entry->nr_normal, __entry->nr_runnable, __entry->nr_assigned)
 );
 
+TRACE_EVENT(sched_energy_read_rapl_counters_before,
+	TP_PROTO(bool wait),
+
+	TP_ARGS(wait),
+
+	TP_STRUCT__entry(
+		__field(bool,	wait)
+	),
+
+	TP_fast_assign(
+		__entry->wait = wait;
+	),
+
+	TP_printk("wait=%i", __entry->wait)
+);
+
+TRACE_EVENT(sched_energy_read_rapl_counters_after,
+	TP_PROTO(bool wait, u64 duration),
+
+	TP_ARGS(wait, duration),
+
+	TP_STRUCT__entry(
+		__field(bool,	wait)
+		__field(u64,	duration)
+	),
+
+	TP_fast_assign(
+		__entry->wait = wait;
+		__entry->duration = duration;
+	),
+
+	TP_printk("wait=%i duration=%llu", __entry->wait, __entry->duration)
+);
+
 TRACE_EVENT(sched_energy_power_usage,
 	TP_PROTO(struct task_struct* tsk, u32 pkg, u32 dram, u32 core),
 

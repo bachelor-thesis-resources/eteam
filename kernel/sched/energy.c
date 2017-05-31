@@ -822,6 +822,8 @@ static u64 read_rapl_counters(struct rapl_counters* counters,
 		bool wait_for_update) {
 	u64 duration = 0;
 
+	trace_sched_energy_read_rapl_counters_before(wait_for_update);
+
 	if (wait_for_update) {
 		__read_rapl_msr_until_update(&(counters->package), ENERGY_PKG,
 				MASK_PKG, OFFSET_PKG, &(counters->last_update),
@@ -837,6 +839,8 @@ static u64 read_rapl_counters(struct rapl_counters* counters,
 	__read_rapl_msr(&(counters->dram), ENERGY_DRAM, MASK_DRAM, OFFSET_DRAM);
 	__read_rapl_msr(&(counters->core), ENERGY_CORE, MASK_CORE, OFFSET_CORE);
 	__read_rapl_msr(&(counters->gpu), ENERGY_GPU, MASK_GPU, OFFSET_GPU);
+
+	trace_sched_energy_read_rapl_counters_after(wait_for_update, duration);
 
 	return duration;
 }
