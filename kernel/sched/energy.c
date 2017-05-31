@@ -300,7 +300,7 @@ static void dequeue_running(struct rq*, struct task_struct*);
 static u64 sched_slice_class(void);
 static u64 sched_slice_energy(struct energy_task*);
 static u64 sched_slice_local(struct rq*);
-static u64 sched_slice_other(void);
+static u64 sched_slice_other(unsigned long);
 
 /* Should we perform a scheduling operation? */
 static bool should_switch_to_energy(struct rq*, char*);
@@ -1183,8 +1183,8 @@ static inline u64 sched_slice_local(struct rq* rq) {
  *
  * @returns:	the runtime for other scheduling class.
  */
-static inline u64 sched_slice_other(void) {
-	return (nr_running() - grq.nr_threads) * THREAD_SCHED_SLICE;
+static inline u64 sched_slice_other(unsigned long nr_total) {
+	return nr_total < grq.nr_threads ? 0 : (nr_total - grq.nr_threads) * THREAD_SCHED_SLICE;
 }
 
 /* Decide if we should switch to the energy sched class from another one.
@@ -1194,14 +1194,16 @@ static inline u64 sched_slice_other(void) {
  * @returns:	whether we should switch or not.
  */
 static inline bool should_switch_to_energy(struct rq* rq, char* reason) {
+	unsigned long nr_total = nr_running();
+
 	if (grq.nr_threads == 0) {
 		/* We have no threads to schedule currently. */
 		return false;
-	} else if (nr_running() == grq.nr_threads) {
+	} else if (nr_total == grq.nr_threads) {
 		/* There are only threads of energy tasks in the system. */
 		if (reason) *reason = 'N';
 		return true;
-	} else if (nr_running() == rq->en.nr_assigned) {
+	} else if (nr_total == rq->en.nr_assigned) {
 		/* All other runqueues run the idle thread and this runqueue only has
 		 * threads from energy tasks. */
 		if (reason) *reason = 'n';
@@ -1214,7 +1216,7 @@ static inline bool should_switch_to_energy(struct rq* rq, char* reason) {
 		ktime_t now = ktime_get();
 		u64 not_running = ktime_us_delta(now, grq.stop_running);
 
-		if (not_running > sched_slice_other()) {
+		if (not_running > sched_slice_other(nr_total)) {
 			if (reason) *reason = 'T';
 			return true;
 		} else {
