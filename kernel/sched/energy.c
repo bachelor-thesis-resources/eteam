@@ -627,7 +627,7 @@ static void __distribute_energy_task(struct energy_task* e_task) {
 }
 
 static inline void __switch_from_energy(struct rq* rq, struct energy_task* e_task, char reason) {
-	trace_sched_energy_switch_from(grq.nr_threads, nr_running(), e_task, reason);
+	trace_sched_energy_switch_from(grq.nr_threads, nr_running(), e_task ? e_task->task : NULL, reason);
 
 	grq.running = 0;
 	grq.stop_running = ktime_get();
@@ -636,7 +636,7 @@ static inline void __switch_from_energy(struct rq* rq, struct energy_task* e_tas
 }
 
 static inline void __switch_to_energy(struct rq* rq, struct energy_task* e_task, char reason) {
-	trace_sched_energy_switch_to(grq.nr_threads, nr_running(), e_task, reason);
+	trace_sched_energy_switch_to(grq.nr_threads, nr_running(), e_task ? e_task->task : NULL, reason);
 
 	grq.running = 1;
 	grq.start_running = ktime_get();
@@ -1839,11 +1839,11 @@ static void switch_in_energy(struct rq* rq, struct energy_task* from,
 		put_energy_task(rq, from);
 	}
 
+	trace_sched_energy_switch_in(from ? from->task : NULL, to ? to->task : NULL, grq.nr_tasks, reason);
+
 	if (to) {
 		distribute_energy_task(rq, to);
 	}
-
-	trace_sched_energy_switch_in(from, to, reason);
 }
 
 /* Set and initialize the energy domain of a given CPU.

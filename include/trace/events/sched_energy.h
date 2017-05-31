@@ -13,73 +13,73 @@
 
 /* Switching to the energy scheduling class. */
 TRACE_EVENT(sched_energy_switch_from,
-	TP_PROTO(int nr_energy, int nr_total, void* e_task, char reason),
+	TP_PROTO(int nr_energy, int nr_total, struct task_struct* task, char reason),
 
-	TP_ARGS(nr_energy, nr_total, e_task, reason),
+	TP_ARGS(nr_energy, nr_total, task, reason),
 
 	TP_STRUCT__entry(
 		__field(int,	nr_energy)
 		__field(int,	nr_total)
-		__field(void*,	e_task)
+		__field(pid_t,	pid)
 		__field(char,	reason)
 	),
 
 	TP_fast_assign(
 		__entry->nr_energy = nr_energy;
 		__entry->nr_total = nr_total;
-		__entry->e_task = e_task;
+		__entry->pid = task ? task->pid : 0;
 		__entry->reason = reason;
 	),
 
-	TP_printk("energy=%d total=%d task=%p reason=%c", __entry->nr_energy, __entry->nr_total,
-		__entry->e_task, __entry->reason)
+	TP_printk("energy=%d total=%d task=%d reason=%c", __entry->nr_energy, __entry->nr_total,
+		__entry->pid, __entry->reason)
 );
 
 /* Switching from the energy scheduling class. */
 TRACE_EVENT(sched_energy_switch_to,
-	TP_PROTO(int nr_energy, int nr_total, void* e_task, char reason),
+	TP_PROTO(int nr_energy, int nr_total, struct task_struct* task, char reason),
 
-	TP_ARGS(nr_energy, nr_total, e_task, reason),
+	TP_ARGS(nr_energy, nr_total, task, reason),
 
 	TP_STRUCT__entry(
 		__field(int,	nr_energy)
 		__field(int,	nr_total)
-		__field(void*,	e_task)
+		__field(pid_t,	pid)
 		__field(char,	reason)
 	),
 
 	TP_fast_assign(
 		__entry->nr_energy = nr_energy;
 		__entry->nr_total = nr_total;
-		__entry->e_task = e_task;
+		__entry->pid = task ? task->pid : 0;
 		__entry->reason = reason;
 	),
 
-	TP_printk("energy=%d total=%d task=%p reason=%c", __entry->nr_energy, __entry->nr_total,
-		__entry->e_task, __entry->reason)
+	TP_printk("energy=%d total=%d task=%d reason=%c", __entry->nr_energy, __entry->nr_total,
+		__entry->pid, __entry->reason)
 );
 
 /* Switching inside the energy scheduling class. */
 TRACE_EVENT(sched_energy_switch_in,
-	TP_PROTO(void* e_task1, void* e_task2, int nr_tasks, char reason),
+	TP_PROTO(struct task_struct* task1, struct task_struct* task2, int nr_tasks, char reason),
 
-	TP_ARGS(e_task1, e_task2, nr_tasks, reason),
+	TP_ARGS(task1, task2, nr_tasks, reason),
 
 	TP_STRUCT__entry(
-		__field(void*,	e_task1)
-		__field(void*,	e_task2)
+		__field(pid_t,	pid1)
+		__field(pid_t,	pid2)
 		__field(int,	nr_tasks)
 		__field(char,	reason)
 	),
 
 	TP_fast_assign(
-		__entry->e_task1 = e_task1;
-		__entry->e_task2 = e_task2;
+		__entry->pid1 = task1 ? task1->pid : 0;
+		__entry->pid2 = task2 ? task2->pid : 0;
 		__entry->nr_tasks = nr_tasks;
 		__entry->reason = reason;
 	),
 
-	TP_printk("task1=%p task2=%p tasks=%d reason=%c", __entry->e_task1, __entry->e_task2,
+	TP_printk("task1=%d task2=%d tasks=%d reason=%c", __entry->pid1, __entry->pid2,
 		__entry->nr_tasks, __entry->reason)
 );
 
