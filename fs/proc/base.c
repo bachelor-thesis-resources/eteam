@@ -2735,8 +2735,27 @@ static int proc_pid_personality(struct seq_file *m, struct pid_namespace *ns,
 	return err;
 }
 
-static int proc_energy_statistics(struct seq_file *m, struct pid_namespace *ns,
-				  struct pid *pid, struct task_struct *task)
+static int proc_energy_stats(struct seq_file *m, struct pid_namespace *ns,
+		struct pid *pid, struct task_struct *task)
+{
+	int err = lock_trace(task);
+	if (!err) {
+		struct energy_statistics *stats = &(task->e_statistics);
+
+		seq_printf(m, "%llu %llu %llu %llu %llu %llu %llu %llu\n",
+			   stats->uj_package/10, stats->uj_dram/10, stats->uj_core/10,
+			   stats->uj_gpu/10, stats->nr_updates, stats->nr_looped,
+			   stats->us_looped,
+			   stats->nr_looped != 0 ? stats->us_looped / stats->nr_looped: 0);
+
+		unlock_trace(task);
+	}
+
+	return err;
+}
+
+static int proc_energy_status(struct seq_file *m, struct pid_namespace *ns,
+		struct pid *pid, struct task_struct *task)
 {
 	int err = lock_trace(task);
 	if (!err) {
@@ -2747,10 +2766,11 @@ static int proc_energy_statistics(struct seq_file *m, struct pid_namespace *ns,
 			      "core (uJ)      : %llu\n"
 			      "gpu (uJ)       : %llu\n"
 			      "updates (#)    : %llu\n"
+			      "loops (#)      : %llu\n"
 			      "loop_time (us) : %llu\n",
-			   stats->uj_package / 10, stats->uj_dram / 10,
-			   stats->uj_core / 10, stats->uj_gpu / 10, stats->nr_updates,
-			   stats->nr_updates != 0 ? stats->us_looped / stats->nr_updates : 0);
+			   stats->uj_package/10, stats->uj_dram/10, stats->uj_core/10,
+			   stats->uj_gpu/10, stats->nr_updates, stats->nr_looped,
+			   stats->nr_looped != 0 ? stats->us_looped / stats->nr_looped : 0);
 
 		unlock_trace(task);
 	}
@@ -2758,18 +2778,20 @@ static int proc_energy_statistics(struct seq_file *m, struct pid_namespace *ns,
 	return err;
 }
 
-static int proc_loop_statistics(struct seq_file *m, struct pid_namespace *ns,
-				struct pid *pid, struct task_struct *task)
+static int proc_loop_status(struct seq_file *m, struct pid_namespace *ns,
+		struct pid *pid, struct task_struct *task)
 {
 	int err = lock_trace(task);
 	if (!err) {
 		struct energy_statistics* stats = &(task->e_statistics);
 
-		seq_printf(m, "loops (#)          : %llu\n"
-			      "loop_time (us)     : %llu\n"
-			      "avg_loop_time (us) : %llu\n"
+		seq_printf(m, "updates (#)    : %llu\n"
+			      "loops (#)      : %llu\n"
+			      "loop_time (us) : %llu\n"
+			      "loop_time (us) : %llu\n"
 			      "\n"
-			      "  0 -  99 : %d\n"
+			      "        0 : %d\n"
+			      "  1 -  99 : %d\n"
 			      "100 - 199 : %d\n"
 			      "200 - 299 : %d\n"
 			      "300 - 399 : %d\n"
@@ -2780,14 +2802,14 @@ static int proc_loop_statistics(struct seq_file *m, struct pid_namespace *ns,
 			      "800 - 899 : %d\n"
 			      "900 - 999 : %d\n"
 			      "    >1000 : %d\n",
-			   stats->nr_updates, stats->us_looped,
-			   stats->nr_updates != 0 ? stats->us_looped / stats->nr_updates : 0,
+			   stats->nr_updates, stats->nr_looped, stats->us_looped,
+			   stats->nr_looped != 0 ? stats->us_looped / stats->nr_looped : 0,
 			   stats->loop_stats[0], stats->loop_stats[1],
 			   stats->loop_stats[2], stats->loop_stats[3],
 			   stats->loop_stats[4], stats->loop_stats[5],
 			   stats->loop_stats[6], stats->loop_stats[7],
 			   stats->loop_stats[8], stats->loop_stats[9],
-			   stats->loop_stats[10]);
+			   stats->loop_stats[10], stats->loop_stats[11]);
 
 		unlock_trace(task);
 	}
@@ -2895,8 +2917,9 @@ static const struct pid_entry tgid_base_stuff[] = {
 #ifdef CONFIG_CHECKPOINT_RESTORE
 	REG("timers",	  S_IRUGO, proc_timers_operations),
 #endif
-	ONE("energystat", S_IRUGO, proc_energy_statistics),
-	ONE("loopstat", S_IRUGO, proc_loop_statistics),
+	ONE("energystat", S_IRUGO, proc_energy_stats),
+	ONE("energystatus", S_IRUGO, proc_energy_status),
+	ONE("loopstatus", S_IRUGO, proc_loop_status),
 };
 
 static int proc_tgid_base_readdir(struct file *file, struct dir_context *ctx)

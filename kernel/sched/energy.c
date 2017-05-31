@@ -326,7 +326,7 @@ static bool need_resched_curr_local(struct rq*);
 static void clear_resched_curr_local(struct rq*);
 
 /* Update runtime statistics. */
-static void update_energy_statistics(struct rq*, struct energy_task*, bool, bool);
+static void update_energy_statistics(struct rq*, struct energy_task*, bool);
 static void update_local_statistics(struct rq*, struct task_struct*);
 
 /* Schedule and remove energy tasks. */
@@ -736,9 +736,11 @@ static inline void __update_rapl_counter(u64* value, u32 consumption, u32 loop_d
 
 static inline void __update_loop_statistics(struct energy_statistics* stats, u64 duration) {
 	if ((duration / 100) >= 10) {
-		stats->loop_stats[10]++;
+		stats->loop_stats[11]++;
+	} else if (duration == 0) {
+		stats->loop_stats[0]++;
 	} else {
-		stats->loop_stats[duration/100]++;
+		stats->loop_stats[(duration/100)+1]++;
 	}
 }
 
@@ -1419,37 +1421,59 @@ static void __trace_power_usage(struct energy_task* e_task,
  *
  * @rq:		the runqueue of the current CPU.
  * @e_task:	the energy task struct of the energy task.
+ * @trace:	whether this is only a tracing update or not.
  */
 static void update_energy_statistics(struct rq* rq, struct energy_task* e_task,
-		bool wait, bool trace) {
+		bool trace) {
 	struct task_struct* task = e_task->task;
-	struct energy_statistics* stats = &(task->e_statistics);
+	struct energy_statistics* cur_stats = &(task->e_statistics);
 	struct energy_statistics old_stats;
 	struct rapl_counters* cur_counters = &(e_task->counters);
 	struct rapl_counters old_counters;
-	u64 duration;
+	u64 duration = 0;
+	ktime_t now = ktime_get();
 
 	copy_rapl_counters(cur_counters, &old_counters);
-	copy_energy_stats(stats, &old_stats);
-	duration = read_rapl_counters(cur_counters, wait);
+	copy_energy_stats(cur_stats, &old_stats);
 
-	stats->nr_updates++;
-	stats->us_looped += duration;
+	if (trace) {
+		read_rapl_counters(cur_counters, false);
 
-	__update_rapl_counter(&(stats->uj_package), __diff_wa(cur_counters->package, old_counters.package),
+		/* Since this is only an intermediate tracing update, restore the
+		 * counter time stamp of the last real update. */
+		cur_counters->last_update = old_counters.last_update;
+	} else if (ktime_ms_delta(now, old_counters.last_update) > 50) {
+		/* If just taking the raw RAPL counters would yield an error > 2%,
+		 * we must wait for an update, just to be sure that the energy that
+		 * we measure is correct. Since the RAPL counters are updated every
+		 * millisecond, having it least 50 ms since the last update means that
+		 * we have at least 50 updates of the hardware RAPL counters, which means,
+		 * that if we read the energy without waiting for an update this may
+		 * lead to one missed update and hence only yields an error of 2%. */
+		read_rapl_counters(cur_counters, false);
+
+		cur_stats->nr_updates++;
+	} else {
+		duration = read_rapl_counters(cur_counters, true);
+
+		cur_stats->nr_updates++;
+		cur_stats->nr_looped++;
+		cur_stats->us_looped += duration;
+
+		__update_loop_statistics(cur_stats, duration);
+	}
+
+	__update_rapl_counter(&(cur_stats->uj_package), __diff_wa(cur_counters->package, old_counters.package),
 			duration, gri.loop_package, gri.unit);
-	__update_rapl_counter(&(stats->uj_dram), __diff_wa(cur_counters->dram, old_counters.dram),
+	__update_rapl_counter(&(cur_stats->uj_dram), __diff_wa(cur_counters->dram, old_counters.dram),
 			duration, gri.loop_dram, gri.unit_dram);
-	__update_rapl_counter(&(stats->uj_core), __diff_wa(cur_counters->core, old_counters.core),
+	__update_rapl_counter(&(cur_stats->uj_core), __diff_wa(cur_counters->core, old_counters.core),
 			duration, gri.loop_core, gri.unit);
-	__update_rapl_counter(&(stats->uj_gpu), __diff_wa(cur_counters->gpu, old_counters.gpu),
+	__update_rapl_counter(&(cur_stats->uj_gpu), __diff_wa(cur_counters->gpu, old_counters.gpu),
 			duration, gri.loop_gpu, gri.unit);
 
-	if (wait)
-		__update_loop_statistics(stats, duration);
-
 	if (trace)
-		__trace_power_usage(e_task, stats, &old_stats, cur_counters, &old_counters, duration);
+		__trace_power_usage(e_task, cur_stats, &old_stats, cur_counters, &old_counters, duration);
 }
 
 /* Update the runtime statistics of an energy task.
@@ -1700,7 +1724,7 @@ static void clear_local_tasks(struct rq* rq) {
 static void put_energy_task(struct rq* rq, struct energy_task* e_task) {
 #ifdef ENERGY_ACCOUNTING
 	/* Update the energy task's statistics. */
-	update_energy_statistics(rq, e_task, true, false);
+	update_energy_statistics(rq, e_task, false);
 #endif
 	/* Update the runtime statistics of the energy task. */
 	update_task_statistics(rq, e_task);
@@ -2202,7 +2226,7 @@ void task_tick_energy(struct rq* rq, struct task_struct* t, int queued) {
 
 #ifdef TRACE_POWER_USAGE
 	if (grq.major_cpu == smp_processor_id() && rq->en.curr_e_task) {
-		update_energy_statistics(rq, rq->en.curr_e_task, false, true);
+		update_energy_statistics(rq, rq->en.curr_e_task, true);
 	}
 #endif
 
