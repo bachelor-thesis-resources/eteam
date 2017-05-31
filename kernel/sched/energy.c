@@ -1,6 +1,7 @@
 /* vim: set noet ts=8 sw=8 sts=8 : */
 
 #include <asm/msr.h>
+#include <asm/mwait.h>
 #include <asm/processor.h>
 
 #include <linux/cpuidle.h>
@@ -1859,9 +1860,13 @@ static void __init init_energy_domain(struct cpumask* domain, unsigned int cpu) 
 
 /* The idle thread function. */
 static int idle_thread_fn(void* unused) {
+	int dummy;
+
 	while (!kthread_should_stop()) {
-		while (!need_resched())
-			default_idle_call();
+		while (!need_resched()) {
+			__monitor(&dummy, 0, 0);
+			__mwait(0, 0);
+		}
 
 		schedule();
 	}
