@@ -191,6 +191,7 @@ struct rapl_info {
 
 	/* What is the energy unit of the RAPL counters. */
 	u32 unit;
+	u32 unit_dram;
 
 	/* How much energy is spent during looping at each counter. */
 	u32 loop_package;
@@ -718,19 +719,19 @@ static inline int __read_rapl_unit(u32* unit) {
 		return err;
 	}
 
-	/* The corresponding unit is (1/2) ^ val Joules. Hence calculate (10 ^ 6) /
-	 * (2 ^ val) and thereby get micro Joules. */
-	*unit = 1000000 / (1 << val);
+	/* The corresponding unit is (1/2) ^ val Joules. Hence I calculate (10 ^ 7) /
+	 * (2 ^ val) and thereby get micro Joules with one digit after the comma. */
+	*unit = 10000000 / (1 << val);
 
 	return 0;
 }
 
 static inline void __update_rapl_counter(u64* value, u32 consumption, u32 loop_duration,
-		u32 avg_loop_consumption) {
+		u32 avg_loop_consumption, u32 unit) {
 	u32 loop_consumption = (avg_loop_consumption * loop_duration) / gri.update_interval;
 	u32 final_consumption = loop_consumption > consumption ? 0 : consumption - loop_consumption;
 
-	*value += final_consumption * gri.unit;
+	*value += final_consumption * unit;
 }
 
 static inline void __update_loop_statistics(struct energy_statistics* stats, u64 duration) {
@@ -906,6 +907,7 @@ static void __init init_gri(void) {
 
 
 	__read_rapl_unit(&(gri.unit));
+	__read_rapl_unit(&(gri.unit_dram));
 }
 
 /* Lock the local energy rq embedded in the CPU runqueues.
@@ -1435,13 +1437,13 @@ static void update_energy_statistics(struct rq* rq, struct energy_task* e_task,
 	stats->us_looped += duration;
 
 	__update_rapl_counter(&(stats->uj_package), __diff_wa(cur_counters->package, old_counters.package),
-			duration, gri.loop_package);
+			duration, gri.loop_package, gri.unit);
 	__update_rapl_counter(&(stats->uj_dram), __diff_wa(cur_counters->dram, old_counters.dram),
-			duration, gri.loop_dram);
+			duration, gri.loop_dram, gri.unit_dram);
 	__update_rapl_counter(&(stats->uj_core), __diff_wa(cur_counters->core, old_counters.core),
-			duration, gri.loop_core);
+			duration, gri.loop_core, gri.unit);
 	__update_rapl_counter(&(stats->uj_gpu), __diff_wa(cur_counters->gpu, old_counters.gpu),
-			duration, gri.loop_gpu);
+			duration, gri.loop_gpu, gri.unit);
 
 	if (wait)
 		__update_loop_statistics(stats, duration);
@@ -2470,9 +2472,11 @@ late_initcall(init_e_idle_threads);
 int __init init_rapl_subsystem(void) {
 	init_gri();
 
-	printk(KERN_INFO "RAPL-subsystem initialized: %u %u %u %u %u\n",
-			gri.update_interval, gri.loop_package, gri.loop_dram,
-			gri.loop_core, gri.loop_gpu);
+	printk(KERN_INFO "RAPL-subsystem initialized: %u %u %u %u %u\n"
+			 "                            %u %u\n",
+			gri.update_interval, gri.loop_package * gri.unit / 10,
+			gri.loop_dram * gri.unit_dram / 10, gri.loop_core * gri.unit / 10,
+			gri.loop_gpu * gri.unit / 10, gri.unit, gri.unit_dram);
 
 	return 0;
 }

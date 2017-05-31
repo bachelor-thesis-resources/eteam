@@ -2748,8 +2748,8 @@ static int proc_energy_statistics(struct seq_file *m, struct pid_namespace *ns,
 			      "gpu (uJ)       : %llu\n"
 			      "updates (#)    : %llu\n"
 			      "loop_time (us) : %llu\n",
-			   stats->uj_package, stats->uj_dram, stats->uj_core,
-			   stats->uj_gpu, stats->nr_updates,
+			   stats->uj_package / 10, stats->uj_dram / 10,
+			   stats->uj_core / 10, stats->uj_gpu / 10, stats->nr_updates,
 			   stats->nr_updates != 0 ? stats->us_looped / stats->nr_updates : 0);
 
 		unlock_trace(task);
