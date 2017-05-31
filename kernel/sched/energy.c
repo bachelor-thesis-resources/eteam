@@ -25,7 +25,8 @@
 #include <trace/events/sched_energy.h>
 
 
-//#define ENERGY_ACCOUNTING
+#define ENERGY_ACCOUNTING
+//#define TRACE_POWER_USAGE
 
 
 /***
@@ -169,6 +170,8 @@ struct global_rq {
 	/* Is the scheduling class currently running. */
 	int running;
 
+	int major_cpu;
+
 	/* All energy tasks. */
 	struct list_head tasks;
 	u32 nr_tasks;
@@ -262,6 +265,9 @@ static void init_rapl_counters(struct rapl_counters*);
 static u64 read_rapl_counters(struct rapl_counters*, bool);
 static void copy_rapl_counters(struct rapl_counters*, struct rapl_counters*);
 
+/* Working with the energy statistics. */
+static void copy_energy_stats(struct energy_statistics*, struct energy_statistics*);
+
 /* Working with the global rapl info. */
 static void init_gri(void);
 
@@ -319,7 +325,7 @@ static bool need_resched_curr_local(struct rq*);
 static void clear_resched_curr_local(struct rq*);
 
 /* Update runtime statistics. */
-static void update_energy_statistics(struct rq*, struct energy_task*);
+static void update_energy_statistics(struct rq*, struct energy_task*, bool, bool);
 static void update_local_statistics(struct rq*, struct task_struct*);
 
 /* Schedule and remove energy tasks. */
@@ -640,6 +646,7 @@ static inline void __switch_to_energy(struct rq* rq, struct energy_task* e_task,
 	trace_sched_energy_switch_to(grq.nr_threads, nr_running(), e_task ? e_task->task : NULL, reason);
 
 	grq.running = 1;
+	grq.major_cpu = smp_processor_id();
 	grq.start_running = ktime_get();
 
 	acquire_cpus(&(rq->en.domain));
@@ -743,6 +750,9 @@ static inline void __update_loop_statistics(struct energy_statistics* stats, u64
 static void __init init_grq(void) {
 	raw_spin_lock_init(&(grq.lock));
 
+	grq.running = 0;
+	grq.major_cpu = 0;
+
 	INIT_LIST_HEAD(&(grq.tasks));
 	grq.nr_tasks = 0;
 	grq.nr_threads = 0;
@@ -843,6 +853,18 @@ static void copy_rapl_counters(struct rapl_counters* from, struct rapl_counters*
 	to->dram = from->dram;
 	to->core = from->core;
 	to->gpu = from->gpu;
+}
+
+/* Copy the collected energy statistics.
+ *
+ * @from:	the structure where we should copy the information from.
+ * @to:		the structure where we should copy the information to.
+ */
+static void copy_energy_stats(struct energy_statistics* from, struct energy_statistics* to) {
+	to->uj_package = from->uj_package;
+	to->uj_dram = from->uj_dram;
+	to->uj_core = from->uj_core;
+	to->uj_gpu = from->uj_gpu;
 }
 
 /* Initialize the global RAPL info. */
@@ -1370,20 +1392,40 @@ static inline void clear_resched_curr_local(struct rq* rq) {
 	rq->en.resched_flags &= ~LOCAL_RESCHED;
 }
 
+static void __trace_power_usage(struct energy_task* e_task,
+		struct energy_statistics* curr, struct energy_statistics* old,
+		struct rapl_counters* curr_cntr, struct rapl_counters* old_cntr,
+		u64 loop_us) {
+	u64 update_us = ktime_us_delta(curr_cntr->last_update, old_cntr->last_update);
+	u64 pkg, dram, core;
+
+	if (update_us > 200) {
+		pkg = ((curr->uj_package - old->uj_package) * 1000) / update_us;
+		dram = ((curr->uj_dram - old->uj_dram) * 1000) / update_us;
+		core = ((curr->uj_core - old->uj_core) * 1000) / update_us;
+
+		trace_sched_energy_power_usage(e_task->task, pkg, dram, core);
+	}
+
+}
+
 /* Update the energy statistics of an energy task.
  *
  * @rq:		the runqueue of the current CPU.
  * @e_task:	the energy task struct of the energy task.
  */
-static void update_energy_statistics(struct rq* rq, struct energy_task* e_task) {
+static void update_energy_statistics(struct rq* rq, struct energy_task* e_task,
+		bool wait, bool trace) {
 	struct task_struct* task = e_task->task;
 	struct energy_statistics* stats = &(task->e_statistics);
+	struct energy_statistics old_stats;
 	struct rapl_counters* cur_counters = &(e_task->counters);
 	struct rapl_counters old_counters;
 	u64 duration;
 
 	copy_rapl_counters(cur_counters, &old_counters);
-	duration = read_rapl_counters(cur_counters, true);
+	copy_energy_stats(stats, &old_stats);
+	duration = read_rapl_counters(cur_counters, wait);
 
 	stats->nr_updates++;
 	stats->us_looped += duration;
@@ -1397,7 +1439,11 @@ static void update_energy_statistics(struct rq* rq, struct energy_task* e_task) 
 	__update_rapl_counter(&(stats->uj_gpu), __diff_wa(cur_counters->gpu, old_counters.gpu),
 			duration, gri.loop_gpu);
 
-	__update_loop_statistics(stats, duration);
+	if (wait)
+		__update_loop_statistics(stats, duration);
+
+	if (trace)
+		__trace_power_usage(e_task, stats, &old_stats, cur_counters, &old_counters, duration);
 }
 
 /* Update the runtime statistics of an energy task.
@@ -1648,7 +1694,7 @@ static void clear_local_tasks(struct rq* rq) {
 static void put_energy_task(struct rq* rq, struct energy_task* e_task) {
 #ifdef ENERGY_ACCOUNTING
 	/* Update the energy task's statistics. */
-	update_energy_statistics(rq, e_task);
+	update_energy_statistics(rq, e_task, true, false);
 #endif
 	/* Update the runtime statistics of the energy task. */
 	update_task_statistics(rq, e_task);
@@ -2147,6 +2193,12 @@ void task_tick_energy(struct rq* rq, struct task_struct* t, int queued) {
 	update_local_statistics(rq, t);
 
 	lock_grq();
+
+#ifdef TRACE_POWER_USAGE
+	if (grq.major_cpu == smp_processor_id() && rq->en.curr_e_task) {
+		update_energy_statistics(rq, rq->en.curr_e_task, false, true);
+	}
+#endif
 
 	update_task_statistics(rq, rq->en.curr_e_task);
 

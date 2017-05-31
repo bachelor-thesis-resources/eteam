@@ -332,6 +332,29 @@ TRACE_EVENT(sched_energy_pick_next_task,
 		__entry->nr_normal, __entry->nr_runnable, __entry->nr_assigned)
 );
 
+TRACE_EVENT(sched_energy_power_usage,
+	TP_PROTO(struct task_struct* tsk, u32 pkg, u32 dram, u32 core),
+
+	TP_ARGS(tsk, pkg, dram, core),
+
+	TP_STRUCT__entry(
+		__field(pid_t,	pid)
+		__field(u32,	pkg)
+		__field(u32,	dram)
+		__field(u32,	core)
+	),
+
+	TP_fast_assign(
+		__entry->pid = tsk ? tsk->pid : -1;
+		__entry->pkg = pkg;
+		__entry->dram = dram;
+		__entry->core = core;
+	),
+
+	TP_printk("pid=%d pkg=%u dram=%u core=%u", __entry->pid, __entry->pkg, __entry->dram,
+		__entry->core)
+);
+
 #endif /* _TRACE_SCHED_ENERGY_H */
 
 /* This part must be outside protection */
