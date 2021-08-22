@@ -92,6 +92,7 @@ dotraplinkage void do_simd_coprocessor_error(struct pt_regs *, long);
 #ifdef CONFIG_X86_32
 dotraplinkage void do_iret_error(struct pt_regs *, long);
 #endif
+dotraplinkage void do_mce(struct pt_regs *, long);
 
 static inline int get_si_code(unsigned long condition)
 {
@@ -112,8 +113,8 @@ asmlinkage void smp_threshold_interrupt(void);
 asmlinkage void smp_deferred_error_interrupt(void);
 #endif
 
-extern enum ctx_state ist_enter(struct pt_regs *regs);
-extern void ist_exit(struct pt_regs *regs, enum ctx_state prev_state);
+extern void ist_enter(struct pt_regs *regs);
+extern void ist_exit(struct pt_regs *regs);
 extern void ist_begin_non_atomic(struct pt_regs *regs);
 extern void ist_end_non_atomic(void);
 

@@ -15,6 +15,8 @@
 #include <net/net_namespace.h>
 #include <linux/sched/rt.h>
 
+#include <asm/thread_info.h>
+
 #ifdef CONFIG_SMP
 # define INIT_PUSHABLE_TASKS(tsk)					\
 	.pushable_tasks = PLIST_NODE_INIT(tsk.pushable_tasks, MAX_PRIO),
@@ -32,6 +34,14 @@ extern struct fs_struct init_fs;
 #define INIT_CPUSET_SEQ(tsk)
 #endif
 
+#ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+#define INIT_PREV_CPUTIME(x)	.prev_cputime = {			\
+	.lock = __RAW_SPIN_LOCK_UNLOCKED(x.prev_cputime.lock),		\
+},
+#else
+#define INIT_PREV_CPUTIME(x)
+#endif
+
 #define INIT_SIGNALS(sig) {						\
 	.nr_threads	= 1,						\
 	.thread_head	= LIST_HEAD_INIT(init_task.thread_node),	\
@@ -44,8 +54,10 @@ extern struct fs_struct init_fs;
 	.rlim		= INIT_RLIMITS,					\
 	.cputimer	= { 						\
 		.cputime_atomic	= INIT_CPUTIME_ATOMIC,			\
-		.running	= 0,					\
+		.running	= false,				\
+		.checking_timer = false,				\
 	},								\
+	INIT_PREV_CPUTIME(sig)						\
 	.cred_guard_mutex =						\
 		 __MUTEX_INITIALIZER(sig.cred_guard_mutex),		\
 }
@@ -173,12 +185,19 @@ extern struct task_group root_task_group;
 # define INIT_KASAN(tsk)
 #endif
 
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+# define INIT_TASK_TI(tsk) .thread_info = INIT_THREAD_INFO(tsk),
+#else
+# define INIT_TASK_TI(tsk)
+#endif
+
 /*
  *  INIT_TASK is used to set up the first task table, touch at
  * your own risk!. Base=0, limit=0x1fffff (=2MB)
  */
 #define INIT_TASK(tsk)	\
 {									\
+	INIT_TASK_TI(tsk)						\
 	.state		= 0,						\
 	.stack		= &init_thread_info,				\
 	.usage		= ATOMIC_INIT(2),				\
@@ -246,6 +265,7 @@ extern struct task_group root_task_group;
 	INIT_TASK_RCU_TASKS(tsk)					\
 	INIT_CPUSET_SEQ(tsk)						\
 	INIT_RT_MUTEXES(tsk)						\
+	INIT_PREV_CPUTIME(tsk)						\
 	INIT_VTIME(tsk)							\
 	INIT_NUMA_BALANCING(tsk)					\
 	INIT_KASAN(tsk)							\

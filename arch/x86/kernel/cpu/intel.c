@@ -5,14 +5,16 @@
 #include <linux/smp.h>
 #include <linux/sched.h>
 #include <linux/thread_info.h>
-#include <linux/module.h>
+#include <linux/init.h>
 #include <linux/uaccess.h>
 
-#include <asm/processor.h>
+#include <asm/cpufeature.h>
 #include <asm/pgtable.h>
 #include <asm/msr.h>
 #include <asm/bugs.h>
 #include <asm/cpu.h>
+#include <asm/intel-family.h>
+#include <asm/microcode_intel.h>
 
 #ifdef CONFIG_X86_64
 #include <linux/topology.h>
@@ -42,14 +44,8 @@ static void early_init_intel(struct cpuinfo_x86 *c)
 		(c->x86 == 0x6 && c->x86_model >= 0x0e))
 		set_cpu_cap(c, X86_FEATURE_CONSTANT_TSC);
 
-	if (c->x86 >= 6 && !cpu_has(c, X86_FEATURE_IA64)) {
-		unsigned lower_word;
-
-		wrmsr(MSR_IA32_UCODE_REV, 0, 0);
-		/* Required by the SDM */
-		sync_core();
-		rdmsr(MSR_IA32_UCODE_REV, lower_word, c->microcode);
-	}
+	if (c->x86 >= 6 && !cpu_has(c, X86_FEATURE_IA64))
+		c->microcode = intel_get_microcode_revision();
 
 	/*
 	 * Atom erratum AAE44/AAF40/AAG38/AAH41:
@@ -59,7 +55,7 @@ static void early_init_intel(struct cpuinfo_x86 *c)
 	 * need the microcode to have already been loaded... so if it is
 	 * not, recommend a BIOS update and disable large pages.
 	 */
-	if (c->x86 == 6 && c->x86_model == 0x1c && c->x86_mask <= 2 &&
+	if (c->x86 == 6 && c->x86_model == 0x1c && c->x86_stepping <= 2 &&
 	    c->microcode < 0x20e) {
 		printk(KERN_WARNING "Atom PSE erratum detected, BIOS microcode update recommended\n");
 		clear_cpu_cap(c, X86_FEATURE_PSE);
@@ -75,7 +71,7 @@ static void early_init_intel(struct cpuinfo_x86 *c)
 
 	/* CPUID workaround for 0F33/0F34 CPU */
 	if (c->x86 == 0xF && c->x86_model == 0x3
-	    && (c->x86_mask == 0x3 || c->x86_mask == 0x4))
+	    && (c->x86_stepping == 0x3 || c->x86_stepping == 0x4))
 		c->x86_phys_bits = 36;
 
 	/*
@@ -97,6 +93,7 @@ static void early_init_intel(struct cpuinfo_x86 *c)
 		switch (c->x86_model) {
 		case 0x27:	/* Penwell */
 		case 0x35:	/* Cloverview */
+		case 0x4a:	/* Merrifield */
 			set_cpu_cap(c, X86_FEATURE_NONSTOP_TSC_S3);
 			break;
 		default:
@@ -159,6 +156,26 @@ static void early_init_intel(struct cpuinfo_x86 *c)
 		pr_info("Disabling PGE capability bit\n");
 		setup_clear_cpu_cap(X86_FEATURE_PGE);
 	}
+
+	if (c->cpuid_level >= 0x00000001) {
+		u32 eax, ebx, ecx, edx;
+
+		cpuid(0x00000001, &eax, &ebx, &ecx, &edx);
+		/*
+		 * If HTT (EDX[28]) is set EBX[16:23] contain the number of
+		 * apicids which are reserved per package. Store the resulting
+		 * shift value for the package management code.
+		 */
+		if (edx & (1U << 28))
+			c->x86_coreid_bits = get_count_order((ebx >> 16) & 0xff);
+	}
+
+	/*
+	 * Get the number of SMT siblings early from the extended topology
+	 * leaf, if available. Otherwise try the legacy SMT detection.
+	 */
+	if (detect_extended_topology_early(c) < 0)
+		detect_ht_early(c);
 }
 
 #ifdef CONFIG_X86_32
@@ -174,8 +191,8 @@ int ppro_with_ram_bug(void)
 	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL &&
 	    boot_cpu_data.x86 == 6 &&
 	    boot_cpu_data.x86_model == 1 &&
-	    boot_cpu_data.x86_mask < 8) {
-		printk(KERN_INFO "Pentium Pro with Errata#50 detected. Taking evasive action.\n");
+	    boot_cpu_data.x86_stepping < 8) {
+		pr_info("Pentium Pro with Errata#50 detected. Taking evasive action.\n");
 		return 1;
 	}
 	return 0;
@@ -191,7 +208,7 @@ static void intel_smp_check(struct cpuinfo_x86 *c)
 	 * Mask B, Pentium, but not Pentium MMX
 	 */
 	if (c->x86 == 5 &&
-	    c->x86_mask >= 1 && c->x86_mask <= 4 &&
+	    c->x86_stepping >= 1 && c->x86_stepping <= 4 &&
 	    c->x86_model <= 3) {
 		/*
 		 * Remember we have B step Pentia with bugs
@@ -234,7 +251,7 @@ static void intel_workarounds(struct cpuinfo_x86 *c)
 	 * SEP CPUID bug: Pentium Pro reports SEP but doesn't have it until
 	 * model 3 mask 3
 	 */
-	if ((c->x86<<8 | c->x86_model<<4 | c->x86_mask) < 0x633)
+	if ((c->x86<<8 | c->x86_model<<4 | c->x86_stepping) < 0x633)
 		clear_cpu_cap(c, X86_FEATURE_SEP);
 
 	/*
@@ -252,7 +269,7 @@ static void intel_workarounds(struct cpuinfo_x86 *c)
 	 * P4 Xeon errata 037 workaround.
 	 * Hardware prefetcher may cause stale data to be loaded into the cache.
 	 */
-	if ((c->x86 == 15) && (c->x86_model == 1) && (c->x86_mask == 1)) {
+	if ((c->x86 == 15) && (c->x86_model == 1) && (c->x86_stepping == 1)) {
 		if (msr_set_bit(MSR_IA32_MISC_ENABLE,
 				MSR_IA32_MISC_ENABLE_PREFETCH_DISABLE_BIT)
 		    > 0) {
@@ -268,7 +285,7 @@ static void intel_workarounds(struct cpuinfo_x86 *c)
 	 * Specification Update").
 	 */
 	if (cpu_has_apic && (c->x86<<8 | c->x86_model<<4) == 0x520 &&
-	    (c->x86_mask < 0x6 || c->x86_mask == 0xb))
+	    (c->x86_stepping < 0x6 || c->x86_stepping == 0xb))
 		set_cpu_bug(c, X86_BUG_11AP);
 
 
@@ -371,6 +388,36 @@ static void detect_vmx_virtcap(struct cpuinfo_x86 *c)
 	}
 }
 
+static void init_intel_energy_perf(struct cpuinfo_x86 *c)
+{
+	u64 epb;
+
+	/*
+	 * Initialize MSR_IA32_ENERGY_PERF_BIAS if not already initialized.
+	 * (x86_energy_perf_policy(8) is available to change it at run-time.)
+	 */
+	if (!cpu_has(c, X86_FEATURE_EPB))
+		return;
+
+	rdmsrl(MSR_IA32_ENERGY_PERF_BIAS, epb);
+	if ((epb & 0xF) != ENERGY_PERF_BIAS_PERFORMANCE)
+		return;
+
+	pr_warn_once("ENERGY_PERF_BIAS: Set to 'normal', was 'performance'\n");
+	pr_warn_once("ENERGY_PERF_BIAS: View and update with x86_energy_perf_policy(8)\n");
+	epb = (epb & ~0xF) | ENERGY_PERF_BIAS_NORMAL;
+	wrmsrl(MSR_IA32_ENERGY_PERF_BIAS, epb);
+}
+
+static void intel_bsp_resume(struct cpuinfo_x86 *c)
+{
+	/*
+	 * MSR_IA32_ENERGY_PERF_BIAS is lost across suspend/resume,
+	 * so reinitialize it properly like during bootup:
+	 */
+	init_intel_energy_perf(c);
+}
+
 static void init_intel(struct cpuinfo_x86 *c)
 {
 	unsigned int l2 = 0;
@@ -414,7 +461,8 @@ static void init_intel(struct cpuinfo_x86 *c)
 
 	if (cpu_has_xmm2)
 		set_cpu_cap(c, X86_FEATURE_LFENCE_RDTSC);
-	if (cpu_has_ds) {
+
+	if (boot_cpu_has(X86_FEATURE_DS)) {
 		unsigned int l1;
 		rdmsr(MSR_IA32_MISC_ENABLE, l1, l2);
 		if (!(l1 & (1<<11)))
@@ -426,6 +474,10 @@ static void init_intel(struct cpuinfo_x86 *c)
 	if (c->x86 == 6 && cpu_has_clflush &&
 	    (c->x86_model == 29 || c->x86_model == 46 || c->x86_model == 47))
 		set_cpu_bug(c, X86_BUG_CLFLUSH_MONITOR);
+
+	if (c->x86 == 6 && boot_cpu_has(X86_FEATURE_MWAIT) &&
+		((c->x86_model == INTEL_FAM6_ATOM_GOLDMONT)))
+		set_cpu_bug(c, X86_BUG_MONITOR);
 
 #ifdef CONFIG_X86_64
 	if (c->x86 == 15)
@@ -452,7 +504,7 @@ static void init_intel(struct cpuinfo_x86 *c)
 		case 6:
 			if (l2 == 128)
 				p = "Celeron (Mendocino)";
-			else if (c->x86_mask == 0 || c->x86_mask == 5)
+			else if (c->x86_stepping == 0 || c->x86_stepping == 5)
 				p = "Celeron-A";
 			break;
 
@@ -478,21 +530,12 @@ static void init_intel(struct cpuinfo_x86 *c)
 	if (cpu_has(c, X86_FEATURE_VMX))
 		detect_vmx_virtcap(c);
 
-	/*
-	 * Initialize MSR_IA32_ENERGY_PERF_BIAS if BIOS did not.
-	 * x86_energy_perf_policy(8) is available to change it at run-time
-	 */
-	if (cpu_has(c, X86_FEATURE_EPB)) {
-		u64 epb;
+	init_intel_energy_perf(c);
 
-		rdmsrl(MSR_IA32_ENERGY_PERF_BIAS, epb);
-		if ((epb & 0xF) == ENERGY_PERF_BIAS_PERFORMANCE) {
-			pr_warn_once("ENERGY_PERF_BIAS: Set to 'normal', was 'performance'\n");
-			pr_warn_once("ENERGY_PERF_BIAS: View and update with x86_energy_perf_policy(8)\n");
-			epb = (epb & ~0xF) | ENERGY_PERF_BIAS_NORMAL;
-			wrmsrl(MSR_IA32_ENERGY_PERF_BIAS, epb);
-		}
-	}
+	if (tsx_ctrl_state == TSX_CTRL_ENABLE)
+		tsx_enable();
+	if (tsx_ctrl_state == TSX_CTRL_DISABLE)
+		tsx_disable();
 }
 
 #ifdef CONFIG_X86_32
@@ -747,6 +790,7 @@ static const struct cpu_dev intel_cpu_dev = {
 	.c_detect_tlb	= intel_detect_tlb,
 	.c_early_init   = early_init_intel,
 	.c_init		= init_intel,
+	.c_bsp_resume	= intel_bsp_resume,
 	.c_x86_vendor	= X86_VENDOR_INTEL,
 };
 

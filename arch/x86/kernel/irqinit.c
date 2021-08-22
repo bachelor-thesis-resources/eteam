@@ -4,6 +4,7 @@
 #include <linux/sched.h>
 #include <linux/ioport.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
 #include <linux/timex.h>
 #include <linux/random.h>
 #include <linux/kprobes.h>
@@ -51,8 +52,8 @@ static struct irqaction irq2 = {
 	.flags = IRQF_NO_THREAD,
 };
 
-DEFINE_PER_CPU(vector_irq_t, vector_irq) = {
-	[0 ... NR_VECTORS - 1] = VECTOR_UNDEFINED,
+DEFINE_PER_CPU_USER_MAPPED(vector_irq_t, vector_irq) = {
+	[0 ... NR_VECTORS - 1] = VECTOR_UNUSED,
 };
 
 int vector_used_by_percpu_irq(unsigned int vector)
@@ -60,7 +61,7 @@ int vector_used_by_percpu_irq(unsigned int vector)
 	int cpu;
 
 	for_each_online_cpu(cpu) {
-		if (per_cpu(vector_irq, cpu)[vector] > VECTOR_UNDEFINED)
+		if (!IS_ERR_OR_NULL(per_cpu(vector_irq, cpu)[vector]))
 			return 1;
 	}
 
@@ -94,7 +95,7 @@ void __init init_IRQ(void)
 	 * irq's migrate etc.
 	 */
 	for (i = 0; i < nr_legacy_irqs(); i++)
-		per_cpu(vector_irq, 0)[ISA_IRQ_VECTOR(i)] = i;
+		per_cpu(vector_irq, 0)[ISA_IRQ_VECTOR(i)] = irq_to_desc(i);
 
 	x86_init.irqs.intr_init();
 }

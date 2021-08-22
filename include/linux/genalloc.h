@@ -31,6 +31,7 @@
 #define __GENALLOC_H__
 
 #include <linux/spinlock_types.h>
+#include <linux/atomic.h>
 
 struct device;
 struct device_node;
@@ -59,6 +60,8 @@ struct gen_pool {
 
 	genpool_algo_t algo;		/* allocation function */
 	void *data;
+
+	const char *name;
 };
 
 /*
@@ -66,7 +69,7 @@ struct gen_pool {
  */
 struct gen_pool_chunk {
 	struct list_head next_chunk;	/* next chunk in pool */
-	atomic_t avail;
+	atomic_long_t avail;
 	phys_addr_t phys_addr;		/* physical starting address of memory chunk */
 	unsigned long start_addr;	/* start address of memory chunk */
 	unsigned long end_addr;		/* end address of memory chunk (inclusive) */
@@ -118,8 +121,8 @@ extern unsigned long gen_pool_best_fit(unsigned long *map, unsigned long size,
 		unsigned long start, unsigned int nr, void *data);
 
 extern struct gen_pool *devm_gen_pool_create(struct device *dev,
-		int min_alloc_order, int nid);
-extern struct gen_pool *gen_pool_get(struct device *dev);
+		int min_alloc_order, int nid, const char *name);
+extern struct gen_pool *gen_pool_get(struct device *dev, const char *name);
 
 bool addr_in_gen_pool(struct gen_pool *pool, unsigned long start,
 			size_t size);

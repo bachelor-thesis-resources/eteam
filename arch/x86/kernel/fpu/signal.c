@@ -56,7 +56,7 @@ static inline int save_fsave_header(struct task_struct *tsk, void __user *buf)
 	if (use_fxsr()) {
 		struct xregs_state *xsave = &tsk->thread.fpu.state.xsave;
 		struct user_i387_ia32_struct env;
-		struct _fpstate_ia32 __user *fp = buf;
+		struct _fpstate_32 __user *fp = buf;
 
 		convert_from_fxsr(&env, tsk);
 
@@ -107,7 +107,7 @@ static inline int save_xstate_epilog(void __user *buf, int ia32_frame)
 	 * header as well as change any contents in the memory layout.
 	 * xrestore as part of sigreturn will capture all the changes.
 	 */
-	xfeatures |= XSTATE_FPSSE;
+	xfeatures |= XFEATURE_MASK_FPSSE;
 
 	err |= __put_user(xfeatures, (__u32 *)&x->header.xfeatures);
 
@@ -165,7 +165,7 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
 	if (!static_cpu_has(X86_FEATURE_FPU))
 		return fpregs_soft_get(current, NULL, 0,
 			sizeof(struct user_i387_ia32_struct), NULL,
-			(struct _fpstate_ia32 __user *) buf) ? -1 : 1;
+			(struct _fpstate_32 __user *) buf) ? -1 : 1;
 
 	if (fpregs_active()) {
 		/* Save the live register state to the user directly. */
@@ -207,7 +207,7 @@ sanitize_restored_xstate(struct task_struct *tsk,
 		 * layout and not enabled by the OS.
 		 */
 		if (fx_only)
-			header->xfeatures = XSTATE_FPSSE;
+			header->xfeatures = XFEATURE_MASK_FPSSE;
 		else
 			header->xfeatures &= (xfeatures_mask & xfeatures);
 	}
@@ -230,7 +230,7 @@ static inline int copy_user_to_fpregs_zeroing(void __user *buf, u64 xbv, int fx_
 {
 	if (use_xsave()) {
 		if ((unsigned long)buf % 64 || fx_only) {
-			u64 init_bv = xfeatures_mask & ~XSTATE_FPSSE;
+			u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
 			return copy_user_to_fxregs(buf);
 		} else {
@@ -294,7 +294,6 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
 		 * thread's fpu state, reconstruct fxstate from the fsave
 		 * header. Sanitize the copied state etc.
 		 */
-		struct fpu *fpu = &tsk->thread.fpu;
 		struct user_i387_ia32_struct env;
 		int err = 0;
 
@@ -309,19 +308,19 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
 		fpu__drop(fpu);
 
 		if (__copy_from_user(&fpu->state.xsave, buf_fx, state_size) ||
-		    __copy_from_user(&env, buf, sizeof(env))) {
+		    __copy_from_user(&env, buf, sizeof(env)) ||
+		    (state_size > offsetof(struct xregs_state, header) &&
+		     fpu->state.xsave.header.xcomp_bv)) {
 			fpstate_init(&fpu->state);
 			err = -1;
 		} else {
 			sanitize_restored_xstate(tsk, &env, xfeatures, fx_only);
 		}
 
+		local_bh_disable();
 		fpu->fpstate_active = 1;
-		if (use_eager_fpu()) {
-			preempt_disable();
-			fpu__restore(fpu);
-			preempt_enable();
-		}
+		fpu__restore(fpu);
+		local_bh_enable();
 
 		return err;
 	} else {
@@ -385,20 +384,19 @@ fpu__alloc_mathframe(unsigned long sp, int ia32_frame,
  */
 void fpu__init_prepare_fx_sw_frame(void)
 {
-	int fsave_header_size = sizeof(struct fregs_state);
 	int size = xstate_size + FP_XSTATE_MAGIC2_SIZE;
-
-	if (config_enabled(CONFIG_X86_32))
-		size += fsave_header_size;
 
 	fx_sw_reserved.magic1 = FP_XSTATE_MAGIC1;
 	fx_sw_reserved.extended_size = size;
 	fx_sw_reserved.xfeatures = xfeatures_mask;
 	fx_sw_reserved.xstate_size = xstate_size;
 
-	if (config_enabled(CONFIG_IA32_EMULATION)) {
+	if (config_enabled(CONFIG_IA32_EMULATION) ||
+	    config_enabled(CONFIG_X86_32)) {
+		int fsave_header_size = sizeof(struct fregs_state);
+
 		fx_sw_reserved_ia32 = fx_sw_reserved;
-		fx_sw_reserved_ia32.extended_size += fsave_header_size;
+		fx_sw_reserved_ia32.extended_size = size + fsave_header_size;
 	}
 }
 

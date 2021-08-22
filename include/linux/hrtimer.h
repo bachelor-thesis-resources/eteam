@@ -87,12 +87,7 @@ enum hrtimer_restart {
  * @function:	timer expiry callback function
  * @base:	pointer to the timer base (per cpu and per clock)
  * @state:	state information (See bit values above)
- * @start_pid: timer statistics field to store the pid of the task which
- *		started the timer
- * @start_site:	timer statistics field to store the site where the timer
- *		was started
- * @start_comm: timer statistics field to store the name of the process which
- *		started the timer
+ * @is_rel:	Set if the timer was armed relative
  *
  * The hrtimer structure must be initialized by hrtimer_init()
  */
@@ -101,12 +96,8 @@ struct hrtimer {
 	ktime_t				_softexpires;
 	enum hrtimer_restart		(*function)(struct hrtimer *);
 	struct hrtimer_clock_base	*base;
-	unsigned long			state;
-#ifdef CONFIG_TIMER_STATS
-	int				start_pid;
-	void				*start_site;
-	char				start_comm[16];
-#endif
+	u8				state;
+	u8				is_rel;
 };
 
 /**
@@ -321,6 +312,27 @@ static inline void clock_was_set_delayed(void) { }
 
 #endif
 
+static inline ktime_t
+__hrtimer_expires_remaining_adjusted(const struct hrtimer *timer, ktime_t now)
+{
+	ktime_t rem = ktime_sub(timer->node.expires, now);
+
+	/*
+	 * Adjust relative timers for the extra we added in
+	 * hrtimer_start_range_ns() to prevent short timeouts.
+	 */
+	if (IS_ENABLED(CONFIG_TIME_LOW_RES) && timer->is_rel)
+		rem.tv64 -= hrtimer_resolution;
+	return rem;
+}
+
+static inline ktime_t
+hrtimer_expires_remaining_adjusted(const struct hrtimer *timer)
+{
+	return __hrtimer_expires_remaining_adjusted(timer,
+						    timer->base->get_time());
+}
+
 extern void clock_was_set(void);
 #ifdef CONFIG_TIMERFD
 extern void timerfd_clock_was_set(void);
@@ -390,18 +402,29 @@ static inline void hrtimer_restart(struct hrtimer *timer)
 }
 
 /* Query timers: */
-extern ktime_t hrtimer_get_remaining(const struct hrtimer *timer);
+extern ktime_t __hrtimer_get_remaining(const struct hrtimer *timer, bool adjust);
+
+static inline ktime_t hrtimer_get_remaining(const struct hrtimer *timer)
+{
+	return __hrtimer_get_remaining(timer, false);
+}
 
 extern u64 hrtimer_get_next_event(void);
 
 extern bool hrtimer_active(const struct hrtimer *timer);
 
-/*
- * Helper function to check, whether the timer is on one of the queues
+/**
+ * hrtimer_is_queued = check, whether the timer is on one of the queues
+ * @timer:	Timer to check
+ *
+ * Returns: True if the timer is queued, false otherwise
+ *
+ * The function can be used lockless, but it gives only a current snapshot.
  */
-static inline int hrtimer_is_queued(struct hrtimer *timer)
+static inline bool hrtimer_is_queued(struct hrtimer *timer)
 {
-	return timer->state & HRTIMER_STATE_ENQUEUED;
+	/* The READ_ONCE pairs with the update functions of timer->state */
+	return !!(READ_ONCE(timer->state) & HRTIMER_STATE_ENQUEUED);
 }
 
 /*

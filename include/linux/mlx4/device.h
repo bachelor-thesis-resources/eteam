@@ -44,6 +44,8 @@
 
 #include <linux/timecounter.h>
 
+#define DEFAULT_UAR_PAGE_SHIFT  12
+
 #define MAX_MSIX_P_PORT		17
 #define MAX_MSIX		64
 #define MIN_MSIX_P_PORT		5
@@ -79,7 +81,8 @@ enum {
 
 enum {
 	MLX4_MAX_PORTS		= 2,
-	MLX4_MAX_PORT_PKEYS	= 128
+	MLX4_MAX_PORT_PKEYS	= 128,
+	MLX4_MAX_PORT_GIDS	= 128
 };
 
 /* base qkey for use in sriov tunnel-qp/proxy-qp communication.
@@ -211,6 +214,10 @@ enum {
 	MLX4_DEV_CAP_FLAG2_ETS_CFG		= 1LL <<  26,
 	MLX4_DEV_CAP_FLAG2_PORT_BEACON		= 1LL <<  27,
 	MLX4_DEV_CAP_FLAG2_IGNORE_FCS		= 1LL <<  28,
+	MLX4_DEV_CAP_FLAG2_PHV_EN		= 1LL <<  29,
+	MLX4_DEV_CAP_FLAG2_SKIP_OUTER_VLAN	= 1LL <<  30,
+	MLX4_DEV_CAP_FLAG2_UPDATE_QP_SRC_CHECK_LB = 1ULL << 31,
+	MLX4_DEV_CAP_FLAG2_LB_SRC_CHK           = 1ULL << 32,
 };
 
 enum {
@@ -422,6 +429,17 @@ enum {
 };
 
 enum {
+	/*
+	 * Max wqe size for rdma read is 512 bytes, so this
+	 * limits our max_sge_rd as the wqe needs to fit:
+	 * - ctrl segment (16 bytes)
+	 * - rdma segment (16 bytes)
+	 * - scatter elements (16 bytes each)
+	 */
+	MLX4_MAX_SGE_RD	= (512 - 16 - 16) / 16
+};
+
+enum {
 	MLX4_DEV_PMC_SUBTYPE_GUID_INFO	 = 0x14,
 	MLX4_DEV_PMC_SUBTYPE_PORT_INFO	 = 0x15,
 	MLX4_DEV_PMC_SUBTYPE_PKEY_TABLE	 = 0x16,
@@ -444,6 +462,7 @@ enum {
 enum {
 	MLX4_INTERFACE_STATE_UP		= 1 << 0,
 	MLX4_INTERFACE_STATE_DELETION	= 1 << 1,
+	MLX4_INTERFACE_STATE_NOWAIT	= 1 << 2,
 };
 
 #define MSTR_SM_CHANGE_MASK (MLX4_EQ_PORT_INFO_MSTR_SM_SL_CHANGE_MASK | \
@@ -581,6 +600,7 @@ struct mlx4_caps {
 	u64			phys_port_id[MLX4_MAX_PORTS + 1];
 	int			tunnel_offload_mode;
 	u8			rx_checksum_flags_port[MLX4_MAX_PORTS + 1];
+	u8			phv_bit[MLX4_MAX_PORTS + 1];
 	u8			alloc_res_qp_mask;
 	u32			dmfs_high_rate_qpn_base;
 	u32			dmfs_high_rate_qpn_range;
@@ -805,6 +825,11 @@ struct mlx4_vf_dev {
 	u8			n_ports;
 };
 
+enum mlx4_pci_status {
+	MLX4_PCI_STATUS_DISABLED,
+	MLX4_PCI_STATUS_ENABLED,
+};
+
 struct mlx4_dev_persistent {
 	struct pci_dev	       *pdev;
 	struct mlx4_dev	       *dev;
@@ -818,6 +843,8 @@ struct mlx4_dev_persistent {
 	u8		state;
 	struct mutex	interface_state_mutex; /* protect SW state */
 	u8	interface_state;
+	struct mutex		pci_status_mutex; /* sync pci state */
+	enum mlx4_pci_status	pci_status;
 };
 
 struct mlx4_dev {
@@ -829,12 +856,14 @@ struct mlx4_dev {
 	struct mlx4_quotas	quotas;
 	struct radix_tree_root	qp_table_tree;
 	u8			rev_id;
+	u8			port_random_macs;
 	char			board_id[MLX4_BOARD_ID_LEN];
 	int			numa_node;
 	int			oper_log_mgm_entry_size;
 	u64			regid_promisc_array[MLX4_MAX_PORTS + 1];
 	u64			regid_allmulti_array[MLX4_MAX_PORTS + 1];
 	struct mlx4_vf_dev     *dev_vfs;
+	u8  uar_page_shift;
 };
 
 struct mlx4_clock_params {
@@ -1332,6 +1361,8 @@ int mlx4_SET_PORT_BEACON(struct mlx4_dev *dev, u8 port, u16 time);
 int mlx4_SET_PORT_fcs_check(struct mlx4_dev *dev, u8 port,
 			    u8 ignore_fcs_value);
 int mlx4_SET_PORT_VXLAN(struct mlx4_dev *dev, u8 port, u8 steering, int enable);
+int set_phv_bit(struct mlx4_dev *dev, u8 port, int new_val);
+int get_phv_bit(struct mlx4_dev *dev, u8 port, int *phv);
 int mlx4_find_cached_mac(struct mlx4_dev *dev, u8 port, u64 mac, int *idx);
 int mlx4_find_cached_vlan(struct mlx4_dev *dev, u8 port, u16 vid, int *idx);
 int mlx4_register_vlan(struct mlx4_dev *dev, u8 port, u16 vlan, int *index);
@@ -1507,4 +1538,14 @@ int mlx4_ACCESS_PTYS_REG(struct mlx4_dev *dev,
 int mlx4_get_internal_clock_params(struct mlx4_dev *dev,
 				   struct mlx4_clock_params *params);
 
+static inline int mlx4_to_hw_uar_index(struct mlx4_dev *dev, int index)
+{
+	return (index << (PAGE_SHIFT - dev->uar_page_shift));
+}
+
+static inline int mlx4_get_num_reserved_uar(struct mlx4_dev *dev)
+{
+	/* The first 128 UARs are used for EQ doorbells */
+	return (128 >> (PAGE_SHIFT - dev->uar_page_shift));
+}
 #endif /* MLX4_DEVICE_H */

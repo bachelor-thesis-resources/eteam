@@ -43,7 +43,8 @@ __x2apic_send_IPI_mask(const struct cpumask *mask, int vector, int apic_dest)
 	unsigned long this_cpu;
 	unsigned long flags;
 
-	x2apic_wrmsr_fence();
+	/* x2apic MSRs are special and need a special fence: */
+	weak_wrmsr_fence();
 
 	local_irq_save(flags);
 
@@ -128,7 +129,6 @@ static struct apic apic_x2apic_phys = {
 	.send_IPI_all			= x2apic_send_IPI_all,
 	.send_IPI_self			= x2apic_send_IPI_self,
 
-	.wait_for_init_deassert		= false,
 	.inquire_remote_apic		= NULL,
 
 	.read				= native_apic_msr_read,

@@ -3,6 +3,7 @@
 
 #include <asm/fpu/api.h>
 #include <asm/pgtable.h>
+#include <asm/nospec-branch.h>
 
 /*
  * We map the EFI regions needed for runtime services non-contiguously,
@@ -39,8 +40,10 @@ extern unsigned long asmlinkage efi_call_phys(void *, ...);
 ({									\
 	efi_status_t __s;						\
 	kernel_fpu_begin();						\
+	firmware_restrict_branch_speculation_start();			\
 	__s = ((efi_##f##_t __attribute__((regparm(0)))*)		\
 		efi.systab->runtime->f)(args);				\
+	firmware_restrict_branch_speculation_end();			\
 	kernel_fpu_end();						\
 	__s;								\
 })
@@ -49,8 +52,10 @@ extern unsigned long asmlinkage efi_call_phys(void *, ...);
 #define __efi_call_virt(f, args...) \
 ({									\
 	kernel_fpu_begin();						\
+	firmware_restrict_branch_speculation_start();			\
 	((efi_##f##_t __attribute__((regparm(0)))*)			\
 		efi.systab->runtime->f)(args);				\
+	firmware_restrict_branch_speculation_end();			\
 	kernel_fpu_end();						\
 })
 
@@ -71,7 +76,9 @@ extern u64 asmlinkage efi_call(void *fp, ...);
 	efi_sync_low_kernel_mappings();					\
 	preempt_disable();						\
 	__kernel_fpu_begin();						\
+	firmware_restrict_branch_speculation_start();			\
 	__s = efi_call((void *)efi.systab->runtime->f, __VA_ARGS__);	\
+	firmware_restrict_branch_speculation_end();			\
 	__kernel_fpu_end();						\
 	preempt_enable();						\
 	__s;								\
@@ -86,6 +93,18 @@ extern u64 asmlinkage efi_call(void *fp, ...);
 extern void __iomem *__init efi_ioremap(unsigned long addr, unsigned long size,
 					u32 type, u64 attribute);
 
+#ifdef CONFIG_KASAN
+/*
+ * CONFIG_KASAN may redefine memset to __memset.  __memset function is present
+ * only in kernel binary.  Since the EFI stub linked into a separate binary it
+ * doesn't have __memset().  So we should use standard memset from
+ * arch/x86/boot/compressed/string.c.  The same applies to memcpy and memmove.
+ */
+#undef memcpy
+#undef memset
+#undef memmove
+#endif
+
 #endif /* CONFIG_X86_32 */
 
 extern struct efi_scratch efi_scratch;
@@ -93,6 +112,7 @@ extern void __init efi_set_executable(efi_memory_desc_t *md, bool executable);
 extern int __init efi_memblock_x86_reserve_range(void);
 extern pgd_t * __init efi_call_phys_prolog(void);
 extern void __init efi_call_phys_epilog(pgd_t *save_pgd);
+extern void __init efi_print_memmap(void);
 extern void __init efi_unmap_memmap(void);
 extern void __init efi_memory_uc(u64 addr, unsigned long size);
 extern void __init efi_map_region(efi_memory_desc_t *md);

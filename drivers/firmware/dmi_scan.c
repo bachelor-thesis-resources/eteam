@@ -18,7 +18,7 @@ EXPORT_SYMBOL_GPL(dmi_kobj);
  * of and an antecedent to, SMBIOS, which stands for System
  * Management BIOS.  See further: http://www.dmtf.org/standards
  */
-static const char dmi_empty_string[] = "        ";
+static const char dmi_empty_string[] = "";
 
 static u32 dmi_ver __initdata;
 static u32 dmi_len;
@@ -44,25 +44,21 @@ static int dmi_memdev_nr;
 static const char * __init dmi_string_nosave(const struct dmi_header *dm, u8 s)
 {
 	const u8 *bp = ((u8 *) dm) + dm->length;
+	const u8 *nsp;
 
 	if (s) {
-		s--;
-		while (s > 0 && *bp) {
+		while (--s > 0 && *bp)
 			bp += strlen(bp) + 1;
-			s--;
-		}
 
-		if (*bp != 0) {
-			size_t len = strlen(bp)+1;
-			size_t cmp_len = len > 8 ? 8 : len;
-
-			if (!memcmp(bp, dmi_empty_string, cmp_len))
-				return dmi_empty_string;
+		/* Strings containing only spaces are considered empty */
+		nsp = bp;
+		while (*nsp == ' ')
+			nsp++;
+		if (*nsp != '\0')
 			return bp;
-		}
 	}
 
-	return "";
+	return dmi_empty_string;
 }
 
 static const char * __init dmi_string(const struct dmi_header *dm, u8 s)
@@ -521,6 +517,7 @@ static int __init dmi_present(const u8 *buf)
 			dmi_ver = smbios_ver;
 		else
 			dmi_ver = (buf[14] & 0xF0) << 4 | (buf[14] & 0x0F);
+		dmi_ver <<= 8;
 		dmi_num = get_unaligned_le16(buf + 12);
 		dmi_len = get_unaligned_le16(buf + 6);
 		dmi_base = get_unaligned_le32(buf + 8);
@@ -528,15 +525,14 @@ static int __init dmi_present(const u8 *buf)
 		if (dmi_walk_early(dmi_decode) == 0) {
 			if (smbios_ver) {
 				pr_info("SMBIOS %d.%d present.\n",
-				       dmi_ver >> 8, dmi_ver & 0xFF);
+					dmi_ver >> 16, (dmi_ver >> 8) & 0xFF);
 			} else {
 				smbios_entry_point_size = 15;
 				memcpy(smbios_entry_point, buf,
 				       smbios_entry_point_size);
 				pr_info("Legacy DMI %d.%d present.\n",
-				       dmi_ver >> 8, dmi_ver & 0xFF);
+					dmi_ver >> 16, (dmi_ver >> 8) & 0xFF);
 			}
-			dmi_ver <<= 8;
 			dmi_format_ids(dmi_ids_string, sizeof(dmi_ids_string));
 			printk(KERN_DEBUG "DMI: %s\n", dmi_ids_string);
 			return 0;

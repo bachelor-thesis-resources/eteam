@@ -32,6 +32,7 @@
 
 #include <linux/mm.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
 #include <linux/init.h>
 #include <linux/delay.h>
 #include <linux/sched.h>
@@ -39,7 +40,7 @@
 #include <linux/mc146818rtc.h>
 #include <linux/compiler.h>
 #include <linux/acpi.h>
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/syscore_ops.h>
 #include <linux/freezer.h>
 #include <linux/kthread.h>
@@ -529,7 +530,7 @@ static void __eoi_ioapic_pin(int apic, int pin, int vector)
 	}
 }
 
-void eoi_ioapic_pin(int vector, struct mp_chip_data *data)
+static void eoi_ioapic_pin(int vector, struct mp_chip_data *data)
 {
 	unsigned long flags;
 	struct irq_pin_list *entry;
@@ -1710,9 +1711,10 @@ static bool io_apic_level_ack_pending(struct mp_chip_data *data)
 
 static inline bool ioapic_irqd_mask(struct irq_data *data)
 {
-	/* If we are moving the irq we need to mask it */
+	/* If we are moving the IRQ we need to mask it */
 	if (unlikely(irqd_is_setaffinity_pending(data))) {
-		mask_ioapic_irq(data);
+		if (!irqd_irq_masked(data))
+			mask_ioapic_irq(data);
 		return true;
 	}
 	return false;
@@ -1749,7 +1751,9 @@ static inline void ioapic_irqd_unmask(struct irq_data *data, bool masked)
 		 */
 		if (!io_apic_level_ack_pending(data->chip_data))
 			irq_move_masked_irq(data);
-		unmask_ioapic_irq(data);
+		/* If the IRQ is masked in the core, leave it: */
+		if (!irqd_irq_masked(data))
+			unmask_ioapic_irq(data);
 	}
 }
 #else
@@ -1875,6 +1879,7 @@ static struct irq_chip ioapic_chip __read_mostly = {
 	.irq_ack		= irq_chip_ack_parent,
 	.irq_eoi		= ioapic_ack_level,
 	.irq_set_affinity	= ioapic_set_affinity,
+	.irq_retrigger		= irq_chip_retrigger_hierarchy,
 	.flags			= IRQCHIP_SKIP_SET_WAKE,
 };
 
@@ -1886,6 +1891,7 @@ static struct irq_chip ioapic_ir_chip __read_mostly = {
 	.irq_ack		= irq_chip_ack_parent,
 	.irq_eoi		= ioapic_ir_ack_level,
 	.irq_set_affinity	= ioapic_set_affinity,
+	.irq_retrigger		= irq_chip_retrigger_hierarchy,
 	.flags			= IRQCHIP_SKIP_SET_WAKE,
 };
 
@@ -2113,8 +2119,9 @@ static inline void __init check_timer(void)
 			int idx;
 			idx = find_irq_entry(apic1, pin1, mp_INT);
 			if (idx != -1 && irq_trigger(idx))
-				unmask_ioapic_irq(irq_get_chip_data(0));
+				unmask_ioapic_irq(irq_get_irq_data(0));
 		}
+		irq_domain_deactivate_irq(irq_data);
 		irq_domain_activate_irq(irq_data);
 		if (timer_irq_works()) {
 			if (disable_timer_pin_1 > 0)
@@ -2136,6 +2143,7 @@ static inline void __init check_timer(void)
 		 * legacy devices should be connected to IO APIC #0
 		 */
 		replace_pin_at_irq_node(data, node, apic1, pin1, apic2, pin2);
+		irq_domain_deactivate_irq(irq_data);
 		irq_domain_activate_irq(irq_data);
 		legacy_pic->unmask(0);
 		if (timer_irq_works()) {
@@ -2340,7 +2348,13 @@ unsigned int arch_dynirq_lower_bound(unsigned int from)
 	 * dmar_alloc_hwirq() may be called before setup_IO_APIC(), so use
 	 * gsi_top if ioapic_dynirq_base hasn't been initialized yet.
 	 */
-	return ioapic_initialized ? ioapic_dynirq_base : gsi_top;
+	if (!ioapic_initialized)
+		return gsi_top;
+	/*
+	 * For DT enabled machines ioapic_dynirq_base is irrelevant and not
+	 * updated. So simply return @from if ioapic_dynirq_base == 0.
+	 */
+	return ioapic_dynirq_base ? : from;
 }
 
 #ifdef CONFIG_X86_32
@@ -2521,7 +2535,9 @@ void __init setup_ioapic_dest(void)
 {
 	int pin, ioapic, irq, irq_entry;
 	const struct cpumask *mask;
+	struct irq_desc *desc;
 	struct irq_data *idata;
+	struct irq_chip *chip;
 
 	if (skip_ioapic_setup == 1)
 		return;
@@ -2535,19 +2551,24 @@ void __init setup_ioapic_dest(void)
 		if (irq < 0 || !mp_init_irq_at_boot(ioapic, irq))
 			continue;
 
-		idata = irq_get_irq_data(irq);
+		desc = irq_to_desc(irq);
+		raw_spin_lock_irq(&desc->lock);
+		idata = irq_desc_get_irq_data(desc);
 
 		/*
 		 * Honour affinities which have been set in early boot
 		 */
 		if (!irqd_can_balance(idata) || irqd_affinity_was_set(idata))
-			mask = idata->affinity;
+			mask = irq_data_get_affinity_mask(idata);
 		else
 			mask = apic->target_cpus();
 
-		irq_set_affinity(irq, mask);
+		chip = irq_data_get_irq_chip(idata);
+		/* Might be lapic_chip for irq 0 */
+		if (chip->irq_set_affinity)
+			chip->irq_set_affinity(idata, mask, false);
+		raw_spin_unlock_irq(&desc->lock);
 	}
-
 }
 #endif
 
@@ -2581,8 +2602,8 @@ static struct resource * __init ioapic_setup_resources(void)
 		res[num].flags = IORESOURCE_MEM | IORESOURCE_BUSY;
 		snprintf(mem, IOAPIC_RESOURCE_NAME_SIZE, "IOAPIC %u", i);
 		mem += IOAPIC_RESOURCE_NAME_SIZE;
+		ioapics[i].iomem_res = &res[num];
 		num++;
-		ioapics[i].iomem_res = res;
 	}
 
 	ioapic_resources = res;
@@ -2906,6 +2927,7 @@ int mp_irqdomain_alloc(struct irq_domain *domain, unsigned int virq,
 	struct irq_data *irq_data;
 	struct mp_chip_data *data;
 	struct irq_alloc_info *info = arg;
+	unsigned long flags;
 
 	if (!info || nr_irqs > 1)
 		return -EINVAL;
@@ -2938,11 +2960,14 @@ int mp_irqdomain_alloc(struct irq_domain *domain, unsigned int virq,
 
 	cfg = irqd_cfg(irq_data);
 	add_pin_to_irq_node(data, ioapic_alloc_attr_node(info), ioapic, pin);
+
+	local_irq_save(flags);
 	if (info->ioapic_entry)
 		mp_setup_entry(cfg, data, info->ioapic_entry);
 	mp_register_handler(virq, data->trigger);
 	if (virq < nr_legacy_irqs())
 		legacy_pic->mask(virq);
+	local_irq_restore(flags);
 
 	apic_printk(APIC_VERBOSE, KERN_DEBUG
 		    "IOAPIC[%d]: Set routing entry (%d-%d -> 0x%x -> IRQ %d Mode:%i Active:%i Dest:%d)\n",

@@ -1,6 +1,7 @@
 #ifndef _LINUX_JIFFIES_H
 #define _LINUX_JIFFIES_H
 
+#include <linux/cache.h>
 #include <linux/math64.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
@@ -63,19 +64,17 @@ extern int register_refined_jiffies(long clock_tick_rate);
 /* TICK_USEC is the time between ticks in usec assuming fake USER_HZ */
 #define TICK_USEC ((1000000UL + USER_HZ/2) / USER_HZ)
 
-/* some arch's have a small-data section that can be accessed register-relative
- * but that can only take up to, say, 4-byte variables. jiffies being part of
- * an 8-byte variable may not be correctly accessed unless we force the issue
- */
-#define __jiffy_data  __attribute__((section(".data")))
+#ifndef __jiffy_arch_data
+#define __jiffy_arch_data
+#endif
 
 /*
  * The 64-bit value is not atomic - you MUST NOT read it
  * without sampling the sequence number in jiffies_lock.
  * get_jiffies_64() will do this for you as appropriate.
  */
-extern u64 __jiffy_data jiffies_64;
-extern unsigned long volatile __jiffy_data jiffies;
+extern u64 __cacheline_aligned_in_smp jiffies_64;
+extern unsigned long volatile __cacheline_aligned_in_smp __jiffy_arch_data jiffies;
 
 #if (BITS_PER_LONG < 64)
 u64 get_jiffies_64(void);
@@ -351,7 +350,7 @@ static inline unsigned long _msecs_to_jiffies(const unsigned int m)
  * directly here and from __msecs_to_jiffies() in the case where
  * constant folding is not possible.
  */
-static inline unsigned long msecs_to_jiffies(const unsigned int m)
+static __always_inline unsigned long msecs_to_jiffies(const unsigned int m)
 {
 	if (__builtin_constant_p(m)) {
 		if ((int)m < 0)
@@ -363,18 +362,11 @@ static inline unsigned long msecs_to_jiffies(const unsigned int m)
 }
 
 extern unsigned long __usecs_to_jiffies(const unsigned int u);
-#if HZ <= USEC_PER_SEC && !(USEC_PER_SEC % HZ)
+#if !(USEC_PER_SEC % HZ)
 static inline unsigned long _usecs_to_jiffies(const unsigned int u)
 {
 	return (u + (USEC_PER_SEC / HZ) - 1) / (USEC_PER_SEC / HZ);
 }
-#elif HZ > USEC_PER_SEC && !(HZ % USEC_PER_SEC)
-static inline unsigned long _usecs_to_jiffies(const unsigned int u)
-{
-	return u * (HZ / USEC_PER_SEC);
-}
-static inline unsigned long _usecs_to_jiffies(const unsigned int u)
-{
 #else
 static inline unsigned long _usecs_to_jiffies(const unsigned int u)
 {
@@ -405,7 +397,7 @@ static inline unsigned long _usecs_to_jiffies(const unsigned int u)
  * directly here and from __msecs_to_jiffies() in the case where
  * constant folding is not possible.
  */
-static inline unsigned long usecs_to_jiffies(const unsigned int u)
+static __always_inline unsigned long usecs_to_jiffies(const unsigned int u)
 {
 	if (__builtin_constant_p(u)) {
 		if (u > jiffies_to_usecs(MAX_JIFFY_OFFSET))
@@ -416,9 +408,25 @@ static inline unsigned long usecs_to_jiffies(const unsigned int u)
 	}
 }
 
-extern unsigned long timespec_to_jiffies(const struct timespec *value);
-extern void jiffies_to_timespec(const unsigned long jiffies,
-				struct timespec *value);
+extern unsigned long timespec64_to_jiffies(const struct timespec64 *value);
+extern void jiffies_to_timespec64(const unsigned long jiffies,
+				  struct timespec64 *value);
+static inline unsigned long timespec_to_jiffies(const struct timespec *value)
+{
+	struct timespec64 ts = timespec_to_timespec64(*value);
+
+	return timespec64_to_jiffies(&ts);
+}
+
+static inline void jiffies_to_timespec(const unsigned long jiffies,
+				       struct timespec *value)
+{
+	struct timespec64 ts;
+
+	jiffies_to_timespec64(jiffies, &ts);
+	*value = timespec64_to_timespec(ts);
+}
+
 extern unsigned long timeval_to_jiffies(const struct timeval *value);
 extern void jiffies_to_timeval(const unsigned long jiffies,
 			       struct timeval *value);

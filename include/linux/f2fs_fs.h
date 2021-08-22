@@ -99,6 +99,7 @@ struct f2fs_super_block {
 /*
  * For checkpoint
  */
+#define CP_CRC_RECOVERY_FLAG	0x00000040
 #define CP_FASTBOOT_FLAG	0x00000020
 #define CP_FSCK_FLAG		0x00000010
 #define CP_ERROR_FLAG		0x00000008
@@ -284,6 +285,12 @@ struct f2fs_nat_block {
 #define SIT_ENTRY_PER_BLOCK (PAGE_CACHE_SIZE / sizeof(struct f2fs_sit_entry))
 
 /*
+ * F2FS uses 4 bytes to represent block address. As a result, supported size of
+ * disk is 16 TB and it equals to 16 * 1024 * 1024 / 2 segments.
+ */
+#define F2FS_MAX_SEGMENT       ((16 * 1024 * 1024) / 2)
+
+/*
  * Note that f2fs_sit_entry->vblocks has the following bit-field information.
  * [15:10] : allocation type such as CURSEG_XXXX_TYPE
  * [9:0] : valid block count
@@ -417,15 +424,25 @@ typedef __le32	f2fs_hash_t;
 
 #define GET_DENTRY_SLOTS(x)	((x + F2FS_SLOT_LEN - 1) >> F2FS_SLOT_LEN_BITS)
 
-/* the number of dentry in a block */
-#define NR_DENTRY_IN_BLOCK	214
-
 /* MAX level for dir lookup */
 #define MAX_DIR_HASH_DEPTH	63
 
 /* MAX buckets in one level of dir */
 #define MAX_DIR_BUCKETS		(1 << ((MAX_DIR_HASH_DEPTH / 2) - 1))
 
+/*
+ * space utilization of regular dentry and inline dentry
+ *		regular dentry			inline dentry
+ * bitmap	1 * 27 = 27			1 * 23 = 23
+ * reserved	1 * 3 = 3			1 * 7 = 7
+ * dentry	11 * 214 = 2354			11 * 182 = 2002
+ * filename	8 * 214 = 1712			8 * 182 = 1456
+ * total	4096				3488
+ *
+ * Note: there are more reserved space in inline dentry than in regular
+ * dentry, when converting inline dentry we should handle this carefully.
+ */
+#define NR_DENTRY_IN_BLOCK	214	/* the number of dentry in a block */
 #define SIZE_OF_DIR_ENTRY	11	/* by byte */
 #define SIZE_OF_DENTRY_BITMAP	((NR_DENTRY_IN_BLOCK + BITS_PER_BYTE - 1) / \
 					BITS_PER_BYTE)
@@ -480,5 +497,7 @@ enum {
 	F2FS_FT_SYMLINK,
 	F2FS_FT_MAX
 };
+
+#define S_SHIFT 12
 
 #endif  /* _LINUX_F2FS_FS_H */

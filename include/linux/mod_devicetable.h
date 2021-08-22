@@ -219,6 +219,14 @@ struct serio_device_id {
 	__u8 proto;
 };
 
+struct hda_device_id {
+	__u32 vendor_id;
+	__u32 rev_id;
+	__u8 api_version;
+	const char *name;
+	unsigned long driver_data;
+};
+
 /*
  * Struct used for matching a device
  */
@@ -253,7 +261,7 @@ struct pcmcia_device_id {
 
 	__u32 		prod_id_hash[4];
 
-	/* not matched against in kernelspace*/
+	/* not matched against in kernelspace */
 	const char *	prod_id[4];
 
 	/* not matched against */
@@ -396,7 +404,7 @@ struct virtio_device_id {
  * For Hyper-V devices we use the device guid as the id.
  */
 struct hv_vmbus_device_id {
-	__u8 guid[16];
+	uuid_le guid;
 	kernel_ulong_t driver_data;	/* Data private to the driver */
 };
 
@@ -494,9 +502,9 @@ struct platform_device_id {
 
 #define MDIO_MODULE_PREFIX	"mdio:"
 
-#define MDIO_ID_FMT "%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d"
+#define MDIO_ID_FMT "%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u%u"
 #define MDIO_ID_ARGS(_id) \
-	(_id)>>31, ((_id)>>30) & 1, ((_id)>>29) & 1, ((_id)>>28) & 1,	\
+	((_id)>>31) & 1, ((_id)>>30) & 1, ((_id)>>29) & 1, ((_id)>>28) & 1, \
 	((_id)>>27) & 1, ((_id)>>26) & 1, ((_id)>>25) & 1, ((_id)>>24) & 1, \
 	((_id)>>23) & 1, ((_id)>>22) & 1, ((_id)>>21) & 1, ((_id)>>20) & 1, \
 	((_id)>>19) & 1, ((_id)>>18) & 1, ((_id)>>17) & 1, ((_id)>>16) & 1, \
@@ -564,6 +572,10 @@ struct mips_cdmm_device_id {
 /*
  * MODULE_DEVICE_TABLE expects this struct to be called x86cpu_device_id.
  * Although gcc seems to ignore this error, clang fails without this define.
+ *
+ * Note: The ordering of the struct is different from upstream because the
+ * static initializers in kernels < 5.7 still use C89 style while upstream
+ * has been converted to proper C99 initializers.
  */
 #define x86cpu_device_id x86_cpu_id
 struct x86_cpu_id {
@@ -572,6 +584,7 @@ struct x86_cpu_id {
 	__u16 model;
 	__u16 feature;	/* bit index */
 	kernel_ulong_t driver_data;
+	__u16 steppings;
 };
 
 #define X86_FEATURE_MATCH(x) \
@@ -580,6 +593,7 @@ struct x86_cpu_id {
 #define X86_VENDOR_ANY 0xffff
 #define X86_FAMILY_ANY 0
 #define X86_MODEL_ANY  0
+#define X86_STEPPING_ANY 0
 #define X86_FEATURE_ANY 0	/* Same as FPU, you can't test for that */
 
 /*
@@ -601,15 +615,13 @@ struct ipack_device_id {
 
 #define MEI_CL_MODULE_PREFIX "mei:"
 #define MEI_CL_NAME_SIZE 32
-#define MEI_CL_UUID_FMT "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x"
-#define MEI_CL_UUID_ARGS(_u) \
-	_u[0], _u[1], _u[2], _u[3], _u[4], _u[5], _u[6], _u[7], \
-	_u[8], _u[9], _u[10], _u[11], _u[12], _u[13], _u[14], _u[15]
+#define MEI_CL_VERSION_ANY 0xff
 
 /**
  * struct mei_cl_device_id - MEI client device identifier
  * @name: helper name
  * @uuid: client uuid
+ * @version: client protocol version
  * @driver_info: information used by the driver.
  *
  * identifies mei client device by uuid and name
@@ -617,6 +629,7 @@ struct ipack_device_id {
 struct mei_cl_device_id {
 	char name[MEI_CL_NAME_SIZE];
 	uuid_le uuid;
+	__u8    version;
 	kernel_ulong_t driver_info;
 };
 

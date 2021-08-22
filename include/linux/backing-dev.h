@@ -12,19 +12,33 @@
 #include <linux/fs.h>
 #include <linux/sched.h>
 #include <linux/blkdev.h>
+#include <linux/device.h>
 #include <linux/writeback.h>
 #include <linux/blk-cgroup.h>
 #include <linux/backing-dev-defs.h>
 #include <linux/slab.h>
 
 int __must_check bdi_init(struct backing_dev_info *bdi);
-void bdi_destroy(struct backing_dev_info *bdi);
+
+static inline struct backing_dev_info *bdi_get(struct backing_dev_info *bdi)
+{
+	kref_get(&bdi->refcnt);
+	return bdi;
+}
+
+void bdi_put(struct backing_dev_info *bdi);
 
 __printf(3, 4)
 int bdi_register(struct backing_dev_info *bdi, struct device *parent,
 		const char *fmt, ...);
 int bdi_register_dev(struct backing_dev_info *bdi, dev_t dev);
+int bdi_register_owner(struct backing_dev_info *bdi, struct device *owner);
+void bdi_unregister(struct backing_dev_info *bdi);
+
 int __must_check bdi_setup_and_register(struct backing_dev_info *, char *);
+void bdi_destroy(struct backing_dev_info *bdi);
+struct backing_dev_info *bdi_alloc_node(gfp_t gfp_mask, int node_id);
+
 void wb_start_writeback(struct bdi_writeback *wb, long nr_pages,
 			bool range_cyclic, enum wb_reason reason);
 void wb_start_background_writeback(struct bdi_writeback *wb);
@@ -178,7 +192,7 @@ static inline struct backing_dev_info *inode_to_bdi(struct inode *inode)
 	sb = inode->i_sb;
 #ifdef CONFIG_BLOCK
 	if (sb_is_blkdev_sb(sb))
-		return blk_get_backing_dev_info(I_BDEV(inode));
+		return I_BDEV(inode)->bd_bdi;
 #endif
 	return sb->s_bdi;
 }
@@ -252,13 +266,19 @@ int inode_congested(struct inode *inode, int cong_bits);
  * @inode: inode of interest
  *
  * cgroup writeback requires support from both the bdi and filesystem.
- * Test whether @inode has both.
+ * Also, both memcg and iocg have to be on the default hierarchy.  Test
+ * whether all conditions are met.
+ *
+ * Note that the test result may change dynamically on the same inode
+ * depending on how memcg and iocg are configured.
  */
 static inline bool inode_cgwb_enabled(struct inode *inode)
 {
 	struct backing_dev_info *bdi = inode_to_bdi(inode);
 
-	return bdi_cap_account_dirty(bdi) &&
+	return cgroup_subsys_on_dfl(memory_cgrp_subsys) &&
+		cgroup_subsys_on_dfl(io_cgrp_subsys) &&
+		bdi_cap_account_dirty(bdi) &&
 		(bdi->capabilities & BDI_CAP_CGROUP_WRITEBACK) &&
 		(inode->i_sb->s_iflags & SB_I_CGROUPWB);
 }
@@ -286,7 +306,7 @@ static inline struct bdi_writeback *wb_find_current(struct backing_dev_info *bdi
 	 * %current's blkcg equals the effective blkcg of its memcg.  No
 	 * need to use the relatively expensive cgroup_get_e_css().
 	 */
-	if (likely(wb && wb->blkcg_css == task_css(current, blkio_cgrp_id)))
+	if (likely(wb && wb->blkcg_css == task_css(current, io_cgrp_id)))
 		return wb;
 	return NULL;
 }
@@ -355,7 +375,7 @@ static inline struct bdi_writeback *inode_to_wb(struct inode *inode)
 /**
  * unlocked_inode_to_wb_begin - begin unlocked inode wb access transaction
  * @inode: target inode
- * @lockedp: temp bool output param, to be passed to the end function
+ * @cookie: output param, to be passed to the end function
  *
  * The caller wants to access the wb associated with @inode but isn't
  * holding inode->i_lock, mapping->tree_lock or wb->list_lock.  This
@@ -363,12 +383,12 @@ static inline struct bdi_writeback *inode_to_wb(struct inode *inode)
  * association doesn't change until the transaction is finished with
  * unlocked_inode_to_wb_end().
  *
- * The caller must call unlocked_inode_to_wb_end() with *@lockdep
- * afterwards and can't sleep during transaction.  IRQ may or may not be
- * disabled on return.
+ * The caller must call unlocked_inode_to_wb_end() with *@cookie afterwards and
+ * can't sleep during the transaction.  IRQs may or may not be disabled on
+ * return.
  */
 static inline struct bdi_writeback *
-unlocked_inode_to_wb_begin(struct inode *inode, bool *lockedp)
+unlocked_inode_to_wb_begin(struct inode *inode, struct wb_lock_cookie *cookie)
 {
 	rcu_read_lock();
 
@@ -376,10 +396,10 @@ unlocked_inode_to_wb_begin(struct inode *inode, bool *lockedp)
 	 * Paired with store_release in inode_switch_wb_work_fn() and
 	 * ensures that we see the new wb if we see cleared I_WB_SWITCH.
 	 */
-	*lockedp = smp_load_acquire(&inode->i_state) & I_WB_SWITCH;
+	cookie->locked = smp_load_acquire(&inode->i_state) & I_WB_SWITCH;
 
-	if (unlikely(*lockedp))
-		spin_lock_irq(&inode->i_mapping->tree_lock);
+	if (unlikely(cookie->locked))
+		spin_lock_irqsave(&inode->i_mapping->tree_lock, cookie->flags);
 
 	/*
 	 * Protected by either !I_WB_SWITCH + rcu_read_lock() or tree_lock.
@@ -391,70 +411,17 @@ unlocked_inode_to_wb_begin(struct inode *inode, bool *lockedp)
 /**
  * unlocked_inode_to_wb_end - end inode wb access transaction
  * @inode: target inode
- * @locked: *@lockedp from unlocked_inode_to_wb_begin()
+ * @cookie: @cookie from unlocked_inode_to_wb_begin()
  */
-static inline void unlocked_inode_to_wb_end(struct inode *inode, bool locked)
+static inline void unlocked_inode_to_wb_end(struct inode *inode,
+					    struct wb_lock_cookie *cookie)
 {
-	if (unlikely(locked))
-		spin_unlock_irq(&inode->i_mapping->tree_lock);
+	if (unlikely(cookie->locked))
+		spin_unlock_irqrestore(&inode->i_mapping->tree_lock,
+				       cookie->flags);
 
 	rcu_read_unlock();
 }
-
-struct wb_iter {
-	int			start_blkcg_id;
-	struct radix_tree_iter	tree_iter;
-	void			**slot;
-};
-
-static inline struct bdi_writeback *__wb_iter_next(struct wb_iter *iter,
-						   struct backing_dev_info *bdi)
-{
-	struct radix_tree_iter *titer = &iter->tree_iter;
-
-	WARN_ON_ONCE(!rcu_read_lock_held());
-
-	if (iter->start_blkcg_id >= 0) {
-		iter->slot = radix_tree_iter_init(titer, iter->start_blkcg_id);
-		iter->start_blkcg_id = -1;
-	} else {
-		iter->slot = radix_tree_next_slot(iter->slot, titer, 0);
-	}
-
-	if (!iter->slot)
-		iter->slot = radix_tree_next_chunk(&bdi->cgwb_tree, titer, 0);
-	if (iter->slot)
-		return *iter->slot;
-	return NULL;
-}
-
-static inline struct bdi_writeback *__wb_iter_init(struct wb_iter *iter,
-						   struct backing_dev_info *bdi,
-						   int start_blkcg_id)
-{
-	iter->start_blkcg_id = start_blkcg_id;
-
-	if (start_blkcg_id)
-		return __wb_iter_next(iter, bdi);
-	else
-		return &bdi->wb;
-}
-
-/**
- * bdi_for_each_wb - walk all wb's of a bdi in ascending blkcg ID order
- * @wb_cur: cursor struct bdi_writeback pointer
- * @bdi: bdi to walk wb's of
- * @iter: pointer to struct wb_iter to be used as iteration buffer
- * @start_blkcg_id: blkcg ID to start iteration from
- *
- * Iterate @wb_cur through the wb's (bdi_writeback's) of @bdi in ascending
- * blkcg ID order starting from @start_blkcg_id.  @iter is struct wb_iter
- * to be used as temp storage during iteration.  rcu_read_lock() must be
- * held throughout iteration.
- */
-#define bdi_for_each_wb(wb_cur, bdi, iter, start_blkcg_id)		\
-	for ((wb_cur) = __wb_iter_init(iter, bdi, start_blkcg_id);	\
-	     (wb_cur); (wb_cur) = __wb_iter_next(iter, bdi))
 
 #else	/* CONFIG_CGROUP_WRITEBACK */
 
@@ -498,12 +465,13 @@ static inline struct bdi_writeback *inode_to_wb(struct inode *inode)
 }
 
 static inline struct bdi_writeback *
-unlocked_inode_to_wb_begin(struct inode *inode, bool *lockedp)
+unlocked_inode_to_wb_begin(struct inode *inode, struct wb_lock_cookie *cookie)
 {
 	return inode_to_wb(inode);
 }
 
-static inline void unlocked_inode_to_wb_end(struct inode *inode, bool locked)
+static inline void unlocked_inode_to_wb_end(struct inode *inode,
+					    struct wb_lock_cookie *cookie)
 {
 }
 
@@ -514,14 +482,6 @@ static inline void wb_memcg_offline(struct mem_cgroup *memcg)
 static inline void wb_blkcg_offline(struct blkcg *blkcg)
 {
 }
-
-struct wb_iter {
-	int		next_id;
-};
-
-#define bdi_for_each_wb(wb_cur, bdi, iter, start_blkcg_id)		\
-	for ((iter)->next_id = (start_blkcg_id);			\
-	     ({	(wb_cur) = !(iter)->next_id++ ? &(bdi)->wb : NULL; }); )
 
 static inline int inode_congested(struct inode *inode, int cong_bits)
 {
@@ -565,6 +525,15 @@ static inline int bdi_rw_congested(struct backing_dev_info *bdi)
 {
 	return bdi_congested(bdi, (1 << WB_sync_congested) |
 				  (1 << WB_async_congested));
+}
+
+extern const char *bdi_unknown_name;
+
+static inline const char *bdi_dev_name(struct backing_dev_info *bdi)
+{
+	if (!bdi || !bdi->dev)
+		return bdi_unknown_name;
+	return dev_name(bdi->dev);
 }
 
 #endif	/* _LINUX_BACKING_DEV_H */

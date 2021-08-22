@@ -145,7 +145,7 @@ static int get_tjmax(void)
 	return -EINVAL;
 }
 
-static int read_temp_msr(unsigned long *temp)
+static int read_temp_msr(int *temp)
 {
 	int cpu;
 	u32 eax, edx;
@@ -177,7 +177,7 @@ err_ret:
 }
 
 static int proc_thermal_get_zone_temp(struct thermal_zone_device *zone,
-					 unsigned long *temp)
+					 int *temp)
 {
 	int ret;
 
@@ -363,7 +363,7 @@ static int  proc_thermal_pci_probe(struct pci_dev *pdev,
 		proc_priv->soc_dts = intel_soc_dts_iosf_init(
 					INTEL_SOC_DTS_INTERRUPT_MSI, 2, 0);
 
-		if (proc_priv->soc_dts && pdev->irq) {
+		if (!IS_ERR(proc_priv->soc_dts) && pdev->irq) {
 			ret = pci_enable_msi(pdev);
 			if (!ret) {
 				ret = request_threaded_irq(pdev->irq, NULL,
