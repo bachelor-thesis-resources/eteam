@@ -81,6 +81,7 @@
 #include <net/sock.h>
 #include <net/ip_fib.h>
 #include <net/switchdev.h>
+#include <trace/events/fib.h>
 #include "fib_lookup.h"
 
 #define MAX_STAT_DEPTH 32
@@ -1278,6 +1279,8 @@ int fib_table_lookup(struct fib_table *tb, const struct flowi4 *flp,
 	unsigned long index;
 	t_key cindex;
 
+	trace_fib_table_lookup(tb->tb_id, flp);
+
 	pn = t->kv;
 	cindex = 0;
 
@@ -1423,8 +1426,11 @@ found:
 			    nh->nh_flags & RTNH_F_LINKDOWN &&
 			    !(fib_flags & FIB_LOOKUP_IGNORE_LINKSTATE))
 				continue;
-			if (flp->flowi4_oif && flp->flowi4_oif != nh->nh_oif)
-				continue;
+			if (!(flp->flowi4_flags & FLOWI_FLAG_SKIP_NH_OIF)) {
+				if (flp->flowi4_oif &&
+				    flp->flowi4_oif != nh->nh_oif)
+					continue;
+			}
 
 			if (!(fib_flags & FIB_LOOKUP_NOREF))
 				atomic_inc(&fi->fib_clntref);
@@ -1439,6 +1445,8 @@ found:
 #ifdef CONFIG_IP_FIB_TRIE_STATS
 			this_cpu_inc(stats->semantic_match_passed);
 #endif
+			trace_fib_table_lookup_nh(nh);
+
 			return err;
 		}
 	}
@@ -1561,7 +1569,7 @@ static struct key_vector *leaf_walk_rcu(struct key_vector **tn, t_key key)
 	do {
 		/* record parent and next child index */
 		pn = n;
-		cindex = key ? get_index(key, pn) : 0;
+		cindex = (key > pn->key) ? get_index(key, pn) : 0;
 
 		if (cindex >> pn->bits)
 			break;
@@ -1688,7 +1696,7 @@ struct fib_table *fib_trie_unmerge(struct fib_table *oldtb)
 	while ((l = leaf_walk_rcu(&tp, key)) != NULL) {
 		struct key_vector *local_l = NULL, *local_tp;
 
-		hlist_for_each_entry_rcu(fa, &l->leaf, fa_list) {
+		hlist_for_each_entry(fa, &l->leaf, fa_list) {
 			struct fib_alias *new_fa;
 
 			if (local_tb->tb_id != fa->tb_id)
@@ -1706,8 +1714,10 @@ struct fib_table *fib_trie_unmerge(struct fib_table *oldtb)
 				local_l = fib_find_node(lt, &local_tp, l->key);
 
 			if (fib_insert_alias(lt, local_tp, local_l, new_fa,
-					     NULL, l->key))
+					     NULL, l->key)) {
+				kmem_cache_free(fn_alias_kmem, new_fa);
 				goto out;
+			}
 		}
 
 		/* stop loop if key wrapped back to 0 */
@@ -1798,7 +1808,7 @@ void fib_table_flush_external(struct fib_table *tb)
 }
 
 /* Caller must hold RTNL. */
-int fib_table_flush(struct fib_table *tb)
+int fib_table_flush(struct fib_table *tb, bool flush_all)
 {
 	struct trie *t = (struct trie *)tb->tb_data;
 	struct key_vector *pn = t->kv;
@@ -1842,7 +1852,17 @@ int fib_table_flush(struct fib_table *tb)
 		hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
 			struct fib_info *fi = fa->fa_info;
 
-			if (!fi || !(fi->fib_flags & RTNH_F_DEAD)) {
+			if (!fi ||
+			    (!(fi->fib_flags & RTNH_F_DEAD) &&
+			     !fib_props[fa->fa_type].error)) {
+				slen = fa->fa_slen;
+				continue;
+			}
+
+			/* Do not flush error routes if network namespace is
+			 * not being dismantled
+			 */
+			if (!flush_all && fib_props[fa->fa_type].error) {
 				slen = fa->fa_slen;
 				continue;
 			}
@@ -1898,6 +1918,8 @@ static int fn_trie_dump_leaf(struct key_vector *l, struct fib_table *tb,
 
 	/* rcu_read_lock is hold by caller */
 	hlist_for_each_entry_rcu(fa, &l->leaf, fa_list) {
+		int err;
+
 		if (i < s_i) {
 			i++;
 			continue;
@@ -1908,17 +1930,14 @@ static int fn_trie_dump_leaf(struct key_vector *l, struct fib_table *tb,
 			continue;
 		}
 
-		if (fib_dump_info(skb, NETLINK_CB(cb->skb).portid,
-				  cb->nlh->nlmsg_seq,
-				  RTM_NEWROUTE,
-				  tb->tb_id,
-				  fa->fa_type,
-				  xkey,
-				  KEYLENGTH - fa->fa_slen,
-				  fa->fa_tos,
-				  fa->fa_info, NLM_F_MULTI) < 0) {
+		err = fib_dump_info(skb, NETLINK_CB(cb->skb).portid,
+				    cb->nlh->nlmsg_seq, RTM_NEWROUTE,
+				    tb->tb_id, fa->fa_type,
+				    xkey, KEYLENGTH - fa->fa_slen,
+				    fa->fa_tos, fa->fa_info, NLM_F_MULTI);
+		if (err < 0) {
 			cb->args[4] = i;
-			return -1;
+			return err;
 		}
 		i++;
 	}
@@ -1940,10 +1959,13 @@ int fib_table_dump(struct fib_table *tb, struct sk_buff *skb,
 	t_key key = cb->args[3];
 
 	while ((l = leaf_walk_rcu(&tp, key)) != NULL) {
-		if (fn_trie_dump_leaf(l, tb, skb, cb) < 0) {
+		int err;
+
+		err = fn_trie_dump_leaf(l, tb, skb, cb);
+		if (err < 0) {
 			cb->args[3] = key;
 			cb->args[2] = count;
-			return -1;
+			return err;
 		}
 
 		++count;
@@ -2210,6 +2232,7 @@ static int fib_triestat_seq_show(struct seq_file *seq, void *v)
 		   " %Zd bytes, size of tnode: %Zd bytes.\n",
 		   LEAF_SIZE, TNODE_SIZE(0));
 
+	rcu_read_lock();
 	for (h = 0; h < FIB_TABLE_HASHSZ; h++) {
 		struct hlist_head *head = &net->ipv4.fib_table_hash[h];
 		struct fib_table *tb;
@@ -2229,7 +2252,9 @@ static int fib_triestat_seq_show(struct seq_file *seq, void *v)
 			trie_show_usage(seq, t->stats);
 #endif
 		}
+		cond_resched_rcu();
 	}
+	rcu_read_unlock();
 
 	return 0;
 }
@@ -2445,29 +2470,22 @@ struct fib_route_iter {
 static struct key_vector *fib_route_get_idx(struct fib_route_iter *iter,
 					    loff_t pos)
 {
-	struct fib_table *tb = iter->main_tb;
 	struct key_vector *l, **tp = &iter->tnode;
-	struct trie *t;
 	t_key key;
 
-	/* use cache location of next-to-find key */
+	/* use cached location of previously found key */
 	if (iter->pos > 0 && pos >= iter->pos) {
-		pos -= iter->pos;
 		key = iter->key;
 	} else {
-		t = (struct trie *)tb->tb_data;
-		iter->tnode = t->kv;
-		iter->pos = 0;
+		iter->pos = 1;
 		key = 0;
 	}
 
-	while ((l = leaf_walk_rcu(tp, key)) != NULL) {
+	pos -= iter->pos;
+
+	while ((l = leaf_walk_rcu(tp, key)) && (pos-- > 0)) {
 		key = l->key + 1;
 		iter->pos++;
-
-		if (--pos <= 0)
-			break;
-
 		l = NULL;
 
 		/* handle unlikely case of a key wrap */
@@ -2476,7 +2494,7 @@ static struct key_vector *fib_route_get_idx(struct fib_route_iter *iter,
 	}
 
 	if (l)
-		iter->key = key;	/* remember it */
+		iter->key = l->key;	/* remember it */
 	else
 		iter->pos = 0;		/* forget it */
 
@@ -2497,14 +2515,14 @@ static void *fib_route_seq_start(struct seq_file *seq, loff_t *pos)
 		return NULL;
 
 	iter->main_tb = tb;
+	t = (struct trie *)tb->tb_data;
+	iter->tnode = t->kv;
 
 	if (*pos != 0)
 		return fib_route_get_idx(iter, *pos);
 
-	t = (struct trie *)tb->tb_data;
-	iter->tnode = t->kv;
 	iter->pos = 0;
-	iter->key = 0;
+	iter->key = KEY_MAX;
 
 	return SEQ_START_TOKEN;
 }
@@ -2513,7 +2531,7 @@ static void *fib_route_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 {
 	struct fib_route_iter *iter = seq->private;
 	struct key_vector *l = NULL;
-	t_key key = iter->key;
+	t_key key = iter->key + 1;
 
 	++*pos;
 
@@ -2522,7 +2540,7 @@ static void *fib_route_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 		l = leaf_walk_rcu(&iter->tnode, key);
 
 	if (l) {
-		iter->key = l->key + 1;
+		iter->key = l->key;
 		iter->pos++;
 	} else {
 		iter->pos = 0;

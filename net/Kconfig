@@ -232,6 +232,7 @@ source "net/netlink/Kconfig"
 source "net/mpls/Kconfig"
 source "net/hsr/Kconfig"
 source "net/switchdev/Kconfig"
+source "net/l3mdev/Kconfig"
 
 config RPS
 	bool
@@ -281,8 +282,11 @@ config BPF_JIT
 	  Berkeley Packet Filter filtering capabilities are normally handled
 	  by an interpreter. This option allows kernel to generate a native
 	  code when filter is loaded in memory. This should speedup
-	  packet sniffing (libpcap/tcpdump). Note : Admin should enable
-	  this feature changing /proc/sys/net/core/bpf_jit_enable
+	  packet sniffing (libpcap/tcpdump).
+
+	  Note, admin should enable this feature changing:
+	  /proc/sys/net/core/bpf_jit_enable
+	  /proc/sys/net/core/bpf_jit_harden (optional)
 
 config NET_FLOW_LIMIT
 	bool
@@ -374,9 +378,23 @@ source "net/caif/Kconfig"
 source "net/ceph/Kconfig"
 source "net/nfc/Kconfig"
 
+config LWTUNNEL
+	bool "Network light weight tunnels"
+	---help---
+	  This feature provides an infrastructure to support light weight
+	  tunnels like mpls. There is no netdevice associated with a light
+	  weight tunnel endpoint. Tunnel encapsulation parameters are stored
+	  with light weight tunnel state associated with fib routes.
+
+config DST_CACHE
+	bool
+	default n
 
 endif   # if NET
 
 # Used by archs to tell that they support BPF_JIT
 config HAVE_BPF_JIT
+	bool
+
+config HAVE_EBPF_JIT
 	bool

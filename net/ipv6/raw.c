@@ -62,6 +62,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/export.h>
+#include <linux/nospec.h>
 
 #define	ICMPV6_HDRLEN	4	/* ICMPv6 header, RFC 4443 Section 2.1 */
 
@@ -283,7 +284,9 @@ static int rawv6_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 			/* Binding to link-local address requires an interface */
 			if (!sk->sk_bound_dev_if)
 				goto out_unlock;
+		}
 
+		if (sk->sk_bound_dev_if) {
 			err = -ENODEV;
 			dev = dev_get_by_index_rcu(sock_net(sk),
 						   sk->sk_bound_dev_if);
@@ -295,7 +298,8 @@ static int rawv6_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 		 * unspecified and mapped address have a v4 equivalent.
 		 */
 		v4addr = LOOPBACK4_IPV6;
-		if (!(addr_type & IPV6_ADDR_MULTICAST))	{
+		if (!(addr_type & IPV6_ADDR_MULTICAST) &&
+		    !sock_net(sk)->ipv6.sysctl.ip_nonlocal_bind) {
 			err = -EADDRNOTAVAIL;
 			if (!ipv6_chk_addr(sock_net(sk), &addr->sin6_addr,
 					   dev, 0)) {
@@ -588,7 +592,11 @@ static int rawv6_push_pending_frames(struct sock *sk, struct flowi6 *fl6,
 	}
 
 	offset += skb_transport_offset(skb);
-	BUG_ON(skb_copy_bits(skb, offset, &csum, 2));
+	err = skb_copy_bits(skb, offset, &csum, 2);
+	if (err < 0) {
+		ip6_flush_pending_frames(sk);
+		goto out;
+	}
 
 	/* in case cksum was not initialized */
 	if (unlikely(csum))
@@ -613,6 +621,7 @@ static int rawv6_send_hdrinc(struct sock *sk, struct msghdr *msg, int length,
 			unsigned int flags)
 {
 	struct ipv6_pinfo *np = inet6_sk(sk);
+	struct net *net = sock_net(sk);
 	struct ipv6hdr *iph;
 	struct sk_buff *skb;
 	int err;
@@ -624,6 +633,8 @@ static int rawv6_send_hdrinc(struct sock *sk, struct msghdr *msg, int length,
 		ipv6_local_error(sk, EMSGSIZE, fl6, rt->dst.dev->mtu);
 		return -EMSGSIZE;
 	}
+	if (length < sizeof(struct ipv6hdr))
+		return -EINVAL;
 	if (flags&MSG_PROBE)
 		goto out;
 
@@ -646,14 +657,17 @@ static int rawv6_send_hdrinc(struct sock *sk, struct msghdr *msg, int length,
 
 	skb->ip_summed = CHECKSUM_NONE;
 
+	if (flags & MSG_CONFIRM)
+		skb_set_dst_pending_confirm(skb, 1);
+
 	skb->transport_header = skb->network_header;
 	err = memcpy_from_msg(iph, msg, length);
 	if (err)
 		goto error_fault;
 
-	IP6_UPD_PO_STATS(sock_net(sk), rt->rt6i_idev, IPSTATS_MIB_OUT, skb->len);
-	err = NF_HOOK(NFPROTO_IPV6, NF_INET_LOCAL_OUT, sk, skb,
-		      NULL, rt->dst.dev, dst_output_sk);
+	IP6_UPD_PO_STATS(net, rt->rt6i_idev, IPSTATS_MIB_OUT, skb->len);
+	err = NF_HOOK(NFPROTO_IPV6, NF_INET_LOCAL_OUT, net, sk, skb,
+		      NULL, rt->dst.dev, dst_output);
 	if (err > 0)
 		err = net_xmit_errno(err);
 	if (err)
@@ -665,7 +679,7 @@ error_fault:
 	err = -EFAULT;
 	kfree_skb(skb);
 error:
-	IP6_INC_STATS(sock_net(sk), rt->rt6i_idev, IPSTATS_MIB_OUTDISCARDS);
+	IP6_INC_STATS(net, rt->rt6i_idev, IPSTATS_MIB_OUTDISCARDS);
 	if (err == -ENOBUFS && !np->recverr)
 		err = 0;
 	return err;
@@ -704,7 +718,10 @@ static int raw6_getfrag(void *from, char *to, int offset, int len, int odd,
 	struct raw6_frag_vec *rfv = from;
 
 	if (offset < rfv->hlen) {
-		int copy = min(rfv->hlen - offset, len);
+		int copy;
+
+		offset = array_index_nospec(offset, rfv->hlen); /* needed? */
+		copy = min(rfv->hlen - offset, len);
 
 		if (skb->ip_summed == CHECKSUM_PARTIAL)
 			memcpy(to, rfv->c + offset, copy);
@@ -731,6 +748,7 @@ static int raw6_getfrag(void *from, char *to, int offset, int len, int odd,
 
 static int rawv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 {
+	struct ipv6_txoptions *opt_to_free = NULL;
 	struct ipv6_txoptions opt_space;
 	DECLARE_SOCKADDR(struct sockaddr_in6 *, sin6, msg->msg_name);
 	struct in6_addr *daddr, *final_p, final;
@@ -746,6 +764,7 @@ static int rawv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	int hlimit = -1;
 	int tclass = -1;
 	int dontfrag = -1;
+	int hdrincl;
 	u16 proto;
 	int err;
 
@@ -758,6 +777,13 @@ static int rawv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	/* Mirror BSD error message compatibility */
 	if (msg->msg_flags & MSG_OOB)
 		return -EOPNOTSUPP;
+
+	/* hdrincl should be READ_ONCE(inet->hdrincl)
+	 * but READ_ONCE() doesn't work with bit fields.
+	 * Doing this indirectly yields the same result.
+	 */
+	hdrincl = inet->hdrincl;
+	hdrincl = READ_ONCE(hdrincl);
 
 	/*
 	 *	Get and verify the address.
@@ -837,8 +863,10 @@ static int rawv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		if (!(opt->opt_nflen|opt->opt_flen))
 			opt = NULL;
 	}
-	if (!opt)
-		opt = np->opt;
+	if (!opt) {
+		opt = txopt_get(np);
+		opt_to_free = opt;
+		}
 	if (flowlabel)
 		opt = fl6_merge_options(&opt_space, flowlabel, opt);
 	opt = ipv6_fixup_options(&opt_space, opt);
@@ -865,10 +893,10 @@ static int rawv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		fl6.flowi6_oif = np->ucast_oif;
 	security_sk_classify_flow(sk, flowi6_to_flowi(&fl6));
 
-	if (inet->hdrincl)
+	if (hdrincl)
 		fl6.flowi6_flags |= FLOWI_FLAG_KNOWN_NH;
 
-	dst = ip6_dst_lookup_flow(sk, &fl6, final_p);
+	dst = ip6_dst_lookup_flow(sock_net(sk), sk, &fl6, final_p);
 	if (IS_ERR(dst)) {
 		err = PTR_ERR(dst);
 		goto out;
@@ -886,7 +914,7 @@ static int rawv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		goto do_confirm;
 
 back_from_confirm:
-	if (inet->hdrincl)
+	if (hdrincl)
 		err = rawv6_send_hdrinc(sk, msg, len, &fl6, &dst, msg->msg_flags);
 	else {
 		lock_sock(sk);
@@ -904,9 +932,11 @@ done:
 	dst_release(dst);
 out:
 	fl6_sock_release(flowlabel);
+	txopt_put(opt_to_free);
 	return err < 0 ? err : len;
 do_confirm:
-	dst_confirm(dst);
+	if (msg->msg_flags & MSG_PROBE)
+		dst_confirm_neigh(dst, &fl6.daddr);
 	if (!(msg->msg_flags & MSG_PROBE) || len)
 		goto back_from_confirm;
 	err = 0;
@@ -1134,8 +1164,7 @@ static int rawv6_ioctl(struct sock *sk, int cmd, unsigned long arg)
 		spin_lock_bh(&sk->sk_receive_queue.lock);
 		skb = skb_peek(&sk->sk_receive_queue);
 		if (skb)
-			amount = skb_tail_pointer(skb) -
-				skb_transport_header(skb);
+			amount = skb->len;
 		spin_unlock_bh(&sk->sk_receive_queue.lock);
 		return put_user(amount, (int __user *)arg);
 	}
@@ -1292,7 +1321,7 @@ void raw6_proc_exit(void)
 #endif	/* CONFIG_PROC_FS */
 
 /* Same as inet6_dgram_ops, sans udp_poll.  */
-static const struct proto_ops inet6_sockraw_ops = {
+const struct proto_ops inet6_sockraw_ops = {
 	.family		   = PF_INET6,
 	.owner		   = THIS_MODULE,
 	.release	   = inet6_release,

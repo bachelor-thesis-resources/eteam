@@ -13,6 +13,7 @@
 #include <net/dsfield.h>
 #include <linux/if_vlan.h>
 #include <linux/mpls.h>
+#include <linux/nospec.h>
 #include "core.h"
 #include "rdev-ops.h"
 
@@ -749,20 +750,25 @@ unsigned int cfg80211_classify8021d(struct sk_buff *skb,
 {
 	unsigned int dscp;
 	unsigned char vlan_priority;
+	unsigned int ret;
 
 	/* skb->priority values from 256->263 are magic values to
 	 * directly indicate a specific 802.1d priority.  This is used
 	 * to allow 802.1d priority to be passed directly in from VLAN
 	 * tags, etc.
 	 */
-	if (skb->priority >= 256 && skb->priority <= 263)
-		return skb->priority - 256;
+	if (skb->priority >= 256 && skb->priority <= 263) {
+		ret = skb->priority - 256;
+		goto out;
+	}
 
 	if (skb_vlan_tag_present(skb)) {
 		vlan_priority = (skb_vlan_tag_get(skb) & VLAN_PRIO_MASK)
 			>> VLAN_PRIO_SHIFT;
-		if (vlan_priority > 0)
-			return vlan_priority;
+		if (vlan_priority > 0) {
+			ret = vlan_priority;
+			goto out;
+		}
 	}
 
 	switch (skb->protocol) {
@@ -781,8 +787,9 @@ unsigned int cfg80211_classify8021d(struct sk_buff *skb,
 		if (!mpls)
 			return 0;
 
-		return (ntohl(mpls->entry) & MPLS_LS_TC_MASK)
+		ret = (ntohl(mpls->entry) & MPLS_LS_TC_MASK)
 			>> MPLS_LS_TC_SHIFT;
+		goto out;
 	}
 	case htons(ETH_P_80221):
 		/* 802.21 is always network control traffic */
@@ -795,18 +802,24 @@ unsigned int cfg80211_classify8021d(struct sk_buff *skb,
 		unsigned int i, tmp_dscp = dscp >> 2;
 
 		for (i = 0; i < qos_map->num_des; i++) {
-			if (tmp_dscp == qos_map->dscp_exception[i].dscp)
-				return qos_map->dscp_exception[i].up;
+			if (tmp_dscp == qos_map->dscp_exception[i].dscp) {
+				ret = qos_map->dscp_exception[i].up;
+				goto out;
+			}
 		}
 
 		for (i = 0; i < 8; i++) {
 			if (tmp_dscp >= qos_map->up[i].low &&
-			    tmp_dscp <= qos_map->up[i].high)
-				return i;
+			    tmp_dscp <= qos_map->up[i].high) {
+				ret = i;
+				goto out;
+			}
 		}
 	}
 
-	return dscp >> 5;
+	ret = dscp >> 5;
+out:
+	return array_index_nospec(ret, IEEE80211_NUM_TIDS);
 }
 EXPORT_SYMBOL(cfg80211_classify8021d);
 
@@ -974,6 +987,7 @@ int cfg80211_change_iface(struct cfg80211_registered_device *rdev,
 		}
 
 		cfg80211_process_rdev_events(rdev);
+		cfg80211_mlme_purge_registrations(dev->ieee80211_ptr);
 	}
 
 	err = rdev_change_virtual_intf(rdev, dev, ntype, flags, params);
@@ -1360,7 +1374,7 @@ bool ieee80211_chandef_to_operating_class(struct cfg80211_chan_def *chandef,
 					  u8 *op_class)
 {
 	u8 vht_opclass;
-	u16 freq = chandef->center_freq1;
+	u32 freq = chandef->center_freq1;
 
 	if (freq >= 2412 && freq <= 2472) {
 		if (chandef->width > NL80211_CHAN_WIDTH_40)
@@ -1813,3 +1827,48 @@ EXPORT_SYMBOL(rfc1042_header);
 const unsigned char bridge_tunnel_header[] __aligned(2) =
 	{ 0xaa, 0xaa, 0x03, 0x00, 0x00, 0xf8 };
 EXPORT_SYMBOL(bridge_tunnel_header);
+
+/* Layer 2 Update frame (802.2 Type 1 LLC XID Update response) */
+struct iapp_layer2_update {
+	u8 da[ETH_ALEN];	/* broadcast */
+	u8 sa[ETH_ALEN];	/* STA addr */
+	__be16 len;		/* 6 */
+	u8 dsap;		/* 0 */
+	u8 ssap;		/* 0 */
+	u8 control;
+	u8 xid_info[3];
+} __packed;
+
+void cfg80211_send_layer2_update(struct net_device *dev, const u8 *addr)
+{
+	struct iapp_layer2_update *msg;
+	struct sk_buff *skb;
+
+	/* Send Level 2 Update Frame to update forwarding tables in layer 2
+	 * bridge devices */
+
+	skb = dev_alloc_skb(sizeof(*msg));
+	if (!skb)
+		return;
+	msg = (struct iapp_layer2_update *)skb_put(skb, sizeof(*msg));
+
+	/* 802.2 Type 1 Logical Link Control (LLC) Exchange Identifier (XID)
+	 * Update response frame; IEEE Std 802.2-1998, 5.4.1.2.1 */
+
+	eth_broadcast_addr(msg->da);
+	ether_addr_copy(msg->sa, addr);
+	msg->len = htons(6);
+	msg->dsap = 0;
+	msg->ssap = 0x01;	/* NULL LSAP, CR Bit: Response */
+	msg->control = 0xaf;	/* XID response lsb.1111F101.
+				 * F=0 (no poll command; unsolicited frame) */
+	msg->xid_info[0] = 0x81;	/* XID format identifier */
+	msg->xid_info[1] = 1;	/* LLC types/classes: Type 1 LLC */
+	msg->xid_info[2] = 0;	/* XID sender's receive window size (RW) */
+
+	skb->dev = dev;
+	skb->protocol = eth_type_trans(skb, dev);
+	memset(skb->cb, 0, sizeof(skb->cb));
+	netif_rx_ni(skb);
+}
+EXPORT_SYMBOL(cfg80211_send_layer2_update);

@@ -40,8 +40,7 @@ MODULE_ALIAS("ip_set_bitmap:ip");
 
 /* Type structure */
 struct bitmap_ip {
-	void *members;		/* the set members */
-	void *extensions;	/* data extensions */
+	unsigned long *members;	/* the set members */
 	u32 first_ip;		/* host byte order, included in range */
 	u32 last_ip;		/* host byte order, included in range */
 	u32 elements;		/* number of max elements in the set */
@@ -49,6 +48,8 @@ struct bitmap_ip {
 	size_t memsize;		/* members size */
 	u8 netmask;		/* subnet netmask */
 	struct timer_list gc;	/* garbage collection */
+	unsigned char extensions[0]	/* data extensions */
+		__aligned(__alignof__(u64));
 };
 
 /* ADT structure for generic function args */
@@ -221,16 +222,9 @@ init_map_ip(struct ip_set *set, struct bitmap_ip *map,
 	    u32 first_ip, u32 last_ip,
 	    u32 elements, u32 hosts, u8 netmask)
 {
-	map->members = ip_set_alloc(map->memsize);
+	map->members = bitmap_zalloc(elements, GFP_KERNEL | __GFP_NOWARN);
 	if (!map->members)
 		return false;
-	if (set->dsize) {
-		map->extensions = ip_set_alloc(set->dsize * elements);
-		if (!map->extensions) {
-			kfree(map->members);
-			return false;
-		}
-	}
 	map->first_ip = first_ip;
 	map->last_ip = last_ip;
 	map->elements = elements;
@@ -316,13 +310,13 @@ bitmap_ip_create(struct net *net, struct ip_set *set, struct nlattr *tb[],
 	pr_debug("hosts %u, elements %llu\n",
 		 hosts, (unsigned long long)elements);
 
-	map = kzalloc(sizeof(*map), GFP_KERNEL);
+	set->dsize = ip_set_elem_len(set, tb, 0, 0);
+	map = ip_set_alloc(sizeof(*map) + elements * set->dsize);
 	if (!map)
 		return -ENOMEM;
 
-	map->memsize = bitmap_bytes(0, elements - 1);
+	map->memsize = BITS_TO_LONGS(elements) * sizeof(unsigned long);
 	set->variant = &bitmap_ip;
-	set->dsize = ip_set_elem_len(set, tb, 0);
 	if (!init_map_ip(set, map, first_ip, last_ip,
 			 elements, hosts, netmask)) {
 		kfree(map);

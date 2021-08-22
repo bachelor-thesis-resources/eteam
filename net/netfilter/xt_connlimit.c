@@ -46,7 +46,9 @@
 struct xt_connlimit_conn {
 	struct hlist_node		node;
 	struct nf_conntrack_tuple	tuple;
-	union nf_inet_addr		addr;
+	struct nf_conntrack_zone	zone;
+	int				cpu;
+	u32				jiffies32;
 };
 
 struct xt_connlimit_rb {
@@ -116,9 +118,9 @@ same_source_net(const union nf_inet_addr *addr,
 	}
 }
 
-static bool add_hlist(struct hlist_head *head,
+bool nf_conncount_add(struct hlist_head *head,
 		      const struct nf_conntrack_tuple *tuple,
-		      const union nf_inet_addr *addr)
+		      const struct nf_conntrack_zone *zone)
 {
 	struct xt_connlimit_conn *conn;
 
@@ -126,21 +128,52 @@ static bool add_hlist(struct hlist_head *head,
 	if (conn == NULL)
 		return false;
 	conn->tuple = *tuple;
-	conn->addr = *addr;
+	conn->zone = *zone;
+	conn->cpu = raw_smp_processor_id();
+	conn->jiffies32 = (u32)jiffies;
 	hlist_add_head(&conn->node, head);
 	return true;
 }
+EXPORT_SYMBOL_GPL(nf_conncount_add);
 
-static unsigned int check_hlist(struct net *net,
-				struct hlist_head *head,
-				const struct nf_conntrack_tuple *tuple,
-				u16 zone,
-				bool *addit)
+static const struct nf_conntrack_tuple_hash *
+find_or_evict(struct net *net, struct xt_connlimit_conn *conn)
+{
+	const struct nf_conntrack_tuple_hash *found;
+	unsigned long a, b;
+	int cpu = raw_smp_processor_id();
+	u32 age;
+
+	found = nf_conntrack_find_get(net, &conn->zone, &conn->tuple);
+	if (found)
+		return found;
+	b = conn->jiffies32;
+	a = (u32)jiffies;
+
+	/* conn might have been added just before by another cpu and
+	 * might still be unconfirmed.  In this case, nf_conntrack_find()
+	 * returns no result.  Thus only evict if this cpu added the
+	 * stale entry or if the entry is older than two jiffies.
+	 */
+	age = a - b;
+	if (conn->cpu == cpu || age >= 2) {
+		hlist_del(&conn->node);
+		kmem_cache_free(connlimit_conn_cachep, conn);
+		return ERR_PTR(-ENOENT);
+	}
+
+	return ERR_PTR(-EAGAIN);
+}
+
+unsigned int nf_conncount_lookup(struct net *net, struct hlist_head *head,
+				 const struct nf_conntrack_tuple *tuple,
+				 const struct nf_conntrack_zone *zone,
+				 bool *addit)
 {
 	const struct nf_conntrack_tuple_hash *found;
 	struct xt_connlimit_conn *conn;
-	struct hlist_node *n;
 	struct nf_conn *found_ct;
+	struct hlist_node *n;
 	unsigned int length = 0;
 
 	*addit = true;
@@ -148,16 +181,26 @@ static unsigned int check_hlist(struct net *net,
 
 	/* check the saved connections */
 	hlist_for_each_entry_safe(conn, n, head, node) {
-		found = nf_conntrack_find_get(net, zone, &conn->tuple);
-		if (found == NULL) {
-			hlist_del(&conn->node);
-			kmem_cache_free(connlimit_conn_cachep, conn);
+		found = find_or_evict(net, conn);
+		if (IS_ERR(found)) {
+			/* Not found, but might be about to be confirmed */
+			if (PTR_ERR(found) == -EAGAIN) {
+				length++;
+				if (!tuple)
+					continue;
+
+				if (nf_ct_tuple_equal(&conn->tuple, tuple) &&
+				    nf_ct_zone_id(&conn->zone, conn->zone.dir) ==
+				    nf_ct_zone_id(zone, zone->dir))
+					*addit = false;
+			}
 			continue;
 		}
 
 		found_ct = nf_ct_tuplehash_to_ctrack(found);
 
-		if (nf_ct_tuple_equal(&conn->tuple, tuple)) {
+		if (nf_ct_tuple_equal(&conn->tuple, tuple) &&
+		    nf_ct_zone_equal(found_ct, zone, zone->dir)) {
 			/*
 			 * Just to be sure we have it only once in the list.
 			 * We should not see tuples twice unless someone hooks
@@ -183,6 +226,7 @@ static unsigned int check_hlist(struct net *net,
 
 	return length;
 }
+EXPORT_SYMBOL_GPL(nf_conncount_lookup);
 
 static void tree_nodes_free(struct rb_root *root,
 			    struct xt_connlimit_rb *gc_nodes[],
@@ -201,7 +245,7 @@ static unsigned int
 count_tree(struct net *net, struct rb_root *root,
 	   const struct nf_conntrack_tuple *tuple,
 	   const union nf_inet_addr *addr, const union nf_inet_addr *mask,
-	   u8 family, u16 zone)
+	   u8 family, const struct nf_conntrack_zone *zone)
 {
 	struct xt_connlimit_rb *gc_nodes[CONNLIMIT_GC_MAX_NODES];
 	struct rb_node **rbnode, *parent;
@@ -229,13 +273,15 @@ count_tree(struct net *net, struct rb_root *root,
 		} else {
 			/* same source network -> be counted! */
 			unsigned int count;
-			count = check_hlist(net, &rbconn->hhead, tuple, zone, &addit);
+
+			count = nf_conncount_lookup(net, &rbconn->hhead, tuple,
+						    zone, &addit);
 
 			tree_nodes_free(root, gc_nodes, gc_count);
 			if (!addit)
 				return count;
 
-			if (!add_hlist(&rbconn->hhead, tuple, addr))
+			if (!nf_conncount_add(&rbconn->hhead, tuple, zone))
 				return 0; /* hotdrop */
 
 			return count + 1;
@@ -245,7 +291,7 @@ count_tree(struct net *net, struct rb_root *root,
 			continue;
 
 		/* only used for GC on hhead, retval and 'addit' ignored */
-		check_hlist(net, &rbconn->hhead, tuple, zone, &addit);
+		nf_conncount_lookup(net, &rbconn->hhead, tuple, zone, &addit);
 		if (hlist_empty(&rbconn->hhead))
 			gc_nodes[gc_count++] = rbconn;
 	}
@@ -274,7 +320,7 @@ count_tree(struct net *net, struct rb_root *root,
 	}
 
 	conn->tuple = *tuple;
-	conn->addr = *addr;
+	conn->zone = *zone;
 	rbconn->addr = *addr;
 
 	INIT_HLIST_HEAD(&rbconn->hhead);
@@ -290,7 +336,8 @@ static int count_them(struct net *net,
 		      const struct nf_conntrack_tuple *tuple,
 		      const union nf_inet_addr *addr,
 		      const union nf_inet_addr *mask,
-		      u_int8_t family, u16 zone)
+		      u_int8_t family,
+		      const struct nf_conntrack_zone *zone)
 {
 	struct rb_root *root;
 	int count;
@@ -316,22 +363,22 @@ static int count_them(struct net *net,
 static bool
 connlimit_mt(const struct sk_buff *skb, struct xt_action_param *par)
 {
-	struct net *net = dev_net(par->in ? par->in : par->out);
+	struct net *net = par->net;
 	const struct xt_connlimit_info *info = par->matchinfo;
 	union nf_inet_addr addr;
 	struct nf_conntrack_tuple tuple;
 	const struct nf_conntrack_tuple *tuple_ptr = &tuple;
+	const struct nf_conntrack_zone *zone = &nf_ct_zone_dflt;
 	enum ip_conntrack_info ctinfo;
 	const struct nf_conn *ct;
 	unsigned int connections;
-	u16 zone = NF_CT_DEFAULT_ZONE;
 
 	ct = nf_ct_get(skb, &ctinfo);
 	if (ct != NULL) {
 		tuple_ptr = &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
 		zone = nf_ct_zone(ct);
 	} else if (!nf_ct_get_tuplepr(skb, skb_network_offset(skb),
-				    par->family, &tuple)) {
+				      par->family, net, &tuple)) {
 		goto hotdrop;
 	}
 
@@ -395,11 +442,19 @@ static int connlimit_mt_check(const struct xt_mtchk_param *par)
 	return 0;
 }
 
-static void destroy_tree(struct rb_root *r)
+void nf_conncount_cache_free(struct hlist_head *hhead)
 {
 	struct xt_connlimit_conn *conn;
-	struct xt_connlimit_rb *rbconn;
 	struct hlist_node *n;
+
+	hlist_for_each_entry_safe(conn, n, hhead, node)
+		kmem_cache_free(connlimit_conn_cachep, conn);
+}
+EXPORT_SYMBOL_GPL(nf_conncount_cache_free);
+
+static void destroy_tree(struct rb_root *r)
+{
+	struct xt_connlimit_rb *rbconn;
 	struct rb_node *node;
 
 	while ((node = rb_first(r)) != NULL) {
@@ -407,8 +462,7 @@ static void destroy_tree(struct rb_root *r)
 
 		rb_erase(node, r);
 
-		hlist_for_each_entry_safe(conn, n, &rbconn->hhead, node)
-			kmem_cache_free(connlimit_conn_cachep, conn);
+		nf_conncount_cache_free(&rbconn->hhead);
 
 		kmem_cache_free(connlimit_rb_cachep, rbconn);
 	}

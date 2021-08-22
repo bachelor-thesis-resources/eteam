@@ -20,7 +20,6 @@
 #include <linux/if_arp.h>
 #include <linux/rtnetlink.h>
 #include <linux/bitmap.h>
-#include <linux/pm_qos.h>
 #include <linux/inetdevice.h>
 #include <net/net_namespace.h>
 #include <net/cfg80211.h>
@@ -32,7 +31,6 @@
 #include "mesh.h"
 #include "wep.h"
 #include "led.h"
-#include "cfg.h"
 #include "debugfs.h"
 
 void ieee80211_configure_filter(struct ieee80211_local *local)
@@ -255,8 +253,27 @@ static void ieee80211_restart_work(struct work_struct *work)
 	     "%s called with hardware scan in progress\n", __func__);
 
 	rtnl_lock();
-	list_for_each_entry(sdata, &local->interfaces, list)
+	list_for_each_entry(sdata, &local->interfaces, list) {
+		/*
+		 * XXX: there may be more work for other vif types and even
+		 * for station mode: a good thing would be to run most of
+		 * the iface type's dependent _stop (ieee80211_mg_stop,
+		 * ieee80211_ibss_stop) etc...
+		 * For now, fix only the specific bug that was seen: race
+		 * between csa_connection_drop_work and us.
+		 */
+		if (sdata->vif.type == NL80211_IFTYPE_STATION) {
+			/*
+			 * This worker is scheduled from the iface worker that
+			 * runs on mac80211's workqueue, so we can't be
+			 * scheduling this worker after the cancel right here.
+			 * The exception is ieee80211_chswitch_done.
+			 * Then we can have a race...
+			 */
+			cancel_work_sync(&sdata->u.mgd.csa_connection_drop_work);
+		}
 		flush_delayed_work(&sdata->dec_tailroom_needed_wk);
+	}
 	ieee80211_scan_cancel(local);
 	ieee80211_reconfig(local);
 	rtnl_unlock();
@@ -283,7 +300,7 @@ void ieee80211_restart_hw(struct ieee80211_hw *hw)
 	local->in_reconfig = true;
 	barrier();
 
-	schedule_work(&local->restart_work);
+	queue_work(system_freezable_wq, &local->restart_work);
 }
 EXPORT_SYMBOL(ieee80211_restart_hw);
 
@@ -462,10 +479,7 @@ static const struct ieee80211_vht_cap mac80211_vht_capa_mod_mask = {
 		cpu_to_le32(IEEE80211_VHT_CAP_RXLDPC |
 			    IEEE80211_VHT_CAP_SHORT_GI_80 |
 			    IEEE80211_VHT_CAP_SHORT_GI_160 |
-			    IEEE80211_VHT_CAP_RXSTBC_1 |
-			    IEEE80211_VHT_CAP_RXSTBC_2 |
-			    IEEE80211_VHT_CAP_RXSTBC_3 |
-			    IEEE80211_VHT_CAP_RXSTBC_4 |
+			    IEEE80211_VHT_CAP_RXSTBC_MASK |
 			    IEEE80211_VHT_CAP_TXSTBC |
 			    IEEE80211_VHT_CAP_SU_BEAMFORMER_CAPABLE |
 			    IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE |
@@ -629,6 +643,8 @@ struct ieee80211_hw *ieee80211_alloc_hw_nm(size_t priv_data_len,
 	INIT_WORK(&local->sched_scan_stopped_work,
 		  ieee80211_sched_scan_stopped_work);
 
+	INIT_WORK(&local->tdls_chsw_work, ieee80211_tdls_chsw_work);
+
 	spin_lock_init(&local->ack_status_lock);
 	idr_init(&local->ack_status_frames);
 
@@ -645,6 +661,7 @@ struct ieee80211_hw *ieee80211_alloc_hw_nm(size_t priv_data_len,
 
 	skb_queue_head_init(&local->skb_queue);
 	skb_queue_head_init(&local->skb_queue_unreliable);
+	skb_queue_head_init(&local->skb_queue_tdls_chsw);
 
 	ieee80211_alloc_led_names(local);
 
@@ -890,12 +907,17 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 		supp_ht = supp_ht || sband->ht_cap.ht_supported;
 		supp_vht = supp_vht || sband->vht_cap.vht_supported;
 
-		if (sband->ht_cap.ht_supported)
-			local->rx_chains =
-				max(ieee80211_mcs_to_chains(&sband->ht_cap.mcs),
-				    local->rx_chains);
+		if (!sband->ht_cap.ht_supported)
+			continue;
 
 		/* TODO: consider VHT for RX chains, hopefully it's the same */
+		local->rx_chains =
+			max(ieee80211_mcs_to_chains(&sband->ht_cap.mcs),
+			    local->rx_chains);
+
+		/* no need to mask, SM_PS_DISABLED has all bits set */
+		sband->ht_cap.cap |= WLAN_HT_CAP_SM_PS_DISABLED <<
+			             IEEE80211_HT_CAP_SM_PS_SHIFT;
 	}
 
 	/* if low-level driver supports AP, we also support VLAN */
@@ -1079,13 +1101,6 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 
 	rtnl_unlock();
 
-	local->network_latency_notifier.notifier_call =
-		ieee80211_max_network_latency;
-	result = pm_qos_add_notifier(PM_QOS_NETWORK_LATENCY,
-				     &local->network_latency_notifier);
-	if (result)
-		goto fail_pm_qos;
-
 #ifdef CONFIG_INET
 	local->ifa_notifier.notifier_call = ieee80211_ifa_changed;
 	result = register_inetaddr_notifier(&local->ifa_notifier);
@@ -1110,10 +1125,7 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 #endif
 #if defined(CONFIG_INET) || defined(CONFIG_IPV6)
  fail_ifa:
-	pm_qos_remove_notifier(PM_QOS_NETWORK_LATENCY,
-			       &local->network_latency_notifier);
 #endif
- fail_pm_qos:
 	rtnl_lock();
 	rate_control_deinitialize(local);
 	ieee80211_remove_interfaces(local);
@@ -1132,18 +1144,6 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 }
 EXPORT_SYMBOL(ieee80211_register_hw);
 
-void ieee80211_napi_add(struct ieee80211_hw *hw, struct napi_struct *napi,
-			struct net_device *napi_dev,
-			int (*poll)(struct napi_struct *, int),
-			int weight)
-{
-	struct ieee80211_local *local = hw_to_local(hw);
-
-	netif_napi_add(napi_dev, napi, poll, weight);
-	local->napi = napi;
-}
-EXPORT_SYMBOL_GPL(ieee80211_napi_add);
-
 void ieee80211_unregister_hw(struct ieee80211_hw *hw)
 {
 	struct ieee80211_local *local = hw_to_local(hw);
@@ -1151,8 +1151,6 @@ void ieee80211_unregister_hw(struct ieee80211_hw *hw)
 	tasklet_kill(&local->tx_pending_tasklet);
 	tasklet_kill(&local->tasklet);
 
-	pm_qos_remove_notifier(PM_QOS_NETWORK_LATENCY,
-			       &local->network_latency_notifier);
 #ifdef CONFIG_INET
 	unregister_inetaddr_notifier(&local->ifa_notifier);
 #endif
@@ -1173,6 +1171,7 @@ void ieee80211_unregister_hw(struct ieee80211_hw *hw)
 
 	cancel_work_sync(&local->restart_work);
 	cancel_work_sync(&local->reconfig_filter);
+	cancel_work_sync(&local->tdls_chsw_work);
 	flush_work(&local->sched_scan_stopped_work);
 
 	ieee80211_clear_tx_pending(local);
@@ -1183,6 +1182,7 @@ void ieee80211_unregister_hw(struct ieee80211_hw *hw)
 		wiphy_warn(local->hw.wiphy, "skb_queue not empty\n");
 	skb_queue_purge(&local->skb_queue);
 	skb_queue_purge(&local->skb_queue_unreliable);
+	skb_queue_purge(&local->skb_queue_tdls_chsw);
 
 	destroy_workqueue(local->workqueue);
 	wiphy_unregister(local->hw.wiphy);

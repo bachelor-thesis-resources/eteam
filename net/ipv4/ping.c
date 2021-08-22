@@ -154,17 +154,18 @@ void ping_hash(struct sock *sk)
 void ping_unhash(struct sock *sk)
 {
 	struct inet_sock *isk = inet_sk(sk);
+
 	pr_debug("ping_unhash(isk=%p,isk->num=%u)\n", isk, isk->inet_num);
+	write_lock_bh(&ping_table.lock);
 	if (sk_hashed(sk)) {
-		write_lock_bh(&ping_table.lock);
 		hlist_nulls_del(&sk->sk_nulls_node);
 		sk_nulls_node_init(&sk->sk_nulls_node);
 		sock_put(sk);
 		isk->inet_num = 0;
 		isk->inet_sport = 0;
 		sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
-		write_unlock_bh(&ping_table.lock);
 	}
+	write_unlock_bh(&ping_table.lock);
 }
 EXPORT_SYMBOL_GPL(ping_unhash);
 
@@ -363,7 +364,8 @@ static int ping_check_bind_addr(struct sock *sk, struct inet_sock *isk,
 						    scoped);
 		rcu_read_unlock();
 
-		if (!(isk->freebind || isk->transparent || has_addr ||
+		if (!(net->ipv6.sysctl.ip_nonlocal_bind ||
+		      isk->freebind || isk->transparent || has_addr ||
 		      addr_type == IPV6_ADDR_ANY))
 			return -EADDRNOTAVAIL;
 
@@ -644,6 +646,8 @@ static int ping_v4_push_pending_frames(struct sock *sk, struct pingfakehdr *pfh,
 {
 	struct sk_buff *skb = skb_peek(&sk->sk_write_queue);
 
+	if (!skb)
+		return 0;
 	pfh->wcheck = csum_partial((char *)&pfh->icmph,
 		sizeof(struct icmphdr), pfh->wcheck);
 	pfh->icmph.checksum = csum_fold(pfh->wcheck);
@@ -658,6 +662,10 @@ int ping_common_sendmsg(int family, struct msghdr *msg, size_t len,
 
 	if (len > 0xFFFF)
 		return -EMSGSIZE;
+
+	/* Must have at least a full ICMP header. */
+	if (len < icmph_len)
+		return -EINVAL;
 
 	/*
 	 *	Check the flags.
@@ -745,8 +753,10 @@ static int ping_v4_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 
 	if (msg->msg_controllen) {
 		err = ip_cmsg_send(sock_net(sk), msg, &ipc, false);
-		if (err)
+		if (unlikely(err)) {
+			kfree(ipc.opt);
 			return err;
+		}
 		if (ipc.opt)
 			free = 1;
 	}
@@ -767,8 +777,10 @@ static int ping_v4_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	ipc.addr = faddr = daddr;
 
 	if (ipc.opt && ipc.opt->opt.srr) {
-		if (!daddr)
-			return -EINVAL;
+		if (!daddr) {
+			err = -EINVAL;
+			goto out_free;
+		}
 		faddr = ipc.opt->opt.faddr;
 	}
 	tos = get_rttos(&ipc, inet);
@@ -789,6 +801,9 @@ static int ping_v4_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	flowi4_init_output(&fl4, ipc.oif, sk->sk_mark, tos,
 			   RT_SCOPE_UNIVERSE, sk->sk_protocol,
 			   inet_sk_flowi_flags(sk), faddr, saddr, 0, 0);
+
+	fl4.fl4_icmp_type = user_icmph.type;
+	fl4.fl4_icmp_code = user_icmph.code;
 
 	security_sk_classify_flow(sk, flowi4_to_flowi(&fl4));
 	rt = ip_route_output_flow(net, &fl4, sk);
@@ -833,6 +848,7 @@ back_from_confirm:
 
 out:
 	ip_rt_put(rt);
+out_free:
 	if (free)
 		kfree(ipc.opt);
 	if (!err) {
@@ -842,7 +858,8 @@ out:
 	return err;
 
 do_confirm:
-	dst_confirm(&rt->dst);
+	if (msg->msg_flags & MSG_PROBE)
+		dst_confirm_neigh(&rt->dst, &fl4.daddr);
 	if (!(msg->msg_flags & MSG_PROBE) || len)
 		goto back_from_confirm;
 	err = 0;

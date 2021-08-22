@@ -34,36 +34,19 @@
 
 static void svc_unregister(const struct svc_serv *serv, struct net *net);
 
-#define svc_serv_is_pooled(serv)    ((serv)->sv_function)
+#define svc_serv_is_pooled(serv)    ((serv)->sv_ops->svo_function)
 
-/*
- * Mode for mapping cpus to pools.
- */
-enum {
-	SVC_POOL_AUTO = -1,	/* choose one of the others */
-	SVC_POOL_GLOBAL,	/* no mapping, just a single global pool
-				 * (legacy & UP mode) */
-	SVC_POOL_PERCPU,	/* one pool per cpu */
-	SVC_POOL_PERNODE	/* one pool per numa node */
-};
 #define SVC_POOL_DEFAULT	SVC_POOL_GLOBAL
 
 /*
  * Structure for mapping cpus to pools and vice versa.
  * Setup once during sunrpc initialisation.
  */
-static struct svc_pool_map {
-	int count;			/* How many svc_servs use us */
-	int mode;			/* Note: int not enum to avoid
-					 * warnings about "enumeration value
-					 * not handled in switch" */
-	unsigned int npools;
-	unsigned int *pool_to;		/* maps pool id to cpu or node */
-	unsigned int *to_pool;		/* maps cpu or node to pool id */
-} svc_pool_map = {
-	.count = 0,
+struct svc_pool_map svc_pool_map = {
 	.mode = SVC_POOL_DEFAULT
 };
+EXPORT_SYMBOL_GPL(svc_pool_map);
+
 static DEFINE_MUTEX(svc_pool_map_mutex);/* protects svc_pool_map.count only */
 
 static int
@@ -236,7 +219,7 @@ svc_pool_map_init_pernode(struct svc_pool_map *m)
  * vice versa).  Initialise the map if we're the first user.
  * Returns the number of pools.
  */
-static unsigned int
+unsigned int
 svc_pool_map_get(void)
 {
 	struct svc_pool_map *m = &svc_pool_map;
@@ -271,7 +254,7 @@ svc_pool_map_get(void)
 	mutex_unlock(&svc_pool_map_mutex);
 	return m->npools;
 }
-
+EXPORT_SYMBOL_GPL(svc_pool_map_get);
 
 /*
  * Drop a reference to the global map of cpus to pools.
@@ -280,7 +263,7 @@ svc_pool_map_get(void)
  * mode using the pool_mode module option without
  * rebooting or re-loading sunrpc.ko.
  */
-static void
+void
 svc_pool_map_put(void)
 {
 	struct svc_pool_map *m = &svc_pool_map;
@@ -297,7 +280,7 @@ svc_pool_map_put(void)
 
 	mutex_unlock(&svc_pool_map_mutex);
 }
-
+EXPORT_SYMBOL_GPL(svc_pool_map_put);
 
 static int svc_pool_map_get_node(unsigned int pidx)
 {
@@ -423,7 +406,7 @@ EXPORT_SYMBOL_GPL(svc_bind);
  */
 static struct svc_serv *
 __svc_create(struct svc_program *prog, unsigned int bufsize, int npools,
-	     void (*shutdown)(struct svc_serv *serv, struct net *net))
+	     struct svc_serv_ops *ops)
 {
 	struct svc_serv	*serv;
 	unsigned int vers;
@@ -440,7 +423,7 @@ __svc_create(struct svc_program *prog, unsigned int bufsize, int npools,
 		bufsize = RPCSVC_MAXPAYLOAD;
 	serv->sv_max_payload = bufsize? bufsize : 4096;
 	serv->sv_max_mesg  = roundup(serv->sv_max_payload + PAGE_SIZE, PAGE_SIZE);
-	serv->sv_shutdown  = shutdown;
+	serv->sv_ops = ops;
 	xdrsize = 0;
 	while (prog) {
 		prog->pg_lovers = prog->pg_nvers-1;
@@ -486,26 +469,22 @@ __svc_create(struct svc_program *prog, unsigned int bufsize, int npools,
 
 struct svc_serv *
 svc_create(struct svc_program *prog, unsigned int bufsize,
-	   void (*shutdown)(struct svc_serv *serv, struct net *net))
+	   struct svc_serv_ops *ops)
 {
-	return __svc_create(prog, bufsize, /*npools*/1, shutdown);
+	return __svc_create(prog, bufsize, /*npools*/1, ops);
 }
 EXPORT_SYMBOL_GPL(svc_create);
 
 struct svc_serv *
 svc_create_pooled(struct svc_program *prog, unsigned int bufsize,
-		  void (*shutdown)(struct svc_serv *serv, struct net *net),
-		  svc_thread_fn func, struct module *mod)
+		  struct svc_serv_ops *ops)
 {
 	struct svc_serv *serv;
 	unsigned int npools = svc_pool_map_get();
 
-	serv = __svc_create(prog, bufsize, npools, shutdown);
+	serv = __svc_create(prog, bufsize, npools, ops);
 	if (!serv)
 		goto out_err;
-
-	serv->sv_function = func;
-	serv->sv_module = mod;
 	return serv;
 out_err:
 	svc_pool_map_put();
@@ -517,8 +496,8 @@ void svc_shutdown_net(struct svc_serv *serv, struct net *net)
 {
 	svc_close_net(serv, net);
 
-	if (serv->sv_shutdown)
-		serv->sv_shutdown(serv, net);
+	if (serv->sv_ops->svo_shutdown)
+		serv->sv_ops->svo_shutdown(serv, net);
 }
 EXPORT_SYMBOL_GPL(svc_shutdown_net);
 
@@ -604,40 +583,52 @@ svc_release_buffer(struct svc_rqst *rqstp)
 }
 
 struct svc_rqst *
-svc_prepare_thread(struct svc_serv *serv, struct svc_pool *pool, int node)
+svc_rqst_alloc(struct svc_serv *serv, struct svc_pool *pool, int node)
 {
 	struct svc_rqst	*rqstp;
 
 	rqstp = kzalloc_node(sizeof(*rqstp), GFP_KERNEL, node);
 	if (!rqstp)
-		goto out_enomem;
+		return rqstp;
 
-	serv->sv_nrthreads++;
 	__set_bit(RQ_BUSY, &rqstp->rq_flags);
 	spin_lock_init(&rqstp->rq_lock);
 	rqstp->rq_server = serv;
 	rqstp->rq_pool = pool;
+
+	rqstp->rq_argp = kmalloc_node(serv->sv_xdrsize, GFP_KERNEL, node);
+	if (!rqstp->rq_argp)
+		goto out_enomem;
+
+	rqstp->rq_resp = kmalloc_node(serv->sv_xdrsize, GFP_KERNEL, node);
+	if (!rqstp->rq_resp)
+		goto out_enomem;
+
+	if (!svc_init_buffer(rqstp, serv->sv_max_mesg, node))
+		goto out_enomem;
+
+	return rqstp;
+out_enomem:
+	svc_rqst_free(rqstp);
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(svc_rqst_alloc);
+
+struct svc_rqst *
+svc_prepare_thread(struct svc_serv *serv, struct svc_pool *pool, int node)
+{
+	struct svc_rqst	*rqstp;
+
+	rqstp = svc_rqst_alloc(serv, pool, node);
+	if (!rqstp)
+		return ERR_PTR(-ENOMEM);
+
+	serv->sv_nrthreads++;
 	spin_lock_bh(&pool->sp_lock);
 	pool->sp_nrthreads++;
 	list_add_rcu(&rqstp->rq_all, &pool->sp_all_threads);
 	spin_unlock_bh(&pool->sp_lock);
-
-	rqstp->rq_argp = kmalloc_node(serv->sv_xdrsize, GFP_KERNEL, node);
-	if (!rqstp->rq_argp)
-		goto out_thread;
-
-	rqstp->rq_resp = kmalloc_node(serv->sv_xdrsize, GFP_KERNEL, node);
-	if (!rqstp->rq_resp)
-		goto out_thread;
-
-	if (!svc_init_buffer(rqstp, serv->sv_max_mesg, node))
-		goto out_thread;
-
 	return rqstp;
-out_thread:
-	svc_exit_thread(rqstp);
-out_enomem:
-	return ERR_PTR(-ENOMEM);
 }
 EXPORT_SYMBOL_GPL(svc_prepare_thread);
 
@@ -739,12 +730,12 @@ svc_set_num_threads(struct svc_serv *serv, struct svc_pool *pool, int nrservs)
 			break;
 		}
 
-		__module_get(serv->sv_module);
-		task = kthread_create_on_node(serv->sv_function, rqstp,
+		__module_get(serv->sv_ops->svo_module);
+		task = kthread_create_on_node(serv->sv_ops->svo_function, rqstp,
 					      node, "%s", serv->sv_name);
 		if (IS_ERR(task)) {
 			error = PTR_ERR(task);
-			module_put(serv->sv_module);
+			module_put(serv->sv_ops->svo_module);
 			svc_exit_thread(rqstp);
 			break;
 		}
@@ -772,15 +763,21 @@ EXPORT_SYMBOL_GPL(svc_set_num_threads);
  * mutex" for the service.
  */
 void
-svc_exit_thread(struct svc_rqst *rqstp)
+svc_rqst_free(struct svc_rqst *rqstp)
 {
-	struct svc_serv	*serv = rqstp->rq_server;
-	struct svc_pool	*pool = rqstp->rq_pool;
-
 	svc_release_buffer(rqstp);
 	kfree(rqstp->rq_resp);
 	kfree(rqstp->rq_argp);
 	kfree(rqstp->rq_auth_data);
+	kfree_rcu(rqstp, rq_rcu_head);
+}
+EXPORT_SYMBOL_GPL(svc_rqst_free);
+
+void
+svc_exit_thread(struct svc_rqst *rqstp)
+{
+	struct svc_serv	*serv = rqstp->rq_server;
+	struct svc_pool	*pool = rqstp->rq_pool;
 
 	spin_lock_bh(&pool->sp_lock);
 	pool->sp_nrthreads--;
@@ -788,7 +785,7 @@ svc_exit_thread(struct svc_rqst *rqstp)
 		list_del_rcu(&rqstp->rq_all);
 	spin_unlock_bh(&pool->sp_lock);
 
-	kfree_rcu(rqstp, rq_rcu_head);
+	svc_rqst_free(rqstp);
 
 	/* Release the server */
 	if (serv)
@@ -1065,6 +1062,8 @@ void svc_printk(struct svc_rqst *rqstp, const char *fmt, ...)
 static __printf(2,3) void svc_printk(struct svc_rqst *rqstp, const char *fmt, ...) {}
 #endif
 
+extern void svc_tcp_prep_reply_hdr(struct svc_rqst *);
+
 /*
  * Common routine for processing the RPC request.
  */
@@ -1094,7 +1093,8 @@ svc_process_common(struct svc_rqst *rqstp, struct kvec *argv, struct kvec *resv)
 	clear_bit(RQ_DROPME, &rqstp->rq_flags);
 
 	/* Setup reply header */
-	rqstp->rq_xprt->xpt_ops->xpo_prep_reply_hdr(rqstp);
+	if (rqstp->rq_prot == IPPROTO_TCP)
+		svc_tcp_prep_reply_hdr(rqstp);
 
 	svc_putu32(resv, rqstp->rq_xid);
 
@@ -1141,7 +1141,8 @@ svc_process_common(struct svc_rqst *rqstp, struct kvec *argv, struct kvec *resv)
 	case SVC_DENIED:
 		goto err_bad_auth;
 	case SVC_CLOSE:
-		if (test_bit(XPT_TEMP, &rqstp->rq_xprt->xpt_flags))
+		if (rqstp->rq_xprt &&
+		    test_bit(XPT_TEMP, &rqstp->rq_xprt->xpt_flags))
 			svc_close_xprt(rqstp->rq_xprt);
 	case SVC_DROP:
 		goto dropit;
@@ -1191,10 +1192,16 @@ svc_process_common(struct svc_rqst *rqstp, struct kvec *argv, struct kvec *resv)
 		*statp = procp->pc_func(rqstp, rqstp->rq_argp, rqstp->rq_resp);
 
 		/* Encode reply */
-		if (test_bit(RQ_DROPME, &rqstp->rq_flags)) {
+		if (*statp == rpc_drop_reply ||
+		    test_bit(RQ_DROPME, &rqstp->rq_flags)) {
 			if (procp->pc_release)
 				procp->pc_release(rqstp, NULL, rqstp->rq_resp);
 			goto dropit;
+		}
+		if (*statp == rpc_autherr_badcred) {
+			if (procp->pc_release)
+				procp->pc_release(rqstp, NULL, rqstp->rq_resp);
+			goto err_bad_auth;
 		}
 		if (*statp == rpc_success &&
 		    (xdr = procp->pc_encode) &&
@@ -1357,23 +1364,31 @@ bc_svc_process(struct svc_serv *serv, struct rpc_rqst *req,
 	dprintk("svc: %s(%p)\n", __func__, req);
 
 	/* Build the svc_rqst used by the common processing routine */
-	rqstp->rq_xprt = serv->sv_bc_xprt;
 	rqstp->rq_xid = req->rq_xid;
 	rqstp->rq_prot = req->rq_xprt->prot;
 	rqstp->rq_server = serv;
+	rqstp->rq_bc_net = req->rq_xprt->xprt_net;
 
 	rqstp->rq_addrlen = sizeof(req->rq_xprt->addr);
 	memcpy(&rqstp->rq_addr, &req->rq_xprt->addr, rqstp->rq_addrlen);
 	memcpy(&rqstp->rq_arg, &req->rq_rcv_buf, sizeof(rqstp->rq_arg));
 	memcpy(&rqstp->rq_res, &req->rq_snd_buf, sizeof(rqstp->rq_res));
 
+	/* Adjust the argument buffer length */
+	rqstp->rq_arg.len = req->rq_private_buf.len;
+	if (rqstp->rq_arg.len <= rqstp->rq_arg.head[0].iov_len) {
+		rqstp->rq_arg.head[0].iov_len = rqstp->rq_arg.len;
+		rqstp->rq_arg.page_len = 0;
+	} else if (rqstp->rq_arg.len <= rqstp->rq_arg.head[0].iov_len +
+			rqstp->rq_arg.page_len)
+		rqstp->rq_arg.page_len = rqstp->rq_arg.len -
+			rqstp->rq_arg.head[0].iov_len;
+	else
+		rqstp->rq_arg.len = rqstp->rq_arg.head[0].iov_len +
+			rqstp->rq_arg.page_len;
+
 	/* reset result send buffer "put" position */
 	resv->iov_len = 0;
-
-	if (rqstp->rq_prot != IPPROTO_TCP) {
-		printk(KERN_ERR "No support for Non-TCP transports!\n");
-		BUG();
-	}
 
 	/*
 	 * Skip the next two words because they've already been

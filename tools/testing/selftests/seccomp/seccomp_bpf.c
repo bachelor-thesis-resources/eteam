@@ -14,19 +14,24 @@
 #include <linux/filter.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/types.h>
 #include <sys/user.h>
 #include <linux/prctl.h>
 #include <linux/ptrace.h>
 #include <linux/seccomp.h>
-#include <poll.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdbool.h>
 #include <string.h>
+#include <time.h>
 #include <linux/elf.h>
 #include <sys/uio.h>
+#include <sys/utsname.h>
+#include <sys/fcntl.h>
+#include <sys/mman.h>
+#include <sys/times.h>
 
 #define _GNU_SOURCE
 #include <unistd.h>
@@ -69,7 +74,12 @@
 #define SECCOMP_RET_ERRNO       0x00050000U /* returns an errno */
 #define SECCOMP_RET_TRACE       0x7ff00000U /* pass to a tracer or disallow */
 #define SECCOMP_RET_ALLOW       0x7fff0000U /* allow */
+#endif
+#ifndef SECCOMP_RET_LOG
+#define SECCOMP_RET_LOG       0x7ffc0000U /* allow after logging */
+#endif
 
+#ifndef SECCOMP_RET_ACTION
 /* Masks for the return value sections. */
 #define SECCOMP_RET_ACTION      0x7fff0000U
 #define SECCOMP_RET_DATA        0x0000ffffU
@@ -82,7 +92,13 @@ struct seccomp_data {
 };
 #endif
 
+#if __BYTE_ORDER == __LITTLE_ENDIAN
 #define syscall_arg(_n) (offsetof(struct seccomp_data, args[_n]))
+#elif __BYTE_ORDER == __BIG_ENDIAN
+#define syscall_arg(_n) (offsetof(struct seccomp_data, args[_n]) + sizeof(__u32))
+#else
+#error "wut? Unknown __BYTE_ORDER?!"
+#endif
 
 #define SIBLING_EXIT_UNKILLED	0xbadbeef
 #define SIBLING_EXIT_FAILURE	0xbadface
@@ -331,6 +347,28 @@ TEST(empty_prog)
 	EXPECT_EQ(EINVAL, errno);
 }
 
+TEST(log_all)
+{
+	struct sock_filter filter[] = {
+		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_LOG),
+	};
+	struct sock_fprog prog = {
+		.len = (unsigned short)ARRAY_SIZE(filter),
+		.filter = filter,
+	};
+	long ret;
+	pid_t parent = getppid();
+
+	ret = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+	ASSERT_EQ(0, ret);
+
+	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
+	ASSERT_EQ(0, ret);
+
+	/* getppid() should succeed and be logged (no check for logging) */
+	EXPECT_EQ(parent, syscall(__NR_getppid));
+}
+
 TEST_SIGNAL(unknown_ret_is_kill_inside, SIGSYS)
 {
 	struct sock_filter filter[] = {
@@ -421,14 +459,16 @@ TEST_SIGNAL(KILL_one, SIGSYS)
 
 TEST_SIGNAL(KILL_one_arg_one, SIGSYS)
 {
+	void *fatal_address;
 	struct sock_filter filter[] = {
 		BPF_STMT(BPF_LD|BPF_W|BPF_ABS,
 			offsetof(struct seccomp_data, nr)),
-		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_getpid, 1, 0),
+		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_times, 1, 0),
 		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
 		/* Only both with lower 32-bit for now. */
 		BPF_STMT(BPF_LD|BPF_W|BPF_ABS, syscall_arg(0)),
-		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0x0C0FFEE, 0, 1),
+		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,
+			(unsigned long)&fatal_address, 0, 1),
 		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_KILL),
 		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
 	};
@@ -438,7 +478,8 @@ TEST_SIGNAL(KILL_one_arg_one, SIGSYS)
 	};
 	long ret;
 	pid_t parent = getppid();
-	pid_t pid = getpid();
+	struct tms timebuf;
+	clock_t clock = times(&timebuf);
 
 	ret = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 	ASSERT_EQ(0, ret);
@@ -447,17 +488,22 @@ TEST_SIGNAL(KILL_one_arg_one, SIGSYS)
 	ASSERT_EQ(0, ret);
 
 	EXPECT_EQ(parent, syscall(__NR_getppid));
-	EXPECT_EQ(pid, syscall(__NR_getpid));
-	/* getpid() should never return. */
-	EXPECT_EQ(0, syscall(__NR_getpid, 0x0C0FFEE));
+	EXPECT_LE(clock, syscall(__NR_times, &timebuf));
+	/* times() should never return. */
+	EXPECT_EQ(0, syscall(__NR_times, &fatal_address));
 }
 
 TEST_SIGNAL(KILL_one_arg_six, SIGSYS)
 {
+#ifndef __NR_mmap2
+	int sysno = __NR_mmap;
+#else
+	int sysno = __NR_mmap2;
+#endif
 	struct sock_filter filter[] = {
 		BPF_STMT(BPF_LD|BPF_W|BPF_ABS,
 			offsetof(struct seccomp_data, nr)),
-		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_getpid, 1, 0),
+		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, sysno, 1, 0),
 		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
 		/* Only both with lower 32-bit for now. */
 		BPF_STMT(BPF_LD|BPF_W|BPF_ABS, syscall_arg(5)),
@@ -471,7 +517,11 @@ TEST_SIGNAL(KILL_one_arg_six, SIGSYS)
 	};
 	long ret;
 	pid_t parent = getppid();
-	pid_t pid = getpid();
+	int fd;
+	void *map1, *map2;
+	int page_size = sysconf(_SC_PAGESIZE);
+
+	ASSERT_LT(0, page_size);
 
 	ret = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 	ASSERT_EQ(0, ret);
@@ -479,10 +529,22 @@ TEST_SIGNAL(KILL_one_arg_six, SIGSYS)
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
 	ASSERT_EQ(0, ret);
 
+	fd = open("/dev/zero", O_RDONLY);
+	ASSERT_NE(-1, fd);
+
 	EXPECT_EQ(parent, syscall(__NR_getppid));
-	EXPECT_EQ(pid, syscall(__NR_getpid));
-	/* getpid() should never return. */
-	EXPECT_EQ(0, syscall(__NR_getpid, 1, 2, 3, 4, 5, 0x0C0FFEE));
+	map1 = (void *)syscall(sysno,
+		NULL, page_size, PROT_READ, MAP_PRIVATE, fd, page_size);
+	EXPECT_NE(MAP_FAILED, map1);
+	/* mmap2() should never return. */
+	map2 = (void *)syscall(sysno,
+		 NULL, page_size, PROT_READ, MAP_PRIVATE, fd, 0x0C0FFEE);
+	EXPECT_EQ(MAP_FAILED, map2);
+
+	/* The test failed, so clean up the resources. */
+	munmap(map1, page_size);
+	munmap(map2, page_size);
+	close(fd);
 }
 
 /* TODO(wad) add 64-bit versus 32-bit arg tests. */
@@ -700,6 +762,7 @@ TEST_F(TRAP, handler)
 
 FIXTURE_DATA(precedence) {
 	struct sock_fprog allow;
+	struct sock_fprog log;
 	struct sock_fprog trace;
 	struct sock_fprog error;
 	struct sock_fprog trap;
@@ -710,6 +773,13 @@ FIXTURE_SETUP(precedence)
 {
 	struct sock_filter allow_insns[] = {
 		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+	};
+	struct sock_filter log_insns[] = {
+		BPF_STMT(BPF_LD|BPF_W|BPF_ABS,
+			offsetof(struct seccomp_data, nr)),
+		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_getpid, 1, 0),
+		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_LOG),
 	};
 	struct sock_filter trace_insns[] = {
 		BPF_STMT(BPF_LD|BPF_W|BPF_ABS,
@@ -747,6 +817,7 @@ FIXTURE_SETUP(precedence)
 	memcpy(self->_x.filter, &_x##_insns, sizeof(_x##_insns)); \
 	self->_x.len = (unsigned short)ARRAY_SIZE(_x##_insns)
 	FILTER_ALLOC(allow);
+	FILTER_ALLOC(log);
 	FILTER_ALLOC(trace);
 	FILTER_ALLOC(error);
 	FILTER_ALLOC(trap);
@@ -757,6 +828,7 @@ FIXTURE_TEARDOWN(precedence)
 {
 #define FILTER_FREE(_x) if (self->_x.filter) free(self->_x.filter)
 	FILTER_FREE(allow);
+	FILTER_FREE(log);
 	FILTER_FREE(trace);
 	FILTER_FREE(error);
 	FILTER_FREE(trap);
@@ -773,6 +845,8 @@ TEST_F(precedence, allow_ok)
 	ASSERT_EQ(0, ret);
 
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->allow);
+	ASSERT_EQ(0, ret);
+	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->log);
 	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->trace);
 	ASSERT_EQ(0, ret);
@@ -797,6 +871,8 @@ TEST_F_SIGNAL(precedence, kill_is_highest, SIGSYS)
 	ASSERT_EQ(0, ret);
 
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->allow);
+	ASSERT_EQ(0, ret);
+	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->log);
 	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->trace);
 	ASSERT_EQ(0, ret);
@@ -829,6 +905,8 @@ TEST_F_SIGNAL(precedence, kill_is_highest_in_any_order, SIGSYS)
 	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->error);
 	ASSERT_EQ(0, ret);
+	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->log);
+	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->trace);
 	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->trap);
@@ -849,6 +927,8 @@ TEST_F_SIGNAL(precedence, trap_is_second, SIGSYS)
 	ASSERT_EQ(0, ret);
 
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->allow);
+	ASSERT_EQ(0, ret);
+	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->log);
 	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->trace);
 	ASSERT_EQ(0, ret);
@@ -875,6 +955,8 @@ TEST_F_SIGNAL(precedence, trap_is_second_in_any_order, SIGSYS)
 	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->trap);
 	ASSERT_EQ(0, ret);
+	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->log);
+	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->trace);
 	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->error);
@@ -896,6 +978,8 @@ TEST_F(precedence, errno_is_third)
 
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->allow);
 	ASSERT_EQ(0, ret);
+	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->log);
+	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->trace);
 	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->error);
@@ -914,6 +998,8 @@ TEST_F(precedence, errno_is_third_in_any_order)
 	ret = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 	ASSERT_EQ(0, ret);
 
+	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->log);
+	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->error);
 	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->trace);
@@ -936,6 +1022,8 @@ TEST_F(precedence, trace_is_fourth)
 
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->allow);
 	ASSERT_EQ(0, ret);
+	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->log);
+	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->trace);
 	ASSERT_EQ(0, ret);
 	/* Should work just fine. */
@@ -957,10 +1045,52 @@ TEST_F(precedence, trace_is_fourth_in_any_order)
 	ASSERT_EQ(0, ret);
 	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->allow);
 	ASSERT_EQ(0, ret);
+	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->log);
+	ASSERT_EQ(0, ret);
 	/* Should work just fine. */
 	EXPECT_EQ(parent, syscall(__NR_getppid));
 	/* No ptracer */
 	EXPECT_EQ(-1, syscall(__NR_getpid));
+}
+
+TEST_F(precedence, log_is_fifth)
+{
+	pid_t mypid, parent;
+	long ret;
+
+	mypid = getpid();
+	parent = getppid();
+	ret = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+	ASSERT_EQ(0, ret);
+
+	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->allow);
+	ASSERT_EQ(0, ret);
+	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->log);
+	ASSERT_EQ(0, ret);
+	/* Should work just fine. */
+	EXPECT_EQ(parent, syscall(__NR_getppid));
+	/* Should also work just fine */
+	EXPECT_EQ(mypid, syscall(__NR_getpid));
+}
+
+TEST_F(precedence, log_is_fifth_in_any_order)
+{
+	pid_t mypid, parent;
+	long ret;
+
+	mypid = getpid();
+	parent = getppid();
+	ret = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+	ASSERT_EQ(0, ret);
+
+	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->log);
+	ASSERT_EQ(0, ret);
+	ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &self->allow);
+	ASSERT_EQ(0, ret);
+	/* Should work just fine. */
+	EXPECT_EQ(parent, syscall(__NR_getppid));
+	/* Should also work just fine */
+	EXPECT_EQ(mypid, syscall(__NR_getpid));
 }
 
 #ifndef PTRACE_O_TRACESECCOMP
@@ -1199,6 +1329,14 @@ TEST_F(TRACE_poke, getpid_runs_normally)
 # define ARCH_REGS	struct user_pt_regs
 # define SYSCALL_NUM	regs[8]
 # define SYSCALL_RET	regs[0]
+#elif defined(__powerpc__)
+# define ARCH_REGS	struct pt_regs
+# define SYSCALL_NUM	gpr[0]
+# define SYSCALL_RET	gpr[3]
+#elif defined(__s390__)
+# define ARCH_REGS     s390_regs
+# define SYSCALL_NUM   gprs[2]
+# define SYSCALL_RET   gprs[2]
 #else
 # error "Do not know how to find your architecture's registers and syscalls"
 #endif
@@ -1232,7 +1370,8 @@ void change_syscall(struct __test_metadata *_metadata,
 	ret = ptrace(PTRACE_GETREGSET, tracee, NT_PRSTATUS, &iov);
 	EXPECT_EQ(0, ret);
 
-#if defined(__x86_64__) || defined(__i386__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__i386__) || defined(__powerpc__) || \
+    defined(__s390__)
 	{
 		regs.SYSCALL_NUM = syscall;
 	}
@@ -1246,6 +1385,18 @@ void change_syscall(struct __test_metadata *_metadata,
 		EXPECT_EQ(0, ret);
 	}
 
+#elif defined(__aarch64__)
+# ifndef NT_ARM_SYSTEM_CALL
+#  define NT_ARM_SYSTEM_CALL 0x404
+# endif
+	{
+		iov.iov_base = &syscall;
+		iov.iov_len = sizeof(syscall);
+		ret = ptrace(PTRACE_SETREGSET, tracee, NT_ARM_SYSTEM_CALL,
+			     &iov);
+		EXPECT_EQ(0, ret);
+	}
+
 #else
 	ASSERT_EQ(1, 0) {
 		TH_LOG("How is the syscall changed on this architecture?");
@@ -1256,6 +1407,8 @@ void change_syscall(struct __test_metadata *_metadata,
 	if (syscall == -1)
 		regs.SYSCALL_RET = 1;
 
+	iov.iov_base = &regs;
+	iov.iov_len = sizeof(regs);
 	ret = ptrace(PTRACE_SETREGSET, tracee, NT_PRSTATUS, &iov);
 	EXPECT_EQ(0, ret);
 }
@@ -1270,17 +1423,21 @@ void tracer_syscall(struct __test_metadata *_metadata, pid_t tracee,
 	ret = ptrace(PTRACE_GETEVENTMSG, tracee, NULL, &msg);
 	EXPECT_EQ(0, ret);
 
+	/* Validate and take action on expected syscalls. */
 	switch (msg) {
 	case 0x1002:
 		/* change getpid to getppid. */
+		EXPECT_EQ(__NR_getpid, get_syscall(_metadata, tracee));
 		change_syscall(_metadata, tracee, __NR_getppid);
 		break;
 	case 0x1003:
 		/* skip gettid. */
+		EXPECT_EQ(__NR_gettid, get_syscall(_metadata, tracee));
 		change_syscall(_metadata, tracee, -1);
 		break;
 	case 0x1004:
 		/* do nothing (allow getppid) */
+		EXPECT_EQ(__NR_getppid, get_syscall(_metadata, tracee));
 		break;
 	default:
 		EXPECT_EQ(0, msg) {
@@ -1396,6 +1553,10 @@ TEST_F(TRACE_syscall, syscall_dropped)
 #  define __NR_seccomp 383
 # elif defined(__aarch64__)
 #  define __NR_seccomp 277
+# elif defined(__powerpc__)
+#  define __NR_seccomp 358
+# elif defined(__s390__)
+#  define __NR_seccomp 348
 # else
 #  warning "seccomp syscall number unknown for this architecture"
 #  define __NR_seccomp 0xffff
@@ -1410,15 +1571,27 @@ TEST_F(TRACE_syscall, syscall_dropped)
 #define SECCOMP_SET_MODE_FILTER 1
 #endif
 
-#ifndef SECCOMP_FLAG_FILTER_TSYNC
-#define SECCOMP_FLAG_FILTER_TSYNC 1
+#ifndef SECCOMP_GET_ACTION_AVAIL
+#define SECCOMP_GET_ACTION_AVAIL 2
+#endif
+
+#ifndef SECCOMP_FILTER_FLAG_TSYNC
+#define SECCOMP_FILTER_FLAG_TSYNC (1UL << 0)
+#endif
+
+#ifndef SECCOMP_FILTER_FLAG_LOG
+#define SECCOMP_FILTER_FLAG_LOG (1UL << 1)
+#endif
+
+#ifndef SECCOMP_FILTER_FLAG_SPEC_ALLOW
+#define SECCOMP_FILTER_FLAG_SPEC_ALLOW (1UL << 2)
 #endif
 
 #ifndef seccomp
-int seccomp(unsigned int op, unsigned int flags, struct sock_fprog *filter)
+int seccomp(unsigned int op, unsigned int flags, void *args)
 {
 	errno = 0;
-	return syscall(__NR_seccomp, op, flags, filter);
+	return syscall(__NR_seccomp, op, flags, args);
 }
 #endif
 
@@ -1440,6 +1613,9 @@ TEST(seccomp_syscall)
 
 	/* Reject insane operation. */
 	ret = seccomp(-1, 0, &prog);
+	ASSERT_NE(ENOSYS, errno) {
+		TH_LOG("Kernel does not support seccomp syscall!");
+	}
 	EXPECT_EQ(EINVAL, errno) {
 		TH_LOG("Did not reject crazy op value!");
 	}
@@ -1488,6 +1664,9 @@ TEST(seccomp_syscall_mode_lock)
 	}
 
 	ret = seccomp(SECCOMP_SET_MODE_FILTER, 0, &prog);
+	ASSERT_NE(ENOSYS, errno) {
+		TH_LOG("Kernel does not support seccomp syscall!");
+	}
 	EXPECT_EQ(0, ret) {
 		TH_LOG("Could not install filter!");
 	}
@@ -1501,6 +1680,79 @@ TEST(seccomp_syscall_mode_lock)
 	ret = seccomp(SECCOMP_SET_MODE_STRICT, 0, NULL);
 	EXPECT_EQ(EINVAL, errno) {
 		TH_LOG("Switched to mode strict!");
+	}
+}
+
+/*
+ * Test detection of known and unknown filter flags. Userspace needs to be able
+ * to check if a filter flag is supported by the current kernel and a good way
+ * of doing that is by attempting to enter filter mode, with the flag bit in
+ * question set, and a NULL pointer for the _args_ parameter. EFAULT indicates
+ * that the flag is valid and EINVAL indicates that the flag is invalid.
+ */
+TEST(detect_seccomp_filter_flags)
+{
+	unsigned int flags[] = { SECCOMP_FILTER_FLAG_TSYNC,
+				 SECCOMP_FILTER_FLAG_LOG,
+				 SECCOMP_FILTER_FLAG_SPEC_ALLOW };
+	unsigned int flag, all_flags;
+	int i;
+	long ret;
+
+	/* Test detection of known-good filter flags */
+	for (i = 0, all_flags = 0; i < ARRAY_SIZE(flags); i++) {
+		int bits = 0;
+
+		flag = flags[i];
+		/* Make sure the flag is a single bit! */
+		while (flag) {
+			if (flag & 0x1)
+				bits ++;
+			flag >>= 1;
+		}
+		ASSERT_EQ(1, bits);
+		flag = flags[i];
+
+		ret = seccomp(SECCOMP_SET_MODE_FILTER, flag, NULL);
+		ASSERT_NE(ENOSYS, errno) {
+			TH_LOG("Kernel does not support seccomp syscall!");
+		}
+		EXPECT_EQ(-1, ret);
+		EXPECT_EQ(EFAULT, errno) {
+			TH_LOG("Failed to detect that a known-good filter flag (0x%X) is supported!",
+			       flag);
+		}
+
+		all_flags |= flag;
+	}
+
+	/* Test detection of all known-good filter flags */
+	ret = seccomp(SECCOMP_SET_MODE_FILTER, all_flags, NULL);
+	EXPECT_EQ(-1, ret);
+	EXPECT_EQ(EFAULT, errno) {
+		TH_LOG("Failed to detect that all known-good filter flags (0x%X) are supported!",
+		       all_flags);
+	}
+
+	/* Test detection of an unknown filter flag */
+	flag = -1;
+	ret = seccomp(SECCOMP_SET_MODE_FILTER, flag, NULL);
+	EXPECT_EQ(-1, ret);
+	EXPECT_EQ(EINVAL, errno) {
+		TH_LOG("Failed to detect that an unknown filter flag (0x%X) is unsupported!",
+		       flag);
+	}
+
+	/*
+	 * Test detection of an unknown filter flag that may simply need to be
+	 * added to this test
+	 */
+	flag = flags[ARRAY_SIZE(flags) - 1] << 1;
+	ret = seccomp(SECCOMP_SET_MODE_FILTER, flag, NULL);
+	EXPECT_EQ(-1, ret);
+	EXPECT_EQ(EINVAL, errno) {
+		TH_LOG("Failed to detect that an unknown filter flag (0x%X) is unsupported! Does a new flag need to be added to this test?",
+		       flag);
 	}
 }
 
@@ -1520,8 +1772,11 @@ TEST(TSYNC_first)
 		TH_LOG("Kernel does not support PR_SET_NO_NEW_PRIVS!");
 	}
 
-	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FLAG_FILTER_TSYNC,
+	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC,
 		      &prog);
+	ASSERT_NE(ENOSYS, errno) {
+		TH_LOG("Kernel does not support seccomp syscall!");
+	}
 	EXPECT_EQ(0, ret) {
 		TH_LOG("Could not install initial filter with TSYNC!");
 	}
@@ -1681,6 +1936,9 @@ TEST_F(TSYNC, siblings_fail_prctl)
 
 	/* Check prctl failure detection by requesting sib 0 diverge. */
 	ret = seccomp(SECCOMP_SET_MODE_FILTER, 0, &prog);
+	ASSERT_NE(ENOSYS, errno) {
+		TH_LOG("Kernel does not support seccomp syscall!");
+	}
 	ASSERT_EQ(0, ret) {
 		TH_LOG("setting filter failed");
 	}
@@ -1718,6 +1976,9 @@ TEST_F(TSYNC, two_siblings_with_ancestor)
 	}
 
 	ret = seccomp(SECCOMP_SET_MODE_FILTER, 0, &self->root_prog);
+	ASSERT_NE(ENOSYS, errno) {
+		TH_LOG("Kernel does not support seccomp syscall!");
+	}
 	ASSERT_EQ(0, ret) {
 		TH_LOG("Kernel does not support SECCOMP_SET_MODE_FILTER!");
 	}
@@ -1729,7 +1990,7 @@ TEST_F(TSYNC, two_siblings_with_ancestor)
 		self->sibling_count++;
 	}
 
-	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FLAG_FILTER_TSYNC,
+	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC,
 		      &self->apply_prog);
 	ASSERT_EQ(0, ret) {
 		TH_LOG("Could install filter on all threads!");
@@ -1790,8 +2051,11 @@ TEST_F(TSYNC, two_siblings_with_no_filter)
 		TH_LOG("Kernel does not support PR_SET_NO_NEW_PRIVS!");
 	}
 
-	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FLAG_FILTER_TSYNC,
+	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC,
 		      &self->apply_prog);
+	ASSERT_NE(ENOSYS, errno) {
+		TH_LOG("Kernel does not support seccomp syscall!");
+	}
 	ASSERT_EQ(0, ret) {
 		TH_LOG("Could install filter on all threads!");
 	}
@@ -1820,6 +2084,9 @@ TEST_F(TSYNC, two_siblings_with_one_divergence)
 	}
 
 	ret = seccomp(SECCOMP_SET_MODE_FILTER, 0, &self->root_prog);
+	ASSERT_NE(ENOSYS, errno) {
+		TH_LOG("Kernel does not support seccomp syscall!");
+	}
 	ASSERT_EQ(0, ret) {
 		TH_LOG("Kernel does not support SECCOMP_SET_MODE_FILTER!");
 	}
@@ -1832,7 +2099,7 @@ TEST_F(TSYNC, two_siblings_with_one_divergence)
 		self->sibling_count++;
 	}
 
-	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FLAG_FILTER_TSYNC,
+	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC,
 		      &self->apply_prog);
 	ASSERT_EQ(self->sibling[0].system_tid, ret) {
 		TH_LOG("Did not fail on diverged sibling.");
@@ -1877,11 +2144,14 @@ TEST_F(TSYNC, two_siblings_not_under_filter)
 	}
 
 	ret = seccomp(SECCOMP_SET_MODE_FILTER, 0, &self->root_prog);
+	ASSERT_NE(ENOSYS, errno) {
+		TH_LOG("Kernel does not support seccomp syscall!");
+	}
 	ASSERT_EQ(0, ret) {
 		TH_LOG("Kernel does not support SECCOMP_SET_MODE_FILTER!");
 	}
 
-	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FLAG_FILTER_TSYNC,
+	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC,
 		      &self->apply_prog);
 	ASSERT_EQ(ret, self->sibling[0].system_tid) {
 		TH_LOG("Did not fail on diverged sibling.");
@@ -1910,7 +2180,7 @@ TEST_F(TSYNC, two_siblings_not_under_filter)
 	/* Switch to the remaining sibling */
 	sib = !sib;
 
-	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FLAG_FILTER_TSYNC,
+	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC,
 		      &self->apply_prog);
 	ASSERT_EQ(0, ret) {
 		TH_LOG("Expected the remaining sibling to sync");
@@ -1933,7 +2203,7 @@ TEST_F(TSYNC, two_siblings_not_under_filter)
 	while (!kill(self->sibling[sib].system_tid, 0))
 		sleep(0.1);
 
-	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FLAG_FILTER_TSYNC,
+	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC,
 		      &self->apply_prog);
 	ASSERT_EQ(0, ret);  /* just us chickens */
 }
@@ -1957,20 +2227,25 @@ TEST(syscall_restart)
 		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_read, 5, 0),
 		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_exit, 4, 0),
 		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_rt_sigreturn, 3, 0),
-		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_poll, 4, 0),
+		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_nanosleep, 4, 0),
 		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_restart_syscall, 4, 0),
 
 		/* Allow __NR_write for easy logging. */
 		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_write, 0, 1),
 		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
 		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_KILL),
-		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_TRACE|0x100), /* poll */
-		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_TRACE|0x200), /* restart */
+		/* The nanosleep jump target. */
+		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_TRACE|0x100),
+		/* The restart_syscall jump target. */
+		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_TRACE|0x200),
 	};
 	struct sock_fprog prog = {
 		.len = (unsigned short)ARRAY_SIZE(filter),
 		.filter = filter,
 	};
+#if defined(__arm__)
+	struct utsname utsbuf;
+#endif
 
 	ASSERT_EQ(0, pipe(pipefd));
 
@@ -1979,10 +2254,7 @@ TEST(syscall_restart)
 	if (child_pid == 0) {
 		/* Child uses EXPECT not ASSERT to deliver status correctly. */
 		char buf = ' ';
-		struct pollfd fds = {
-			.fd = pipefd[0],
-			.events = POLLIN,
-		};
+		struct timespec timeout = { };
 
 		/* Attach parent as tracer and stop. */
 		EXPECT_EQ(0, ptrace(PTRACE_TRACEME));
@@ -2006,10 +2278,11 @@ TEST(syscall_restart)
 			TH_LOG("Failed to get sync data from read()");
 		}
 
-		/* Start poll to be interrupted. */
+		/* Start nanosleep to be interrupted. */
+		timeout.tv_sec = 1;
 		errno = 0;
-		EXPECT_EQ(1, poll(&fds, 1, -1)) {
-			TH_LOG("Call to poll() failed (errno %d)", errno);
+		EXPECT_EQ(0, nanosleep(&timeout, NULL)) {
+			TH_LOG("Call to nanosleep() failed (errno %d)", errno);
 		}
 
 		/* Read final sync from parent. */
@@ -2034,14 +2307,14 @@ TEST(syscall_restart)
 	ASSERT_EQ(0, ptrace(PTRACE_CONT, child_pid, NULL, 0));
 	ASSERT_EQ(1, write(pipefd[1], ".", 1));
 
-	/* Wait for poll() to start. */
+	/* Wait for nanosleep() to start. */
 	ASSERT_EQ(child_pid, waitpid(child_pid, &status, 0));
 	ASSERT_EQ(true, WIFSTOPPED(status));
 	ASSERT_EQ(SIGTRAP, WSTOPSIG(status));
 	ASSERT_EQ(PTRACE_EVENT_SECCOMP, (status >> 16));
 	ASSERT_EQ(0, ptrace(PTRACE_GETEVENTMSG, child_pid, NULL, &msg));
 	ASSERT_EQ(0x100, msg);
-	EXPECT_EQ(__NR_poll, get_syscall(_metadata, child_pid));
+	EXPECT_EQ(__NR_nanosleep, get_syscall(_metadata, child_pid));
 
 	/* Might as well check siginfo for sanity while we're here. */
 	ASSERT_EQ(0, ptrace(PTRACE_GETSIGINFO, child_pid, NULL, &info));
@@ -2052,7 +2325,7 @@ TEST(syscall_restart)
 	/* Verify signal delivery came from child (seccomp-triggered). */
 	EXPECT_EQ(child_pid, info.si_pid);
 
-	/* Interrupt poll with SIGSTOP (which we'll need to handle). */
+	/* Interrupt nanosleep with SIGSTOP (which we'll need to handle). */
 	ASSERT_EQ(0, kill(child_pid, SIGSTOP));
 	ASSERT_EQ(0, ptrace(PTRACE_CONT, child_pid, NULL, 0));
 	ASSERT_EQ(child_pid, waitpid(child_pid, &status, 0));
@@ -2062,7 +2335,7 @@ TEST(syscall_restart)
 	ASSERT_EQ(0, ptrace(PTRACE_GETSIGINFO, child_pid, NULL, &info));
 	EXPECT_EQ(getpid(), info.si_pid);
 
-	/* Restart poll with SIGCONT, which triggers restart_syscall. */
+	/* Restart nanosleep with SIGCONT, which triggers restart_syscall. */
 	ASSERT_EQ(0, kill(child_pid, SIGCONT));
 	ASSERT_EQ(0, ptrace(PTRACE_CONT, child_pid, NULL, 0));
 	ASSERT_EQ(child_pid, waitpid(child_pid, &status, 0));
@@ -2076,16 +2349,25 @@ TEST(syscall_restart)
 	ASSERT_EQ(SIGTRAP, WSTOPSIG(status));
 	ASSERT_EQ(PTRACE_EVENT_SECCOMP, (status >> 16));
 	ASSERT_EQ(0, ptrace(PTRACE_GETEVENTMSG, child_pid, NULL, &msg));
+
 	ASSERT_EQ(0x200, msg);
 	ret = get_syscall(_metadata, child_pid);
 #if defined(__arm__)
-	/* FIXME: ARM does not expose true syscall in registers. */
-	EXPECT_EQ(__NR_poll, ret);
-#else
-	EXPECT_EQ(__NR_restart_syscall, ret);
+	/*
+	 * FIXME:
+	 * - native ARM registers do NOT expose true syscall.
+	 * - compat ARM registers on ARM64 DO expose true syscall.
+	 */
+	ASSERT_EQ(0, uname(&utsbuf));
+	if (strncmp(utsbuf.machine, "arm", 3) == 0) {
+		EXPECT_EQ(__NR_nanosleep, ret);
+	} else
 #endif
+	{
+		EXPECT_EQ(__NR_restart_syscall, ret);
+	}
 
-	/* Write again to end poll. */
+	/* Write again to end test. */
 	ASSERT_EQ(0, ptrace(PTRACE_CONT, child_pid, NULL, 0));
 	ASSERT_EQ(1, write(pipefd[1], "!", 1));
 	EXPECT_EQ(0, close(pipefd[1]));
@@ -2093,6 +2375,99 @@ TEST(syscall_restart)
 	ASSERT_EQ(child_pid, waitpid(child_pid, &status, 0));
 	if (WIFSIGNALED(status) || WEXITSTATUS(status))
 		_metadata->passed = 0;
+}
+
+TEST_SIGNAL(filter_flag_log, SIGSYS)
+{
+	struct sock_filter allow_filter[] = {
+		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+	};
+	struct sock_filter kill_filter[] = {
+		BPF_STMT(BPF_LD|BPF_W|BPF_ABS,
+			offsetof(struct seccomp_data, nr)),
+		BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_getpid, 0, 1),
+		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_KILL),
+		BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+	};
+	struct sock_fprog allow_prog = {
+		.len = (unsigned short)ARRAY_SIZE(allow_filter),
+		.filter = allow_filter,
+	};
+	struct sock_fprog kill_prog = {
+		.len = (unsigned short)ARRAY_SIZE(kill_filter),
+		.filter = kill_filter,
+	};
+	long ret;
+	pid_t parent = getppid();
+
+	ret = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+	ASSERT_EQ(0, ret);
+
+	/* Verify that the FILTER_FLAG_LOG flag isn't accepted in strict mode */
+	ret = seccomp(SECCOMP_SET_MODE_STRICT, SECCOMP_FILTER_FLAG_LOG,
+		      &allow_prog);
+	ASSERT_NE(ENOSYS, errno) {
+		TH_LOG("Kernel does not support seccomp syscall!");
+	}
+	EXPECT_NE(0, ret) {
+		TH_LOG("Kernel accepted FILTER_FLAG_LOG flag in strict mode!");
+	}
+	EXPECT_EQ(EINVAL, errno) {
+		TH_LOG("Kernel returned unexpected errno for FILTER_FLAG_LOG flag in strict mode!");
+	}
+
+	/* Verify that a simple, permissive filter can be added with no flags */
+	ret = seccomp(SECCOMP_SET_MODE_FILTER, 0, &allow_prog);
+	EXPECT_EQ(0, ret);
+
+	/* See if the same filter can be added with the FILTER_FLAG_LOG flag */
+	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_LOG,
+		      &allow_prog);
+	ASSERT_NE(EINVAL, errno) {
+		TH_LOG("Kernel does not support the FILTER_FLAG_LOG flag!");
+	}
+	EXPECT_EQ(0, ret);
+
+	/* Ensure that the kill filter works with the FILTER_FLAG_LOG flag */
+	ret = seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_LOG,
+		      &kill_prog);
+	EXPECT_EQ(0, ret);
+
+	EXPECT_EQ(parent, syscall(__NR_getppid));
+	/* getpid() should never return. */
+	EXPECT_EQ(0, syscall(__NR_getpid));
+}
+
+TEST(get_action_avail)
+{
+	__u32 actions[] = { SECCOMP_RET_KILL,  SECCOMP_RET_TRAP,
+			    SECCOMP_RET_ERRNO, SECCOMP_RET_TRACE,
+			    SECCOMP_RET_LOG,   SECCOMP_RET_ALLOW };
+	__u32 unknown_action = 0x10000000U;
+	int i;
+	long ret;
+
+	ret = seccomp(SECCOMP_GET_ACTION_AVAIL, 0, &actions[0]);
+	ASSERT_NE(ENOSYS, errno) {
+		TH_LOG("Kernel does not support seccomp syscall!");
+	}
+	ASSERT_NE(EINVAL, errno) {
+		TH_LOG("Kernel does not support SECCOMP_GET_ACTION_AVAIL operation!");
+	}
+	EXPECT_EQ(ret, 0);
+
+	for (i = 0; i < ARRAY_SIZE(actions); i++) {
+		ret = seccomp(SECCOMP_GET_ACTION_AVAIL, 0, &actions[i]);
+		EXPECT_EQ(ret, 0) {
+			TH_LOG("Expected action (0x%X) not available!",
+			       actions[i]);
+		}
+	}
+
+	/* Check that an unknown action is handled properly (EOPNOTSUPP) */
+	ret = seccomp(SECCOMP_GET_ACTION_AVAIL, 0, &unknown_action);
+	EXPECT_EQ(ret, -1);
+	EXPECT_EQ(errno, EOPNOTSUPP);
 }
 
 /*
@@ -2103,6 +2478,8 @@ TEST(syscall_restart)
  * - endianness checking when appropriate
  * - 64-bit arg prodding
  * - arch value testing (x86 modes especially)
+ * - verify that FILTER_FLAG_LOG filters generate log messages
+ * - verify that RET_LOG generates log messages
  * - ...
  */
 

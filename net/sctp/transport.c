@@ -72,7 +72,7 @@ static struct sctp_transport *sctp_transport_init(struct net *net,
 	 */
 	peer->rto = msecs_to_jiffies(net->sctp.rto_initial);
 
-	peer->last_time_heard = ktime_get();
+	peer->last_time_heard = ktime_set(0, 0);
 	peer->last_time_ecne_reduced = jiffies;
 
 	peer->param_flags = SPP_HB_DISABLE |
@@ -148,7 +148,7 @@ void sctp_transport_free(struct sctp_transport *transport)
 
 	/* Delete the ICMP proto unreachable timer if it's active. */
 	if (del_timer(&transport->proto_unreach_timer))
-		sctp_association_put(transport->asoc);
+		sctp_transport_put(transport);
 
 	sctp_transport_put(transport);
 }
@@ -222,7 +222,7 @@ void sctp_transport_pmtu(struct sctp_transport *transport, struct sock *sk)
 {
 	/* If we don't have a fresh route, look one up */
 	if (!transport->dst || transport->dst->obsolete) {
-		dst_release(transport->dst);
+		sctp_transport_dst_release(transport);
 		transport->af_specific->get_dst(transport, &transport->saddr,
 						&transport->fl, sk);
 	}
@@ -331,7 +331,7 @@ void sctp_transport_update_rto(struct sctp_transport *tp, __u32 rtt)
 		 * 1/8, rto_alpha would be expressed as 3.
 		 */
 		tp->rttvar = tp->rttvar - (tp->rttvar >> net->sctp.rto_beta)
-			+ (((__u32)abs64((__s64)tp->srtt - (__s64)rtt)) >> net->sctp.rto_beta);
+			+ (((__u32)abs((__s64)tp->srtt - (__s64)rtt)) >> net->sctp.rto_beta);
 		tp->srtt = tp->srtt - (tp->srtt >> net->sctp.rto_alpha)
 			+ (rtt >> net->sctp.rto_alpha);
 	} else {
@@ -653,4 +653,18 @@ void sctp_transport_immediate_rtx(struct sctp_transport *t)
 		if (!mod_timer(&t->T3_rtx_timer, jiffies + t->rto))
 			sctp_transport_hold(t);
 	}
+}
+
+/* Drop dst */
+void sctp_transport_dst_release(struct sctp_transport *t)
+{
+	dst_release(t->dst);
+	t->dst = NULL;
+	t->dst_pending_confirm = 0;
+}
+
+/* Schedule neighbour confirm */
+void sctp_transport_dst_confirm(struct sctp_transport *t)
+{
+	t->dst_pending_confirm = 1;
 }

@@ -79,6 +79,7 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/compat.h>
 #include <linux/uio.h>
+#include <linux/nospec.h>
 
 struct raw_frag_vec {
 	struct msghdr *msg;
@@ -167,6 +168,7 @@ static int icmp_filter(const struct sock *sk, const struct sk_buff *skb)
  */
 static int raw_v4_input(struct sk_buff *skb, const struct iphdr *iph, int hash)
 {
+	int dif = inet_iif(skb);
 	struct sock *sk;
 	struct hlist_head *head;
 	int delivered = 0;
@@ -179,8 +181,7 @@ static int raw_v4_input(struct sk_buff *skb, const struct iphdr *iph, int hash)
 
 	net = dev_net(skb->dev);
 	sk = __raw_v4_lookup(net, __sk_head(head), iph->protocol,
-			     iph->saddr, iph->daddr,
-			     skb->dev->ifindex);
+			     iph->saddr, iph->daddr, dif);
 
 	while (sk) {
 		delivered = 1;
@@ -195,7 +196,7 @@ static int raw_v4_input(struct sk_buff *skb, const struct iphdr *iph, int hash)
 		}
 		sk = __raw_v4_lookup(net, sk_next(sk), iph->protocol,
 				     iph->saddr, iph->daddr,
-				     skb->dev->ifindex);
+				     dif);
 	}
 out:
 	read_unlock(&raw_v4_hashinfo.lock);
@@ -354,6 +355,9 @@ static int raw_send_hdrinc(struct sock *sk, struct flowi4 *fl4,
 			       rt->dst.dev->mtu);
 		return -EMSGSIZE;
 	}
+	if (length < sizeof(struct iphdr))
+		return -EINVAL;
+
 	if (flags&MSG_PROBE)
 		goto out;
 
@@ -378,6 +382,9 @@ static int raw_send_hdrinc(struct sock *sk, struct flowi4 *fl4,
 	skb->ip_summed = CHECKSUM_NONE;
 
 	sock_tx_timestamp(sk, &skb_shinfo(skb)->tx_flags);
+
+	if (flags & MSG_CONFIRM)
+		skb_set_dst_pending_confirm(skb, 1);
 
 	skb->transport_header = skb->network_header;
 	err = -EFAULT;
@@ -406,13 +413,16 @@ static int raw_send_hdrinc(struct sock *sk, struct flowi4 *fl4,
 			ip_select_ident(net, skb, NULL);
 
 		iph->check = ip_fast_csum((unsigned char *)iph, iph->ihl);
+		skb->transport_header += iphlen;
+		if (iph->protocol == IPPROTO_ICMP &&
+		    length >= iphlen + sizeof(struct icmphdr))
+			icmp_out_count(net, ((struct icmphdr *)
+				skb_transport_header(skb))->type);
 	}
-	if (iph->protocol == IPPROTO_ICMP)
-		icmp_out_count(net, ((struct icmphdr *)
-			skb_transport_header(skb))->type);
 
-	err = NF_HOOK(NFPROTO_IPV4, NF_INET_LOCAL_OUT, sk, skb,
-		      NULL, rt->dst.dev, dst_output_sk);
+	err = NF_HOOK(NFPROTO_IPV4, NF_INET_LOCAL_OUT,
+		      net, sk, skb, NULL, rt->dst.dev,
+		      dst_output);
 	if (err > 0)
 		err = net_xmit_errno(err);
 	if (err)
@@ -455,7 +465,10 @@ static int raw_getfrag(void *from, char *to, int offset, int len, int odd,
 	struct raw_frag_vec *rfv = from;
 
 	if (offset < rfv->hlen) {
-		int copy = min(rfv->hlen - offset, len);
+		int copy;
+
+		offset = array_index_nospec(offset, rfv->hlen); /* needed? */
+		copy = min(rfv->hlen - offset, len);
 
 		if (skb->ip_summed == CHECKSUM_PARTIAL)
 			memcpy(to, rfv->hdr.c + offset, copy);
@@ -483,6 +496,7 @@ static int raw_getfrag(void *from, char *to, int offset, int len, int odd,
 static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 {
 	struct inet_sock *inet = inet_sk(sk);
+	struct net *net = sock_net(sk);
 	struct ipcm_cookie ipc;
 	struct rtable *rt = NULL;
 	struct flowi4 fl4;
@@ -493,11 +507,18 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	int err;
 	struct ip_options_data opt_copy;
 	struct raw_frag_vec rfv;
+	int hdrincl;
 
 	err = -EMSGSIZE;
 	if (len > 0xFFFF)
 		goto out;
 
+	/* hdrincl should be READ_ONCE(inet->hdrincl)
+	 * but READ_ONCE() doesn't work with bit fields.
+	 * Doing this indirectly yields the same result.
+	 */
+	hdrincl = inet->hdrincl;
+	hdrincl = READ_ONCE(hdrincl);
 	/*
 	 *	Check the flags.
 	 */
@@ -542,9 +563,11 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	ipc.oif = sk->sk_bound_dev_if;
 
 	if (msg->msg_controllen) {
-		err = ip_cmsg_send(sock_net(sk), msg, &ipc, false);
-		if (err)
+		err = ip_cmsg_send(net, msg, &ipc, false);
+		if (unlikely(err)) {
+			kfree(ipc.opt);
 			goto out;
+		}
 		if (ipc.opt)
 			free = 1;
 	}
@@ -570,7 +593,7 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		/* Linux does not mangle headers on raw sockets,
 		 * so that IP options + IP_HDRINCL is non-sense.
 		 */
-		if (inet->hdrincl)
+		if (hdrincl)
 			goto done;
 		if (ipc.opt->opt.srr) {
 			if (!daddr)
@@ -592,12 +615,18 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 
 	flowi4_init_output(&fl4, ipc.oif, sk->sk_mark, tos,
 			   RT_SCOPE_UNIVERSE,
-			   inet->hdrincl ? IPPROTO_RAW : sk->sk_protocol,
+			   hdrincl ? IPPROTO_RAW : sk->sk_protocol,
 			   inet_sk_flowi_flags(sk) |
-			    (inet->hdrincl ? FLOWI_FLAG_KNOWN_NH : 0),
+			    (hdrincl ? FLOWI_FLAG_KNOWN_NH : 0),
 			   daddr, saddr, 0, 0);
 
-	if (!inet->hdrincl) {
+	if (!saddr && ipc.oif) {
+		err = l3mdev_get_saddr(net, ipc.oif, &fl4);
+		if (err < 0)
+			goto done;
+	}
+
+	if (!hdrincl) {
 		rfv.msg = msg;
 		rfv.hlen = 0;
 
@@ -607,7 +636,7 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	}
 
 	security_sk_classify_flow(sk, flowi4_to_flowi(&fl4));
-	rt = ip_route_output_flow(sock_net(sk), &fl4, sk);
+	rt = ip_route_output_flow(net, &fl4, sk);
 	if (IS_ERR(rt)) {
 		err = PTR_ERR(rt);
 		rt = NULL;
@@ -622,7 +651,7 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		goto do_confirm;
 back_from_confirm:
 
-	if (inet->hdrincl)
+	if (hdrincl)
 		err = raw_send_hdrinc(sk, &fl4, msg, len,
 				      &rt, msg->msg_flags);
 
@@ -655,7 +684,8 @@ out:
 	return len;
 
 do_confirm:
-	dst_confirm(&rt->dst);
+	if (msg->msg_flags & MSG_PROBE)
+		dst_confirm_neigh(&rt->dst, &fl4.daddr);
 	if (!(msg->msg_flags & MSG_PROBE) || len)
 		goto back_from_confirm;
 	err = 0;

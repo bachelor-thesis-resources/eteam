@@ -151,6 +151,27 @@ static void bictcp_init(struct sock *sk)
 		tcp_sk(sk)->snd_ssthresh = initial_ssthresh;
 }
 
+static void bictcp_cwnd_event(struct sock *sk, enum tcp_ca_event event)
+{
+	if (event == CA_EVENT_TX_START) {
+		struct bictcp *ca = inet_csk_ca(sk);
+		u32 now = tcp_time_stamp;
+		s32 delta;
+
+		delta = now - tcp_sk(sk)->lsndtime;
+
+		/* We were application limited (idle) for a while.
+		 * Shift epoch_start to keep cwnd growth to cubic curve.
+		 */
+		if (ca->epoch_start && delta > 0) {
+			ca->epoch_start += delta;
+			if (after(ca->epoch_start, now))
+				ca->epoch_start = now;
+		}
+		return;
+	}
+}
+
 /* calculate the cubic root of x using a table lookup followed by one
  * Newton-Raphson iteration.
  * Avg err ~= 0.195%
@@ -320,7 +341,7 @@ static void bictcp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 	if (!tcp_is_cwnd_limited(sk))
 		return;
 
-	if (tp->snd_cwnd <= tp->snd_ssthresh) {
+	if (tcp_in_slow_start(tp)) {
 		if (hystart && after(ack, ca->end_seq))
 			bictcp_hystart_reset(sk);
 		acked = tcp_slow_start(tp, acked);
@@ -393,6 +414,8 @@ static void hystart_update(struct sock *sk, u32 delay)
 
 	if (hystart_detect & HYSTART_DELAY) {
 		/* obtain the minimum delay of more than sampling packets */
+		if (ca->curr_rtt > delay)
+			ca->curr_rtt = delay;
 		if (ca->sample_cnt < HYSTART_MIN_SAMPLES) {
 			if (ca->curr_rtt == 0 || ca->curr_rtt > delay)
 				ca->curr_rtt = delay;
@@ -439,7 +462,7 @@ static void bictcp_acked(struct sock *sk, u32 cnt, s32 rtt_us)
 		ca->delay_min = delay;
 
 	/* hystart triggers when cwnd is larger than some threshold */
-	if (hystart && tp->snd_cwnd <= tp->snd_ssthresh &&
+	if (hystart && tcp_in_slow_start(tp) &&
 	    tp->snd_cwnd >= hystart_low_window)
 		hystart_update(sk, delay);
 }
@@ -450,6 +473,7 @@ static struct tcp_congestion_ops cubictcp __read_mostly = {
 	.cong_avoid	= bictcp_cong_avoid,
 	.set_state	= bictcp_state,
 	.undo_cwnd	= bictcp_undo_cwnd,
+	.cwnd_event	= bictcp_cwnd_event,
 	.pkts_acked     = bictcp_acked,
 	.owner		= THIS_MODULE,
 	.name		= "cubic",

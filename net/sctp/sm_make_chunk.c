@@ -857,7 +857,11 @@ struct sctp_chunk *sctp_make_shutdown(const struct sctp_association *asoc,
 	sctp_shutdownhdr_t shut;
 	__u32 ctsn;
 
-	ctsn = sctp_tsnmap_get_ctsn(&asoc->peer.tsn_map);
+	if (chunk && chunk->asoc)
+		ctsn = sctp_tsnmap_get_ctsn(&chunk->asoc->peer.tsn_map);
+	else
+		ctsn = sctp_tsnmap_get_ctsn(&asoc->peer.tsn_map);
+
 	shut.cum_tsn_ack = htonl(ctsn);
 
 	retval = sctp_make_control(asoc, SCTP_CID_SHUTDOWN, 0,
@@ -1367,10 +1371,14 @@ static struct sctp_chunk *_sctp_make_chunk(const struct sctp_association *asoc,
 	sctp_chunkhdr_t *chunk_hdr;
 	struct sk_buff *skb;
 	struct sock *sk;
+	int chunklen;
+
+	chunklen = WORD_ROUND(sizeof(*chunk_hdr) + paylen);
+	if (chunklen > SCTP_MAX_CHUNK_LEN)
+		goto nodata;
 
 	/* No need to allocate LL here, as this is only a chunk. */
-	skb = alloc_skb(WORD_ROUND(sizeof(sctp_chunkhdr_t) + paylen),
-			GFP_ATOMIC);
+	skb = alloc_skb(chunklen, GFP_ATOMIC);
 	if (!skb)
 		goto nodata;
 
@@ -1652,7 +1660,7 @@ static sctp_cookie_param_t *sctp_pack_cookie(const struct sctp_endpoint *ep,
 
 	/* Set an expiration time for the cookie.  */
 	cookie->c.expiration = ktime_add(asoc->cookie_life,
-					 ktime_get());
+					 ktime_get_real());
 
 	/* Copy the peer's init packet.  */
 	memcpy(&cookie->c.peer_init[0], init_chunk->chunk_hdr,
@@ -1780,7 +1788,7 @@ no_hmac:
 	if (sock_flag(ep->base.sk, SOCK_TIMESTAMP))
 		kt = skb_get_ktime(skb);
 	else
-		kt = ktime_get();
+		kt = ktime_get_real();
 
 	if (!asoc && ktime_before(bear_cookie->expiration, kt)) {
 		/*
@@ -2494,7 +2502,7 @@ static int sctp_process_param(struct sctp_association *asoc,
 	__u16 sat;
 	int retval = 1;
 	sctp_scope_t scope;
-	time_t stale;
+	u32 stale;
 	struct sctp_af *af;
 	union sctp_addr_param *addr_param;
 	struct sctp_transport *t;
@@ -3090,8 +3098,19 @@ static __be16 sctp_process_asconf_param(struct sctp_association *asoc,
 			sctp_assoc_set_primary(asoc, asconf->transport);
 			sctp_assoc_del_nonprimary_peers(asoc,
 							asconf->transport);
-		} else
-			sctp_assoc_del_peer(asoc, &addr);
+			return SCTP_ERROR_NO_ERROR;
+		}
+
+		/* If the address is not part of the association, the
+		 * ASCONF-ACK with Error Cause Indication Parameter
+		 * which including cause of Unresolvable Address should
+		 * be sent.
+		 */
+		peer = sctp_assoc_lookup_paddr(asoc, &addr);
+		if (!peer)
+			return SCTP_ERROR_DNS_FAILED;
+
+		sctp_assoc_rm_peer(asoc, peer);
 		break;
 	case SCTP_PARAM_SET_PRIMARY:
 		/* ADDIP Section 4.2.4
@@ -3297,8 +3316,7 @@ static void sctp_asconf_param_success(struct sctp_association *asoc,
 		local_bh_enable();
 		list_for_each_entry(transport, &asoc->peer.transport_addr_list,
 				transports) {
-			dst_release(transport->dst);
-			transport->dst = NULL;
+			sctp_transport_dst_release(transport);
 		}
 		break;
 	case SCTP_PARAM_DEL_IP:
@@ -3312,8 +3330,7 @@ static void sctp_asconf_param_success(struct sctp_association *asoc,
 		local_bh_enable();
 		list_for_each_entry(transport, &asoc->peer.transport_addr_list,
 				transports) {
-			dst_release(transport->dst);
-			transport->dst = NULL;
+			sctp_transport_dst_release(transport);
 		}
 		break;
 	default:

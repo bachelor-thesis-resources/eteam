@@ -95,11 +95,10 @@ static void afiucv_hs_callback_txnotify(struct sk_buff *, enum iucv_tx_notify);
 /* Call Back functions */
 static void iucv_callback_rx(struct iucv_path *, struct iucv_message *);
 static void iucv_callback_txdone(struct iucv_path *, struct iucv_message *);
-static void iucv_callback_connack(struct iucv_path *, u8 ipuser[16]);
-static int iucv_callback_connreq(struct iucv_path *, u8 ipvmid[8],
-				 u8 ipuser[16]);
-static void iucv_callback_connrej(struct iucv_path *, u8 ipuser[16]);
-static void iucv_callback_shutdown(struct iucv_path *, u8 ipuser[16]);
+static void iucv_callback_connack(struct iucv_path *, u8 *);
+static int iucv_callback_connreq(struct iucv_path *, u8 *, u8 *);
+static void iucv_callback_connrej(struct iucv_path *, u8 *);
+static void iucv_callback_shutdown(struct iucv_path *, u8 *);
 
 static struct iucv_sock_list iucv_sk_list = {
 	.lock = __RW_LOCK_UNLOCKED(iucv_sk_list.lock),
@@ -353,20 +352,28 @@ static int afiucv_hs_send(struct iucv_message *imsg, struct sock *sock,
 		memcpy(&phs_hdr->iucv_hdr, imsg, sizeof(struct iucv_message));
 
 	skb->dev = iucv->hs_dev;
-	if (!skb->dev)
-		return -ENODEV;
-	if (!(skb->dev->flags & IFF_UP) || !netif_carrier_ok(skb->dev))
-		return -ENETDOWN;
+	if (!skb->dev) {
+		err = -ENODEV;
+		goto err_free;
+	}
+	if (!(skb->dev->flags & IFF_UP) || !netif_carrier_ok(skb->dev)) {
+		err = -ENETDOWN;
+		goto err_free;
+	}
 	if (skb->len > skb->dev->mtu) {
-		if (sock->sk_type == SOCK_SEQPACKET)
-			return -EMSGSIZE;
-		else
-			skb_trim(skb, skb->dev->mtu);
+		if (sock->sk_type == SOCK_SEQPACKET) {
+			err = -EMSGSIZE;
+			goto err_free;
+		}
+		skb_trim(skb, skb->dev->mtu);
 	}
 	skb->protocol = ETH_P_AF_IUCV;
 	nskb = skb_clone(skb, GFP_ATOMIC);
-	if (!nskb)
-		return -ENOMEM;
+	if (!nskb) {
+		err = -ENOMEM;
+		goto err_free;
+	}
+
 	skb_queue_tail(&iucv->send_skb_q, nskb);
 	err = dev_queue_xmit(skb);
 	if (net_xmit_eval(err)) {
@@ -377,6 +384,10 @@ static int afiucv_hs_send(struct iucv_message *imsg, struct sock *sock,
 		WARN_ON(atomic_read(&iucv->msg_recv) < 0);
 	}
 	return net_xmit_eval(err);
+
+err_free:
+	kfree_skb(skb);
+	return err;
 }
 
 static struct sock *__iucv_get_sock_by_name(char *nm)
@@ -706,7 +717,8 @@ static int iucv_sock_bind(struct socket *sock, struct sockaddr *addr,
 	char uid[9];
 
 	/* Verify the input sockaddr */
-	if (!addr || addr->sa_family != AF_IUCV)
+	if (addr_len < sizeof(struct sockaddr_iucv) ||
+	    addr->sa_family != AF_IUCV)
 		return -EINVAL;
 
 	lock_sock(sk);
@@ -850,7 +862,7 @@ static int iucv_sock_connect(struct socket *sock, struct sockaddr *addr,
 	struct iucv_sock *iucv = iucv_sk(sk);
 	int err;
 
-	if (addr->sa_family != AF_IUCV || alen < sizeof(struct sockaddr_iucv))
+	if (alen < sizeof(struct sockaddr_iucv) || addr->sa_family != AF_IUCV)
 		return -EINVAL;
 
 	if (sk->sk_state != IUCV_OPEN && sk->sk_state != IUCV_BOUND)
@@ -1144,7 +1156,7 @@ static int iucv_sock_sendmsg(struct socket *sock, struct msghdr *msg,
 		err = afiucv_hs_send(&txmsg, sk, skb, 0);
 		if (err) {
 			atomic_dec(&iucv->msg_sent);
-			goto fail;
+			goto out;
 		}
 		goto release;
 	}
@@ -1484,7 +1496,7 @@ unsigned int iucv_sock_poll(struct file *file, struct socket *sock,
 	if (sock_writeable(sk) && iucv_below_msglim(sk))
 		mask |= POLLOUT | POLLWRNORM | POLLWRBAND;
 	else
-		set_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
+		sk_set_bit(SOCKWQ_ASYNC_NOSPACE, sk);
 
 	return mask;
 }
@@ -1513,7 +1525,8 @@ static int iucv_sock_shutdown(struct socket *sock, int how)
 		break;
 	}
 
-	if (how == SEND_SHUTDOWN || how == SHUTDOWN_MASK) {
+	if ((how == SEND_SHUTDOWN || how == SHUTDOWN_MASK) &&
+	    sk->sk_state == IUCV_CONNECTED) {
 		if (iucv->transport == AF_IUCV_TRANS_IUCV) {
 			txmsg.class = 0;
 			txmsg.tag = 0;
@@ -1723,7 +1736,7 @@ static int iucv_callback_connreq(struct iucv_path *path,
 	}
 
 	/* Create the new socket */
-	nsk = iucv_sock_alloc(NULL, sk->sk_type, GFP_ATOMIC, 0);
+	nsk = iucv_sock_alloc(NULL, sk->sk_protocol, GFP_ATOMIC, 0);
 	if (!nsk) {
 		err = pr_iucv->path_sever(path, user_data);
 		iucv_path_free(path);
@@ -1933,7 +1946,7 @@ static int afiucv_hs_callback_syn(struct sock *sk, struct sk_buff *skb)
 		goto out;
 	}
 
-	nsk = iucv_sock_alloc(NULL, sk->sk_type, GFP_ATOMIC, 0);
+	nsk = iucv_sock_alloc(NULL, sk->sk_protocol, GFP_ATOMIC, 0);
 	bh_lock_sock(sk);
 	if ((sk->sk_state != IUCV_LISTEN) ||
 	    sk_acceptq_is_full(sk) ||
@@ -2117,8 +2130,8 @@ static int afiucv_hs_rcv(struct sk_buff *skb, struct net_device *dev,
 	struct sock *sk;
 	struct iucv_sock *iucv;
 	struct af_iucv_trans_hdr *trans_hdr;
+	int err = NET_RX_SUCCESS;
 	char nullstring[8];
-	int err = 0;
 
 	skb_pull(skb, ETH_HLEN);
 	trans_hdr = (struct af_iucv_trans_hdr *)skb->data;
@@ -2202,7 +2215,7 @@ static int afiucv_hs_rcv(struct sk_buff *skb, struct net_device *dev,
 		err = afiucv_hs_callback_rx(sk, skb);
 		break;
 	default:
-		;
+		kfree_skb(skb);
 	}
 
 	return err;
@@ -2379,15 +2392,24 @@ static int afiucv_iucv_init(void)
 	af_iucv_dev->driver = &af_iucv_driver;
 	err = device_register(af_iucv_dev);
 	if (err)
-		goto out_driver;
+		goto out_iucv_dev;
 	return 0;
 
+out_iucv_dev:
+	put_device(af_iucv_dev);
 out_driver:
 	driver_unregister(&af_iucv_driver);
 out_iucv:
 	pr_iucv->iucv_unregister(&af_iucv_handler, 0);
 out:
 	return err;
+}
+
+static void afiucv_iucv_exit(void)
+{
+	device_unregister(af_iucv_dev);
+	driver_unregister(&af_iucv_driver);
+	pr_iucv->iucv_unregister(&af_iucv_handler, 0);
 }
 
 static int __init afiucv_init(void)
@@ -2423,11 +2445,18 @@ static int __init afiucv_init(void)
 		err = afiucv_iucv_init();
 		if (err)
 			goto out_sock;
-	} else
-		register_netdevice_notifier(&afiucv_netdev_notifier);
+	}
+
+	err = register_netdevice_notifier(&afiucv_netdev_notifier);
+	if (err)
+		goto out_notifier;
+
 	dev_add_pack(&iucv_packet_type);
 	return 0;
 
+out_notifier:
+	if (pr_iucv)
+		afiucv_iucv_exit();
 out_sock:
 	sock_unregister(PF_IUCV);
 out_proto:
@@ -2441,12 +2470,11 @@ out:
 static void __exit afiucv_exit(void)
 {
 	if (pr_iucv) {
-		device_unregister(af_iucv_dev);
-		driver_unregister(&af_iucv_driver);
-		pr_iucv->iucv_unregister(&af_iucv_handler, 0);
+		afiucv_iucv_exit();
 		symbol_put(iucv_if);
-	} else
-		unregister_netdevice_notifier(&afiucv_netdev_notifier);
+	}
+
+	unregister_netdevice_notifier(&afiucv_netdev_notifier);
 	dev_remove_pack(&iucv_packet_type);
 	sock_unregister(PF_IUCV);
 	proto_unregister(&iucv_proto);

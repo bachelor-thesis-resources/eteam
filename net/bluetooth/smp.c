@@ -23,6 +23,7 @@
 #include <linux/debugfs.h>
 #include <linux/crypto.h>
 #include <linux/scatterlist.h>
+#include <crypto/algapi.h>
 #include <crypto/b128ops.h>
 
 #include <net/bluetooth/bluetooth.h>
@@ -30,7 +31,7 @@
 #include <net/bluetooth/l2cap.h>
 #include <net/bluetooth/mgmt.h>
 
-#include "ecc.h"
+#include "ecdh_helper.h"
 #include "smp.h"
 
 #define SMP_DEV(hdev) \
@@ -495,7 +496,7 @@ static int smp_ah(struct crypto_blkcipher *tfm, const u8 irk[16],
 	}
 
 	/* The output of the random address function ah is:
-	 *	ah(h, r) = e(k, r') mod 2^24
+	 *	ah(k, r) = e(k, r') mod 2^24
 	 * The output of the security function e is then truncated to 24 bits
 	 * by taking the least significant 24 bits of the output of e as the
 	 * result of ah.
@@ -524,7 +525,7 @@ bool smp_irk_matches(struct hci_dev *hdev, const u8 irk[16],
 	if (err)
 		return false;
 
-	return !memcmp(bdaddr->b, hash, 3);
+	return !crypto_memneq(bdaddr->b, hash, 3);
 }
 
 int smp_generate_rpa(struct hci_dev *hdev, const u8 irk[16], bdaddr_t *rpa)
@@ -571,13 +572,13 @@ int smp_generate_oob(struct hci_dev *hdev, u8 hash[16], u8 rand[16])
 	} else {
 		while (true) {
 			/* Generate local key pair for Secure Connections */
-			if (!ecc_make_key(smp->local_pk, smp->local_sk))
+			if (!generate_ecdh_keys(smp->local_pk, smp->local_sk))
 				return -EIO;
 
 			/* This is unlikely, but we need to check that
 			 * we didn't accidentially generate a debug key.
 			 */
-			if (memcmp(smp->local_sk, debug_sk, 32))
+			if (crypto_memneq(smp->local_sk, debug_sk, 32))
 				break;
 		}
 		smp->debug_key = false;
@@ -811,7 +812,6 @@ static void smp_failure(struct l2cap_conn *conn, u8 reason)
 		smp_send_cmd(conn, SMP_CMD_PAIRING_FAIL, sizeof(reason),
 			     &reason);
 
-	clear_bit(HCI_CONN_ENCRYPT_PEND, &hcon->flags);
 	mgmt_auth_failed(hcon, HCI_ERROR_AUTH_FAILURE);
 
 	if (chan->data)
@@ -992,7 +992,7 @@ static u8 smp_random(struct smp_chan *smp)
 	if (ret)
 		return SMP_UNSPECIFIED;
 
-	if (memcmp(smp->pcnf, confirm, sizeof(smp->pcnf)) != 0) {
+	if (crypto_memneq(smp->pcnf, confirm, sizeof(smp->pcnf))) {
 		BT_ERR("Pairing failed (confirmation values mismatch)");
 		return SMP_CONFIRM_FAILED;
 	}
@@ -1046,8 +1046,24 @@ static void smp_notify_keys(struct l2cap_conn *conn)
 	struct smp_cmd_pairing *rsp = (void *) &smp->prsp[1];
 	bool persistent;
 
+	if (hcon->type == ACL_LINK) {
+		if (hcon->key_type == HCI_LK_DEBUG_COMBINATION)
+			persistent = false;
+		else
+			persistent = !test_bit(HCI_CONN_FLUSH_KEY,
+					       &hcon->flags);
+	} else {
+		/* The LTKs, IRKs and CSRKs should be persistent only if
+		 * both sides had the bonding bit set in their
+		 * authentication requests.
+		 */
+		persistent = !!((req->auth_req & rsp->auth_req) &
+				SMP_AUTH_BONDING);
+	}
+
 	if (smp->remote_irk) {
-		mgmt_new_irk(hdev, smp->remote_irk);
+		mgmt_new_irk(hdev, smp->remote_irk, persistent);
+
 		/* Now that user space can be considered to know the
 		 * identity address track the connection based on it
 		 * from now on (assuming this is an LE link).
@@ -1057,38 +1073,7 @@ static void smp_notify_keys(struct l2cap_conn *conn)
 			hcon->dst_type = smp->remote_irk->addr_type;
 			queue_work(hdev->workqueue, &conn->id_addr_update_work);
 		}
-
-		/* When receiving an indentity resolving key for
-		 * a remote device that does not use a resolvable
-		 * private address, just remove the key so that
-		 * it is possible to use the controller white
-		 * list for scanning.
-		 *
-		 * Userspace will have been told to not store
-		 * this key at this point. So it is safe to
-		 * just remove it.
-		 */
-		if (!bacmp(&smp->remote_irk->rpa, BDADDR_ANY)) {
-			list_del_rcu(&smp->remote_irk->list);
-			kfree_rcu(smp->remote_irk, rcu);
-			smp->remote_irk = NULL;
-		}
 	}
-
-	if (hcon->type == ACL_LINK) {
-		if (hcon->key_type == HCI_LK_DEBUG_COMBINATION)
-			persistent = false;
-		else
-			persistent = !test_bit(HCI_CONN_FLUSH_KEY,
-					       &hcon->flags);
-	} else {
-		/* The LTKs and CSRKs should be persistent only if both sides
-		 * had the bonding bit set in their authentication requests.
-		 */
-		persistent = !!((req->auth_req & rsp->auth_req) &
-				SMP_AUTH_BONDING);
-	}
-
 
 	if (smp->csrk) {
 		smp->csrk->bdaddr_type = hcon->dst_type;
@@ -1507,7 +1492,7 @@ static u8 sc_passkey_round(struct smp_chan *smp, u8 smp_op)
 			   smp->rrnd, r, cfm))
 			return SMP_UNSPECIFIED;
 
-		if (memcmp(smp->pcnf, cfm, 16))
+		if (crypto_memneq(smp->pcnf, cfm, 16))
 			return SMP_CONFIRM_FAILED;
 
 		smp->passkey_round++;
@@ -1885,13 +1870,13 @@ static u8 sc_send_public_key(struct smp_chan *smp)
 	} else {
 		while (true) {
 			/* Generate local key pair for Secure Connections */
-			if (!ecc_make_key(smp->local_pk, smp->local_sk))
+			if (!generate_ecdh_keys(smp->local_pk, smp->local_sk))
 				return SMP_UNSPECIFIED;
 
 			/* This is unlikely, but we need to check that
 			 * we didn't accidentially generate a debug key.
 			 */
-			if (memcmp(smp->local_sk, debug_sk, 32))
+			if (crypto_memneq(smp->local_sk, debug_sk, 32))
 				break;
 		}
 	}
@@ -2156,7 +2141,7 @@ static u8 smp_cmd_pairing_random(struct l2cap_conn *conn, struct sk_buff *skb)
 		if (err)
 			return SMP_UNSPECIFIED;
 
-		if (memcmp(smp->pcnf, cfm, 16))
+		if (crypto_memneq(smp->pcnf, cfm, 16))
 			return SMP_CONFIRM_FAILED;
 	} else {
 		smp_send_cmd(conn, SMP_CMD_PAIRING_RANDOM, sizeof(smp->prnd),
@@ -2266,8 +2251,14 @@ static u8 smp_cmd_security_req(struct l2cap_conn *conn, struct sk_buff *skb)
 	else
 		sec_level = authreq_to_seclevel(auth);
 
-	if (smp_sufficient_security(hcon, sec_level, SMP_USE_LTK))
+	if (smp_sufficient_security(hcon, sec_level, SMP_USE_LTK)) {
+		/* If link is already encrypted with sufficient security we
+		 * still need refresh encryption as per Core Spec 5.0 Vol 3,
+		 * Part H 2.4.6
+		 */
+		smp_ltk_encrypt(conn, hcon->sec_level);
 		return 0;
+	}
 
 	if (sec_level > hcon->pending_sec_level)
 		hcon->pending_sec_level = sec_level;
@@ -2311,12 +2302,6 @@ int smp_conn_security(struct hci_conn *hcon, __u8 sec_level)
 	if (!conn)
 		return 1;
 
-	chan = conn->smp;
-	if (!chan) {
-		BT_ERR("SMP security requested but not available");
-		return 1;
-	}
-
 	if (!hci_dev_test_flag(hcon->hdev, HCI_LE_ENABLED))
 		return 1;
 
@@ -2329,6 +2314,12 @@ int smp_conn_security(struct hci_conn *hcon, __u8 sec_level)
 	if (hcon->role == HCI_ROLE_MASTER)
 		if (smp_ltk_encrypt(conn, hcon->pending_sec_level))
 			return 0;
+
+	chan = conn->smp;
+	if (!chan) {
+		BT_ERR("SMP security requested but not available");
+		return 1;
+	}
 
 	l2cap_chan_lock(chan);
 
@@ -2378,6 +2369,53 @@ int smp_conn_security(struct hci_conn *hcon, __u8 sec_level)
 unlock:
 	l2cap_chan_unlock(chan);
 	return ret;
+}
+
+int smp_cancel_and_remove_pairing(struct hci_dev *hdev, bdaddr_t *bdaddr,
+				  u8 addr_type)
+{
+	struct hci_conn *hcon;
+	struct l2cap_conn *conn;
+	struct l2cap_chan *chan;
+	struct smp_chan *smp;
+	int err;
+
+	err = hci_remove_ltk(hdev, bdaddr, addr_type);
+	hci_remove_irk(hdev, bdaddr, addr_type);
+
+	hcon = hci_conn_hash_lookup_le(hdev, bdaddr, addr_type);
+	if (!hcon)
+		goto done;
+
+	conn = hcon->l2cap_data;
+	if (!conn)
+		goto done;
+
+	chan = conn->smp;
+	if (!chan)
+		goto done;
+
+	l2cap_chan_lock(chan);
+
+	smp = chan->data;
+	if (smp) {
+		/* Set keys to NULL to make sure smp_failure() does not try to
+		 * remove and free already invalidated rcu list entries. */
+		smp->ltk = NULL;
+		smp->slave_ltk = NULL;
+		smp->remote_irk = NULL;
+
+		if (test_bit(SMP_FLAG_COMPLETE, &smp->flags))
+			smp_failure(conn, 0);
+		else
+			smp_failure(conn, SMP_UNSPECIFIED);
+		err = 0;
+	}
+
+	l2cap_chan_unlock(chan);
+
+done:
+	return err;
 }
 
 static int smp_cmd_encrypt_info(struct l2cap_conn *conn, struct sk_buff *skb)
@@ -2491,6 +2529,19 @@ static int smp_cmd_ident_addr_info(struct l2cap_conn *conn,
 	if (!bacmp(&info->bdaddr, BDADDR_ANY) ||
 	    !hci_is_identity_address(&info->bdaddr, info->addr_type)) {
 		BT_ERR("Ignoring IRK with no identity address");
+		goto distribute;
+	}
+
+	/* Drop IRK if peer is using identity address during pairing but is
+	 * providing different address as identity information.
+	 *
+	 * Microsoft Surface Precision Mouse is known to have this bug.
+	 */
+	if (hci_is_identity_address(&hcon->dst, hcon->dst_type) &&
+	    (bacmp(&info->bdaddr, &hcon->dst) ||
+	     info->addr_type != hcon->dst_type)) {
+		bt_dev_err(hcon->hdev,
+			   "ignoring IRK with invalid identity address");
 		goto distribute;
 	}
 
@@ -2611,7 +2662,7 @@ static int smp_cmd_public_key(struct l2cap_conn *conn, struct sk_buff *skb)
 		if (err)
 			return SMP_UNSPECIFIED;
 
-		if (memcmp(cfm.confirm_val, smp->pcnf, 16))
+		if (crypto_memneq(cfm.confirm_val, smp->pcnf, 16))
 			return SMP_CONFIRM_FAILED;
 	}
 
@@ -2627,7 +2678,7 @@ static int smp_cmd_public_key(struct l2cap_conn *conn, struct sk_buff *skb)
 	SMP_DBG("Remote Public Key X: %32phN", smp->remote_pk);
 	SMP_DBG("Remote Public Key Y: %32phN", smp->remote_pk + 32);
 
-	if (!ecdh_shared_secret(smp->remote_pk, smp->local_sk, smp->dhkey))
+	if (!compute_ecdh_secret(smp->remote_pk, smp->local_sk, smp->dhkey))
 		return SMP_UNSPECIFIED;
 
 	SMP_DBG("DHKey %32phN", smp->dhkey);
@@ -2644,7 +2695,7 @@ static int smp_cmd_public_key(struct l2cap_conn *conn, struct sk_buff *skb)
 	else
 		hcon->pending_sec_level = BT_SECURITY_FIPS;
 
-	if (!memcmp(debug_pk, smp->remote_pk, 64))
+	if (!crypto_memneq(debug_pk, smp->remote_pk, 64))
 		set_bit(SMP_FLAG_DEBUG_KEY, &smp->flags);
 
 	if (smp->method == DSP_PASSKEY) {
@@ -2743,7 +2794,7 @@ static int smp_cmd_dhkey_check(struct l2cap_conn *conn, struct sk_buff *skb)
 	if (err)
 		return SMP_UNSPECIFIED;
 
-	if (memcmp(check->e, e, 16))
+	if (crypto_memneq(check->e, e, 16))
 		return SMP_DHKEY_CHECK_FAILED;
 
 	if (!hcon->out) {
@@ -3001,8 +3052,13 @@ static void smp_ready_cb(struct l2cap_chan *chan)
 
 	BT_DBG("chan %p", chan);
 
+	/* No need to call l2cap_chan_hold() here since we already own
+	 * the reference taken in smp_new_conn_cb(). This is just the
+	 * first time that we tie it to a specific pointer. The code in
+	 * l2cap_core.c ensures that there's no risk this function wont
+	 * get called if smp_new_conn_cb was previously called.
+	 */
 	conn->smp = chan;
-	l2cap_chan_hold(chan);
 
 	if (hcon->type == ACL_LINK && test_bit(HCI_CONN_ENCRYPT, &hcon->flags))
 		bredr_pairing(chan);
@@ -3448,7 +3504,7 @@ static int __init test_ah(struct crypto_blkcipher *tfm_aes)
 	if (err)
 		return err;
 
-	if (memcmp(res, exp, 3))
+	if (crypto_memneq(res, exp, 3))
 		return -EINVAL;
 
 	return 0;
@@ -3478,7 +3534,7 @@ static int __init test_c1(struct crypto_blkcipher *tfm_aes)
 	if (err)
 		return err;
 
-	if (memcmp(res, exp, 16))
+	if (crypto_memneq(res, exp, 16))
 		return -EINVAL;
 
 	return 0;
@@ -3503,7 +3559,7 @@ static int __init test_s1(struct crypto_blkcipher *tfm_aes)
 	if (err)
 		return err;
 
-	if (memcmp(res, exp, 16))
+	if (crypto_memneq(res, exp, 16))
 		return -EINVAL;
 
 	return 0;
@@ -3535,7 +3591,7 @@ static int __init test_f4(struct crypto_hash *tfm_cmac)
 	if (err)
 		return err;
 
-	if (memcmp(res, exp, 16))
+	if (crypto_memneq(res, exp, 16))
 		return -EINVAL;
 
 	return 0;
@@ -3569,10 +3625,10 @@ static int __init test_f5(struct crypto_hash *tfm_cmac)
 	if (err)
 		return err;
 
-	if (memcmp(mackey, exp_mackey, 16))
+	if (crypto_memneq(mackey, exp_mackey, 16))
 		return -EINVAL;
 
-	if (memcmp(ltk, exp_ltk, 16))
+	if (crypto_memneq(ltk, exp_ltk, 16))
 		return -EINVAL;
 
 	return 0;
@@ -3605,7 +3661,7 @@ static int __init test_f6(struct crypto_hash *tfm_cmac)
 	if (err)
 		return err;
 
-	if (memcmp(res, exp, 16))
+	if (crypto_memneq(res, exp, 16))
 		return -EINVAL;
 
 	return 0;
@@ -3659,7 +3715,7 @@ static int __init test_h6(struct crypto_hash *tfm_cmac)
 	if (err)
 		return err;
 
-	if (memcmp(res, exp, 16))
+	if (crypto_memneq(res, exp, 16))
 		return -EINVAL;
 
 	return 0;
