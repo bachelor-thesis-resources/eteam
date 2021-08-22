@@ -240,7 +240,8 @@ static ssize_t keymap_show(struct kobject *kobj, struct kobj_attribute *attr,
 	cp += sprintf(cp, "%d, %d, %d,\n", KEY_MAP_VER, num_keys, nstates);
 	cp1 += 2; /* now pointing at shift states */
 	/* dump num_keys+1 as first row is shift states + flags,
-	 * each subsequent row is key + states */
+	 * each subsequent row is key + states
+	 */
 	for (n = 0; n <= num_keys; n++) {
 		for (i = 0; i <= nstates; i++) {
 			ch = *cp1++;
@@ -367,7 +368,7 @@ static ssize_t synth_show(struct kobject *kobj, struct kobj_attribute *attr,
 {
 	int rv;
 
-	if (synth == NULL)
+	if (!synth)
 		rv = sprintf(buf, "%s\n", "none");
 	else
 		rv = sprintf(buf, "%s\n", synth->name);
@@ -386,7 +387,7 @@ static ssize_t synth_store(struct kobject *kobj, struct kobj_attribute *attr,
 	len = strlen(buf);
 	if (len < 2 || len > 9)
 		return -EINVAL;
-	strncpy(new_synth_name, buf, len);
+	memcpy(new_synth_name, buf, len);
 	if (new_synth_name[len - 1] == '\n')
 		len--;
 	new_synth_name[len] = '\0';
@@ -458,14 +459,14 @@ static ssize_t punc_show(struct kobject *kobj, struct kobj_attribute *attr,
 	unsigned long flags;
 
 	p_header = spk_var_header_by_name(attr->attr.name);
-	if (p_header == NULL) {
+	if (!p_header) {
 		pr_warn("p_header is null, attr->attr.name is %s\n",
 			attr->attr.name);
 		return -EINVAL;
 	}
 
 	var = spk_get_punc_var(p_header->var_id);
-	if (var == NULL) {
+	if (!var) {
 		pr_warn("var is null, p_header->var_id is %i\n",
 				p_header->var_id);
 		return -EINVAL;
@@ -500,20 +501,20 @@ static ssize_t punc_store(struct kobject *kobj, struct kobj_attribute *attr,
 		return -EINVAL;
 
 	p_header = spk_var_header_by_name(attr->attr.name);
-	if (p_header == NULL) {
+	if (!p_header) {
 		pr_warn("p_header is null, attr->attr.name is %s\n",
 			attr->attr.name);
 		return -EINVAL;
 	}
 
 	var = spk_get_punc_var(p_header->var_id);
-	if (var == NULL) {
+	if (!var) {
 		pr_warn("var is null, p_header->var_id is %i\n",
 				p_header->var_id);
 		return -EINVAL;
 	}
 
-	strncpy(punc_buf, buf, x);
+	memcpy(punc_buf, buf, x);
 
 	while (x && punc_buf[x - 1] == '\n')
 		x--;
@@ -545,7 +546,7 @@ ssize_t spk_var_show(struct kobject *kobj, struct kobj_attribute *attr,
 	unsigned long flags;
 
 	param = spk_var_header_by_name(attr->attr.name);
-	if (param == NULL)
+	if (!param)
 		return -EINVAL;
 
 	spin_lock_irqsave(&speakup_info.spinlock, flags);
@@ -621,9 +622,9 @@ ssize_t spk_var_store(struct kobject *kobj, struct kobj_attribute *attr,
 	unsigned long flags;
 
 	param = spk_var_header_by_name(attr->attr.name);
-	if (param == NULL)
+	if (!param)
 		return -EINVAL;
-	if (param->data == NULL)
+	if (!param->data)
 		return 0;
 	ret = 0;
 	cp = (char *)buf;
@@ -830,7 +831,9 @@ static ssize_t message_show(struct kobject *kobj,
 	struct msg_group_t *group = spk_find_msg_group(attr->attr.name);
 	unsigned long flags;
 
-	BUG_ON(!group);
+	if (WARN_ON(!group))
+		return -EINVAL;
+
 	spin_lock_irqsave(&speakup_info.spinlock, flags);
 	retval = message_show_helper(buf, group->start, group->end);
 	spin_unlock_irqrestore(&speakup_info.spinlock, flags);
@@ -842,7 +845,9 @@ static ssize_t message_store(struct kobject *kobj, struct kobj_attribute *attr,
 {
 	struct msg_group_t *group = spk_find_msg_group(attr->attr.name);
 
-	BUG_ON(!group);
+	if (WARN_ON(!group))
+		return -EINVAL;
+
 	return message_store_helper(buf, count, group);
 }
 

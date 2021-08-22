@@ -62,7 +62,7 @@ static struct ad7780_state *ad_sigma_delta_to_ad7780(struct ad_sigma_delta *sd)
 }
 
 static int ad7780_set_mode(struct ad_sigma_delta *sigma_delta,
-	enum ad_sigma_delta_mode mode)
+			   enum ad_sigma_delta_mode mode)
 {
 	struct ad7780_state *st = ad_sigma_delta_to_ad7780(sigma_delta);
 	unsigned val;
@@ -90,12 +90,16 @@ static int ad7780_read_raw(struct iio_dev *indio_dev,
 			   long m)
 {
 	struct ad7780_state *st = iio_priv(indio_dev);
+	int voltage_uv;
 
 	switch (m) {
 	case IIO_CHAN_INFO_RAW:
 		return ad_sigma_delta_single_conversion(indio_dev, chan, val);
 	case IIO_CHAN_INFO_SCALE:
-		*val = st->int_vref_mv * st->gain;
+		voltage_uv = regulator_get_voltage(st->reg);
+		if (voltage_uv < 0)
+			return voltage_uv;
+		*val = (voltage_uv / 1000) * st->gain;
 		*val2 = chan->scan_type.realbits - 1;
 		return IIO_VAL_FRACTIONAL_LOG2;
 	case IIO_CHAN_INFO_OFFSET:
@@ -107,13 +111,13 @@ static int ad7780_read_raw(struct iio_dev *indio_dev,
 }
 
 static int ad7780_postprocess_sample(struct ad_sigma_delta *sigma_delta,
-	unsigned int raw_sample)
+				     unsigned int raw_sample)
 {
 	struct ad7780_state *st = ad_sigma_delta_to_ad7780(sigma_delta);
 	const struct ad7780_chip_info *chip_info = st->chip_info;
 
 	if ((raw_sample & AD7780_ERR) ||
-		((raw_sample & chip_info->pattern_mask) != chip_info->pattern))
+	    ((raw_sample & chip_info->pattern_mask) != chip_info->pattern))
 		return -EIO;
 
 	if (raw_sample & AD7780_GAIN)
@@ -206,9 +210,10 @@ static int ad7780_probe(struct spi_device *spi)
 	indio_dev->info = &ad7780_info;
 
 	if (pdata && gpio_is_valid(pdata->gpio_pdrst)) {
-
-		ret = devm_gpio_request_one(&spi->dev, pdata->gpio_pdrst,
-					GPIOF_OUT_INIT_LOW, "AD7780 /PDRST");
+		ret = devm_gpio_request_one(&spi->dev,
+					    pdata->gpio_pdrst,
+					    GPIOF_OUT_INIT_LOW,
+					    "AD7780 /PDRST");
 		if (ret) {
 			dev_err(&spi->dev, "failed to request GPIO PDRST\n");
 			goto error_disable_reg;
@@ -263,7 +268,6 @@ MODULE_DEVICE_TABLE(spi, ad7780_id);
 static struct spi_driver ad7780_driver = {
 	.driver = {
 		.name	= "ad7780",
-		.owner	= THIS_MODULE,
 	},
 	.probe		= ad7780_probe,
 	.remove		= ad7780_remove,

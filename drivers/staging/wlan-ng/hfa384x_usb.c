@@ -530,12 +530,7 @@ static void hfa384x_usb_defer(struct work_struct *data)
 ----------------------------------------------------------------*/
 void hfa384x_create(hfa384x_t *hw, struct usb_device *usb)
 {
-	memset(hw, 0, sizeof(hfa384x_t));
 	hw->usb = usb;
-
-	/* set up the endpoints */
-	hw->endp_in = usb_rcvbulkpipe(usb, 1);
-	hw->endp_out = usb_sndbulkpipe(usb, 2);
 
 	/* Set up the waitq */
 	init_waitqueue_head(&hw->cmdq);
@@ -1194,7 +1189,7 @@ int hfa384x_cmd_download(hfa384x_t *hw, u16 mode, u16 lowaddr,
 ----------------------------------------------------------------*/
 int hfa384x_corereset(hfa384x_t *hw, int holdtime, int settletime, int genesis)
 {
-	int result = 0;
+	int result;
 
 	result = usb_reset_device(hw->usb);
 	if (result < 0) {
@@ -3574,6 +3569,8 @@ static void hfa384x_int_rxmonitor(wlandevice_t *wlandev,
 	     WLAN_HDR_A4_LEN + WLAN_DATA_MAXLEN + WLAN_CRC_LEN)) {
 		pr_debug("overlen frm: len=%zd\n",
 			 skblen - sizeof(struct p80211_caphdr));
+
+		return;
 	}
 
 	skb = dev_alloc_skb(skblen);

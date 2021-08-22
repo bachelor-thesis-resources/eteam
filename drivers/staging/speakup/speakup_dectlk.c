@@ -51,7 +51,7 @@ static unsigned char get_index(void);
 static int in_escape;
 static int is_flushing;
 
-static spinlock_t flush_lock;
+static DEFINE_SPINLOCK(flush_lock);
 static DECLARE_WAIT_QUEUE_HEAD(flush);
 
 static struct var_t vars[] = {
@@ -291,10 +291,9 @@ static void do_catch_up(struct spk_synth *synth)
 
 static void synth_flush(struct spk_synth *synth)
 {
-	if (in_escape) {
+	if (in_escape)
 		/* if in command output ']' so we don't get an error */
 		spk_serial_out(']');
-	}
 	in_escape = 0;
 	is_flushing = 1;
 	spk_serial_out(SYNTH_CLEAR);
