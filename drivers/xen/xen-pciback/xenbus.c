@@ -44,7 +44,6 @@ static struct xen_pcibk_device *alloc_pdev(struct xenbus_device *xdev)
 	dev_dbg(&xdev->dev, "allocated pdev @ 0x%p\n", pdev);
 
 	pdev->xdev = xdev;
-	dev_set_drvdata(&xdev->dev, pdev);
 
 	mutex_init(&pdev->dev_lock);
 
@@ -58,6 +57,9 @@ static struct xen_pcibk_device *alloc_pdev(struct xenbus_device *xdev)
 		kfree(pdev);
 		pdev = NULL;
 	}
+
+	dev_set_drvdata(&xdev->dev, pdev);
+
 out:
 	return pdev;
 }
@@ -122,7 +124,7 @@ static int xen_pcibk_do_attach(struct xen_pcibk_device *pdev, int gnt_ref,
 
 	pdev->sh_info = vaddr;
 
-	err = bind_interdomain_evtchn_to_irqhandler(
+	err = bind_interdomain_evtchn_to_irqhandler_lateeoi(
 		pdev->xdev->otherend_id, remote_evtchn, xen_pcibk_handle_event,
 		0, DRV_NAME, pdev);
 	if (err < 0) {
@@ -689,7 +691,7 @@ static int xen_pcibk_xenbus_probe(struct xenbus_device *dev,
 
 	/* watch the backend node for backend configuration information */
 	err = xenbus_watch_path(dev, dev->nodename, &pdev->be_watch,
-				xen_pcibk_be_watch);
+				NULL, xen_pcibk_be_watch);
 	if (err)
 		goto out;
 

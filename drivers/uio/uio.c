@@ -249,6 +249,8 @@ static struct class uio_class = {
 	.dev_groups = uio_groups,
 };
 
+bool uio_class_registered;
+
 /*
  * device functions
  */
@@ -524,6 +526,7 @@ static ssize_t uio_read(struct file *filep, char __user *buf,
 
 		event_count = atomic_read(&idev->event);
 		if (event_count != listener->event_count) {
+			__set_current_state(TASK_RUNNING);
 			if (copy_to_user(buf, &event_count, count))
 				retval = -EFAULT;
 			else {
@@ -771,6 +774,9 @@ static int init_uio_class(void)
 		printk(KERN_ERR "class_register failed for uio\n");
 		goto err_class_register;
 	}
+
+	uio_class_registered = true;
+
 	return 0;
 
 err_class_register:
@@ -781,6 +787,7 @@ exit:
 
 static void release_uio_class(void)
 {
+	uio_class_registered = false;
 	class_unregister(&uio_class);
 	uio_major_cleanup();
 }
@@ -799,6 +806,9 @@ int __uio_register_device(struct module *owner,
 {
 	struct uio_device *idev;
 	int ret = 0;
+
+	if (!uio_class_registered)
+		return -EPROBE_DEFER;
 
 	if (!parent || !info || !info->name || !info->version)
 		return -EINVAL;
@@ -845,8 +855,10 @@ int __uio_register_device(struct module *owner,
 		 */
 		ret = request_irq(info->irq, uio_interrupt,
 				  info->irq_flags, info->name, idev);
-		if (ret)
+		if (ret) {
+			info->uio_dev = NULL;
 			goto err_request_irq;
+		}
 	}
 
 	return 0;
@@ -896,6 +908,7 @@ static int __init uio_init(void)
 static void __exit uio_exit(void)
 {
 	release_uio_class();
+	idr_destroy(&uio_idr);
 }
 
 module_init(uio_init)

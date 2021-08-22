@@ -158,8 +158,8 @@ static unsigned int cy_isa_addresses[] = {
 static long maddr[NR_CARDS];
 static int irq[NR_CARDS];
 
-module_param_array(maddr, long, NULL, 0);
-module_param_array(irq, int, NULL, 0);
+module_param_hw_array(maddr, long, iomem, NULL, 0);
+module_param_hw_array(irq, int, irq, NULL, 0);
 
 #endif				/* CONFIG_ISA */
 
@@ -1575,15 +1575,6 @@ static int cy_open(struct tty_struct *tty, struct file *filp)
 	printk(KERN_DEBUG "cyc:cy_open (%d): incrementing count to %d\n",
 		current->pid, info->port.count);
 #endif
-
-	/*
-	 * If the port is the middle of closing, bail out now
-	 */
-	if (info->port.flags & ASYNC_CLOSING) {
-		wait_event_interruptible_tty(tty, info->port.close_wait,
-				!(info->port.flags & ASYNC_CLOSING));
-		return (info->port.flags & ASYNC_HUP_NOTIFY) ? -EAGAIN: -ERESTARTSYS;
-	}
 
 	/*
 	 * Start up serial port

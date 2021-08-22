@@ -28,6 +28,7 @@
 #include <scsi/scsi_device.h>
 #include <scsi/scsi_cmnd.h>
 #include <scsi/scsi_tcq.h>
+#include <scsi/scsi_devinfo.h>
 #include <linux/seqlock.h>
 
 #define VIRTIO_SCSI_MEMPOOL_SZ 64
@@ -533,7 +534,9 @@ static int virtscsi_queuecommand(struct virtio_scsi *vscsi,
 {
 	struct Scsi_Host *shost = virtio_scsi_host(vscsi->vdev);
 	struct virtio_scsi_cmd *cmd = scsi_cmd_priv(sc);
+	unsigned long flags;
 	int req_size;
+	int ret;
 
 	BUG_ON(scsi_sg_count(sc) > shost->sg_tablesize);
 
@@ -561,8 +564,19 @@ static int virtscsi_queuecommand(struct virtio_scsi *vscsi,
 		req_size = sizeof(cmd->req.cmd);
 	}
 
-	if (virtscsi_kick_cmd(req_vq, cmd, req_size, sizeof(cmd->resp.cmd)) != 0)
+	ret = virtscsi_kick_cmd(req_vq, cmd, req_size, sizeof(cmd->resp.cmd));
+	if (ret == -EIO) {
+		cmd->resp.cmd.response = VIRTIO_SCSI_S_BAD_TARGET;
+		spin_lock_irqsave(&req_vq->vq_lock, flags);
+		virtscsi_complete_cmd(vscsi, cmd);
+		spin_unlock_irqrestore(&req_vq->vq_lock, flags);
+	} else if (ret != 0) {
+		/* The SCSI command requeue will increment 'tgt->reqs' again. */
+		struct virtio_scsi_target_state *tgt =
+				scsi_target(sc->device)->hostdata;
+		atomic_dec(&tgt->reqs);
 		return SCSI_MLQUEUE_HOST_BUSY;
+	}
 	return 0;
 }
 
@@ -578,11 +592,12 @@ static int virtscsi_queuecommand_single(struct Scsi_Host *sh,
 }
 
 static struct virtio_scsi_vq *virtscsi_pick_vq_mq(struct virtio_scsi *vscsi,
-						  struct scsi_cmnd *sc)
+						  struct virtio_scsi_target_state *tgt, struct scsi_cmnd *sc)
 {
 	u32 tag = blk_mq_unique_tag(sc->request);
 	u16 hwq = blk_mq_unique_tag_to_hwq(tag);
 
+	atomic_inc(&tgt->reqs);
 	return &vscsi->req_vqs[hwq];
 }
 
@@ -632,7 +647,7 @@ static int virtscsi_queuecommand_multi(struct Scsi_Host *sh,
 	struct virtio_scsi_vq *req_vq;
 
 	if (shost_use_blk_mq(sh))
-		req_vq = virtscsi_pick_vq_mq(vscsi, sc);
+		req_vq = virtscsi_pick_vq_mq(vscsi, tgt, sc);
 	else
 		req_vq = virtscsi_pick_vq(vscsi, tgt);
 
@@ -682,7 +697,6 @@ static int virtscsi_device_reset(struct scsi_cmnd *sc)
 		return FAILED;
 
 	memset(cmd, 0, sizeof(*cmd));
-	cmd->sc = sc;
 	cmd->req.tmf = (struct virtio_scsi_ctrl_tmf_req){
 		.type = VIRTIO_SCSI_T_TMF,
 		.subtype = cpu_to_virtio32(vscsi->vdev,
@@ -694,6 +708,28 @@ static int virtscsi_device_reset(struct scsi_cmnd *sc)
 	};
 	return virtscsi_tmf(vscsi, cmd);
 }
+
+static int virtscsi_device_alloc(struct scsi_device *sdevice)
+{
+	/*
+	 * Passed through SCSI targets (e.g. with qemu's 'scsi-block')
+	 * may have transfer limits which come from the host SCSI
+	 * controller or something on the host side other than the
+	 * target itself.
+	 *
+	 * To make this work properly, the hypervisor can adjust the
+	 * target's VPD information to advertise these limits.  But
+	 * for that to work, the guest has to look at the VPD pages,
+	 * which we won't do by default if it is an SPC-2 device, even
+	 * if it does actually support it.
+	 *
+	 * So, set the blist to always try to read the VPD pages.
+	 */
+	sdevice->sdev_bflags = BLIST_TRY_VPD_PAGES;
+
+	return 0;
+}
+
 
 /**
  * virtscsi_change_queue_depth() - Change a virtscsi target's queue depth
@@ -719,7 +755,6 @@ static int virtscsi_abort(struct scsi_cmnd *sc)
 		return FAILED;
 
 	memset(cmd, 0, sizeof(*cmd));
-	cmd->sc = sc;
 	cmd->req.tmf = (struct virtio_scsi_ctrl_tmf_req){
 		.type = VIRTIO_SCSI_T_TMF,
 		.subtype = VIRTIO_SCSI_T_TMF_ABORT_TASK,
@@ -753,6 +788,10 @@ static int virtscsi_target_alloc(struct scsi_target *starget)
 static void virtscsi_target_destroy(struct scsi_target *starget)
 {
 	struct virtio_scsi_target_state *tgt = starget->hostdata;
+
+	/* we can race with concurrent virtscsi_complete_cmd */
+	while (atomic_read(&tgt->reqs))
+		cpu_relax();
 	kfree(tgt);
 }
 
@@ -766,6 +805,7 @@ static struct scsi_host_template virtscsi_host_template_single = {
 	.change_queue_depth = virtscsi_change_queue_depth,
 	.eh_abort_handler = virtscsi_abort,
 	.eh_device_reset_handler = virtscsi_device_reset,
+	.slave_alloc = virtscsi_device_alloc,
 
 	.can_queue = 1024,
 	.dma_boundary = UINT_MAX,
@@ -786,6 +826,7 @@ static struct scsi_host_template virtscsi_host_template_multi = {
 	.eh_abort_handler = virtscsi_abort,
 	.eh_device_reset_handler = virtscsi_device_reset,
 
+	.slave_alloc = virtscsi_device_alloc,
 	.can_queue = 1024,
 	.dma_boundary = UINT_MAX,
 	.use_clustering = ENABLE_CLUSTERING,

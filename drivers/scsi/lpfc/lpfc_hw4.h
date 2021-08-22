@@ -1182,6 +1182,7 @@ struct lpfc_mbx_wq_create {
 #define lpfc_mbx_wq_create_page_size_SHIFT	0
 #define lpfc_mbx_wq_create_page_size_MASK	0x000000FF
 #define lpfc_mbx_wq_create_page_size_WORD	word1
+#define LPFC_WQ_PAGE_SIZE_4096	0x1
 #define lpfc_mbx_wq_create_wqe_size_SHIFT	8
 #define lpfc_mbx_wq_create_wqe_size_MASK	0x0000000F
 #define lpfc_mbx_wq_create_wqe_size_WORD	word1
@@ -1253,6 +1254,7 @@ struct rq_context {
 #define lpfc_rq_context_page_size_SHIFT	0		/* Version 1 Only */
 #define lpfc_rq_context_page_size_MASK	0x000000FF
 #define lpfc_rq_context_page_size_WORD	word0
+#define	LPFC_RQ_PAGE_SIZE_4096	0x1
 	uint32_t reserved1;
 	uint32_t word2;
 #define lpfc_rq_context_cq_id_SHIFT	16
@@ -3178,7 +3180,7 @@ struct lpfc_mbx_get_port_name {
 #define MB_CEQ_STATUS_QUEUE_FLUSHING		0x4
 #define MB_CQE_STATUS_DMA_FAILED		0x5
 
-#define LPFC_MBX_WR_CONFIG_MAX_BDE		8
+#define LPFC_MBX_WR_CONFIG_MAX_BDE		1
 struct lpfc_mbx_wr_object {
 	struct mbox_header header;
 	union {
@@ -3317,6 +3319,7 @@ struct lpfc_acqe_link {
 #define LPFC_ASYNC_LINK_SPEED_20GBPS		0x5
 #define LPFC_ASYNC_LINK_SPEED_25GBPS		0x6
 #define LPFC_ASYNC_LINK_SPEED_40GBPS		0x7
+#define LPFC_ASYNC_LINK_SPEED_100GBPS		0x8
 #define lpfc_acqe_link_duplex_SHIFT		16
 #define lpfc_acqe_link_duplex_MASK		0x000000FF
 #define lpfc_acqe_link_duplex_WORD		word0
@@ -3447,23 +3450,50 @@ struct lpfc_acqe_fc_la {
 struct lpfc_acqe_misconfigured_event {
 	struct {
 	uint32_t word0;
-#define lpfc_sli_misconfigured_port0_SHIFT	0
-#define lpfc_sli_misconfigured_port0_MASK	0x000000FF
-#define lpfc_sli_misconfigured_port0_WORD	word0
-#define lpfc_sli_misconfigured_port1_SHIFT	8
-#define lpfc_sli_misconfigured_port1_MASK	0x000000FF
-#define lpfc_sli_misconfigured_port1_WORD	word0
-#define lpfc_sli_misconfigured_port2_SHIFT	16
-#define lpfc_sli_misconfigured_port2_MASK	0x000000FF
-#define lpfc_sli_misconfigured_port2_WORD	word0
-#define lpfc_sli_misconfigured_port3_SHIFT	24
-#define lpfc_sli_misconfigured_port3_MASK	0x000000FF
-#define lpfc_sli_misconfigured_port3_WORD	word0
+#define lpfc_sli_misconfigured_port0_state_SHIFT	0
+#define lpfc_sli_misconfigured_port0_state_MASK		0x000000FF
+#define lpfc_sli_misconfigured_port0_state_WORD		word0
+#define lpfc_sli_misconfigured_port1_state_SHIFT	8
+#define lpfc_sli_misconfigured_port1_state_MASK		0x000000FF
+#define lpfc_sli_misconfigured_port1_state_WORD		word0
+#define lpfc_sli_misconfigured_port2_state_SHIFT	16
+#define lpfc_sli_misconfigured_port2_state_MASK		0x000000FF
+#define lpfc_sli_misconfigured_port2_state_WORD		word0
+#define lpfc_sli_misconfigured_port3_state_SHIFT	24
+#define lpfc_sli_misconfigured_port3_state_MASK		0x000000FF
+#define lpfc_sli_misconfigured_port3_state_WORD		word0
+	uint32_t word1;
+#define lpfc_sli_misconfigured_port0_op_SHIFT		0
+#define lpfc_sli_misconfigured_port0_op_MASK		0x00000001
+#define lpfc_sli_misconfigured_port0_op_WORD		word1
+#define lpfc_sli_misconfigured_port0_severity_SHIFT	1
+#define lpfc_sli_misconfigured_port0_severity_MASK	0x00000003
+#define lpfc_sli_misconfigured_port0_severity_WORD	word1
+#define lpfc_sli_misconfigured_port1_op_SHIFT		8
+#define lpfc_sli_misconfigured_port1_op_MASK		0x00000001
+#define lpfc_sli_misconfigured_port1_op_WORD		word1
+#define lpfc_sli_misconfigured_port1_severity_SHIFT	9
+#define lpfc_sli_misconfigured_port1_severity_MASK	0x00000003
+#define lpfc_sli_misconfigured_port1_severity_WORD	word1
+#define lpfc_sli_misconfigured_port2_op_SHIFT		16
+#define lpfc_sli_misconfigured_port2_op_MASK		0x00000001
+#define lpfc_sli_misconfigured_port2_op_WORD		word1
+#define lpfc_sli_misconfigured_port2_severity_SHIFT	17
+#define lpfc_sli_misconfigured_port2_severity_MASK	0x00000003
+#define lpfc_sli_misconfigured_port2_severity_WORD	word1
+#define lpfc_sli_misconfigured_port3_op_SHIFT		24
+#define lpfc_sli_misconfigured_port3_op_MASK		0x00000001
+#define lpfc_sli_misconfigured_port3_op_WORD		word1
+#define lpfc_sli_misconfigured_port3_severity_SHIFT	25
+#define lpfc_sli_misconfigured_port3_severity_MASK	0x00000003
+#define lpfc_sli_misconfigured_port3_severity_WORD	word1
 	} theEvent;
 #define LPFC_SLI_EVENT_STATUS_VALID			0x00
 #define LPFC_SLI_EVENT_STATUS_NOT_PRESENT	0x01
 #define LPFC_SLI_EVENT_STATUS_WRONG_TYPE	0x02
 #define LPFC_SLI_EVENT_STATUS_UNSUPPORTED	0x03
+#define LPFC_SLI_EVENT_STATUS_UNQUALIFIED	0x04
+#define LPFC_SLI_EVENT_STATUS_UNCERTIFIED	0x05
 };
 
 struct lpfc_acqe_sli {

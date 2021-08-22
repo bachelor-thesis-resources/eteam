@@ -1349,6 +1349,7 @@ static int esp_data_bytes_sent(struct esp *esp, struct esp_cmd_entry *ent,
 
 	bytes_sent = esp->data_dma_len;
 	bytes_sent -= ecount;
+	bytes_sent -= esp->send_cmd_residual;
 
 	/*
 	 * The am53c974 has a DMA 'pecularity'. The doc states:
@@ -2694,7 +2695,6 @@ struct scsi_host_template scsi_esp_template = {
 	.use_clustering		= ENABLE_CLUSTERING,
 	.max_sectors		= 0xffff,
 	.skip_settle_delay	= 1,
-	.use_blk_tags		= 1,
 };
 EXPORT_SYMBOL(scsi_esp_template);
 

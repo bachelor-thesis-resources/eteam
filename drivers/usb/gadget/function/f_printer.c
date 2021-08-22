@@ -35,6 +35,7 @@
 #include <linux/types.h>
 #include <linux/ctype.h>
 #include <linux/cdev.h>
+#include <linux/kref.h>
 
 #include <asm/byteorder.h>
 #include <linux/io.h>
@@ -69,7 +70,7 @@ struct printer_dev {
 	struct usb_gadget	*gadget;
 	s8			interface;
 	struct usb_ep		*in_ep, *out_ep;
-
+	struct kref             kref;
 	struct list_head	rx_reqs;	/* List of free RX structs */
 	struct list_head	rx_reqs_active;	/* List of Active RX xfers */
 	struct list_head	rx_buffers;	/* List of completed xfers */
@@ -161,14 +162,6 @@ static struct usb_endpoint_descriptor hs_ep_out_desc = {
 	.wMaxPacketSize =	cpu_to_le16(512)
 };
 
-static struct usb_qualifier_descriptor dev_qualifier = {
-	.bLength =		sizeof(dev_qualifier),
-	.bDescriptorType =	USB_DT_DEVICE_QUALIFIER,
-	.bcdUSB =		cpu_to_le16(0x0200),
-	.bDeviceClass =		USB_CLASS_PRINTER,
-	.bNumConfigurations =	1
-};
-
 static struct usb_descriptor_header *hs_printer_function[] = {
 	(struct usb_descriptor_header *) &intf_desc,
 	(struct usb_descriptor_header *) &hs_ep_in_desc,
@@ -230,6 +223,13 @@ static inline struct usb_endpoint_descriptor *ep_desc(struct usb_gadget *gadget,
 }
 
 /*-------------------------------------------------------------------------*/
+
+static void printer_dev_free(struct kref *kref)
+{
+	struct printer_dev *dev = container_of(kref, struct printer_dev, kref);
+
+	kfree(dev);
+}
 
 static struct usb_request *
 printer_req_alloc(struct usb_ep *ep, unsigned len, gfp_t gfp_flags)
@@ -361,6 +361,7 @@ printer_open(struct inode *inode, struct file *fd)
 
 	spin_unlock_irqrestore(&dev->lock, flags);
 
+	kref_get(&dev->kref);
 	DBG(dev, "printer_open returned %x\n", ret);
 	return ret;
 }
@@ -378,6 +379,7 @@ printer_close(struct inode *inode, struct file *fd)
 	dev->printer_status &= ~PRINTER_SELECTED;
 	spin_unlock_irqrestore(&dev->lock, flags);
 
+	kref_put(&dev->kref, printer_dev_free);
 	DBG(dev, "printer_close\n");
 
 	return 0;
@@ -804,6 +806,8 @@ done:
 
 static void printer_reset_interface(struct printer_dev *dev)
 {
+	unsigned long	flags;
+
 	if (dev->interface < 0)
 		return;
 
@@ -815,9 +819,11 @@ static void printer_reset_interface(struct printer_dev *dev)
 	if (dev->out_ep->desc)
 		usb_ep_disable(dev->out_ep);
 
+	spin_lock_irqsave(&dev->lock, flags);
 	dev->in_ep->desc = NULL;
 	dev->out_ep->desc = NULL;
 	dev->interface = -1;
+	spin_unlock_irqrestore(&dev->lock, flags);
 }
 
 /* Change our operational Interface. */
@@ -1035,12 +1041,10 @@ autoconf_fail:
 			cdev->gadget->name);
 		return -ENODEV;
 	}
-	in_ep->driver_data = in_ep;	/* claim */
 
 	out_ep = usb_ep_autoconfig(cdev->gadget, &fs_ep_out_desc);
 	if (!out_ep)
 		goto autoconf_fail;
-	out_ep->driver_data = out_ep;	/* claim */
 
 	/* assumes that all endpoints are dual-speed */
 	hs_ep_in_desc.bEndpointAddress = fs_ep_in_desc.bEndpointAddress;
@@ -1112,6 +1116,7 @@ fail_tx_reqs:
 		printer_req_free(dev->in_ep, req);
 	}
 
+	usb_free_all_descriptors(f);
 	return ret;
 
 }
@@ -1131,13 +1136,10 @@ static int printer_func_set_alt(struct usb_function *f,
 static void printer_func_disable(struct usb_function *f)
 {
 	struct printer_dev *dev = func_to_printer(f);
-	unsigned long		flags;
 
 	DBG(dev, "%s\n", __func__);
 
-	spin_lock_irqsave(&dev->lock, flags);
 	printer_reset_interface(dev);
-	spin_unlock_irqrestore(&dev->lock, flags);
 }
 
 static inline struct f_printer_opts
@@ -1146,9 +1148,6 @@ static inline struct f_printer_opts
 	return container_of(to_config_group(item), struct f_printer_opts,
 			    func_inst.group);
 }
-
-CONFIGFS_ATTR_STRUCT(f_printer_opts);
-CONFIGFS_ATTR_OPS(f_printer_opts);
 
 static void printer_attr_release(struct config_item *item)
 {
@@ -1159,13 +1158,12 @@ static void printer_attr_release(struct config_item *item)
 
 static struct configfs_item_operations printer_item_ops = {
 	.release	= printer_attr_release,
-	.show_attribute	= f_printer_opts_attr_show,
-	.store_attribute = f_printer_opts_attr_store,
 };
 
-static ssize_t f_printer_opts_pnp_string_show(struct f_printer_opts *opts,
+static ssize_t f_printer_opts_pnp_string_show(struct config_item *item,
 					      char *page)
 {
+	struct f_printer_opts *opts = to_f_printer_opts(item);
 	int result;
 
 	mutex_lock(&opts->lock);
@@ -1175,9 +1173,10 @@ static ssize_t f_printer_opts_pnp_string_show(struct f_printer_opts *opts,
 	return result;
 }
 
-static ssize_t f_printer_opts_pnp_string_store(struct f_printer_opts *opts,
+static ssize_t f_printer_opts_pnp_string_store(struct config_item *item,
 					       const char *page, size_t len)
 {
+	struct f_printer_opts *opts = to_f_printer_opts(item);
 	int result, l;
 
 	mutex_lock(&opts->lock);
@@ -1190,14 +1189,12 @@ static ssize_t f_printer_opts_pnp_string_store(struct f_printer_opts *opts,
 	return result;
 }
 
-static struct f_printer_opts_attribute f_printer_opts_pnp_string =
-	__CONFIGFS_ATTR(pnp_string, S_IRUGO | S_IWUSR,
-			f_printer_opts_pnp_string_show,
-			f_printer_opts_pnp_string_store);
+CONFIGFS_ATTR(f_printer_opts_, pnp_string);
 
-static ssize_t f_printer_opts_q_len_show(struct f_printer_opts *opts,
+static ssize_t f_printer_opts_q_len_show(struct config_item *item,
 					 char *page)
 {
+	struct f_printer_opts *opts = to_f_printer_opts(item);
 	int result;
 
 	mutex_lock(&opts->lock);
@@ -1207,9 +1204,10 @@ static ssize_t f_printer_opts_q_len_show(struct f_printer_opts *opts,
 	return result;
 }
 
-static ssize_t f_printer_opts_q_len_store(struct f_printer_opts *opts,
+static ssize_t f_printer_opts_q_len_store(struct config_item *item,
 					  const char *page, size_t len)
 {
+	struct f_printer_opts *opts = to_f_printer_opts(item);
 	int ret;
 	u16 num;
 
@@ -1230,13 +1228,11 @@ end:
 	return ret;
 }
 
-static struct f_printer_opts_attribute f_printer_opts_q_len =
-	__CONFIGFS_ATTR(q_len, S_IRUGO | S_IWUSR, f_printer_opts_q_len_show,
-			f_printer_opts_q_len_store);
+CONFIGFS_ATTR(f_printer_opts_, q_len);
 
 static struct configfs_attribute *printer_attrs[] = {
-	&f_printer_opts_pnp_string.attr,
-	&f_printer_opts_q_len.attr,
+	&f_printer_opts_attr_pnp_string,
+	&f_printer_opts_attr_q_len,
 	NULL,
 };
 
@@ -1331,7 +1327,8 @@ static void gprinter_free(struct usb_function *f)
 	struct f_printer_opts *opts;
 
 	opts = container_of(f->fi, struct f_printer_opts, func_inst);
-	kfree(dev);
+
+	kref_put(&dev->kref, printer_dev_free);
 	mutex_lock(&opts->lock);
 	--opts->refcnt;
 	mutex_unlock(&opts->lock);
@@ -1400,6 +1397,7 @@ static struct usb_function *gprinter_alloc(struct usb_function_instance *fi)
 		return ERR_PTR(-ENOMEM);
 	}
 
+	kref_init(&dev->kref);
 	++opts->refcnt;
 	dev->minor = opts->minor;
 	dev->pnp_string = opts->pnp_string;

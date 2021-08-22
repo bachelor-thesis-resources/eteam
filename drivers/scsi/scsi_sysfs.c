@@ -399,6 +399,8 @@ static void scsi_device_dev_release_usercontext(struct work_struct *work)
 
 	sdev = container_of(work, struct scsi_device, ew.work);
 
+	scsi_dh_release_device(sdev);
+
 	parent = sdev->sdev_gendev.parent;
 
 	spin_lock_irqsave(sdev->host->host_lock, flags);
@@ -676,8 +678,33 @@ static ssize_t
 sdev_store_delete(struct device *dev, struct device_attribute *attr,
 		  const char *buf, size_t count)
 {
-	if (device_remove_file_self(dev, attr))
-		scsi_remove_device(to_scsi_device(dev));
+	struct kernfs_node *kn;
+	struct scsi_device *sdev = to_scsi_device(dev);
+
+	/*
+	 * We need to try to get module, avoiding the module been removed
+	 * during delete.
+	 */
+	if (scsi_device_get(sdev))
+		return -ENODEV;
+
+	kn = sysfs_break_active_protection(&dev->kobj, &attr->attr);
+	WARN_ON_ONCE(!kn);
+	/*
+	 * Concurrent writes into the "delete" sysfs attribute may trigger
+	 * concurrent calls to device_remove_file() and scsi_remove_device().
+	 * device_remove_file() handles concurrent removal calls by
+	 * serializing these and by ignoring the second and later removal
+	 * attempts.  Concurrent calls of scsi_remove_device() are
+	 * serialized. The second and later calls of scsi_remove_device() are
+	 * ignored because the first call of that function changes the device
+	 * state into SDEV_DEL.
+	 */
+	device_remove_file(dev, attr);
+	scsi_remove_device(sdev);
+	if (kn)
+		sysfs_unbreak_active_protection(kn);
+	scsi_device_put(sdev);
 	return count;
 };
 static DEVICE_ATTR(delete, S_IWUSR, NULL, sdev_store_delete);
@@ -772,6 +799,29 @@ static struct bin_attribute dev_attr_vpd_##_page = {		\
 
 sdev_vpd_pg_attr(pg83);
 sdev_vpd_pg_attr(pg80);
+
+static ssize_t show_inquiry(struct file *filep, struct kobject *kobj,
+			    struct bin_attribute *bin_attr,
+			    char *buf, loff_t off, size_t count)
+{
+	struct device *dev = container_of(kobj, struct device, kobj);
+	struct scsi_device *sdev = to_scsi_device(dev);
+
+	if (!sdev->inquiry)
+		return -EINVAL;
+
+	return memory_read_from_buffer(buf, count, &off, sdev->inquiry,
+				       sdev->inquiry_len);
+}
+
+static struct bin_attribute dev_attr_inquiry = {
+	.attr = {
+		.name = "inquiry",
+		.mode = S_IRUGO,
+	},
+	.size = 0,
+	.read = show_inquiry,
+};
 
 static ssize_t
 show_iostat_counterbits(struct device *dev, struct device_attribute *attr,
@@ -898,7 +948,7 @@ sdev_store_queue_ramp_up_period(struct device *dev,
 		return -EINVAL;
 
 	sdev->queue_ramp_up_period = msecs_to_jiffies(period);
-	return period;
+	return count;
 }
 
 static DEVICE_ATTR(queue_ramp_up_period, S_IRUGO | S_IWUSR,
@@ -957,6 +1007,7 @@ static struct attribute *scsi_sdev_attrs[] = {
 static struct bin_attribute *scsi_sdev_bin_attrs[] = {
 	&dev_attr_vpd_pg83,
 	&dev_attr_vpd_pg80,
+	&dev_attr_inquiry,
 	NULL
 };
 static struct attribute_group scsi_sdev_attr_group = {
@@ -1005,10 +1056,6 @@ int scsi_sysfs_add_sdev(struct scsi_device *sdev)
 	struct request_queue *rq = sdev->request_queue;
 	struct scsi_target *starget = sdev->sdev_target;
 
-	error = scsi_device_set_state(sdev, SDEV_RUNNING);
-	if (error)
-		return error;
-
 	error = scsi_target_add(starget);
 	if (error)
 		return error;
@@ -1030,11 +1077,21 @@ int scsi_sysfs_add_sdev(struct scsi_device *sdev)
 				"failed to add device: %d\n", error);
 		return error;
 	}
+
+	error = scsi_dh_add_device(sdev);
+	if (error)
+		/*
+		 * device_handler is optional, so any error can be ignored
+		 */
+		sdev_printk(KERN_INFO, sdev,
+				"failed to add device handler: %d\n", error);
+
 	device_enable_async_suspend(&sdev->sdev_dev);
 	error = device_add(&sdev->sdev_dev);
 	if (error) {
 		sdev_printk(KERN_INFO, sdev,
 				"failed to add class device: %d\n", error);
+		scsi_dh_remove_device(sdev);
 		device_del(&sdev->sdev_gendev);
 		return error;
 	}
@@ -1067,6 +1124,14 @@ void __scsi_remove_device(struct scsi_device *sdev)
 {
 	struct device *dev = &sdev->sdev_gendev;
 
+	/*
+	 * This cleanup path is not reentrant and while it is impossible
+	 * to get a new reference with scsi_device_get() someone can still
+	 * hold a previously acquired one.
+	 */
+	if (sdev->sdev_state == SDEV_DEL)
+		return;
+
 	if (sdev->is_visible) {
 		if (scsi_device_set_state(sdev, SDEV_CANCEL) != 0)
 			return;
@@ -1074,6 +1139,7 @@ void __scsi_remove_device(struct scsi_device *sdev)
 		bsg_unregister_queue(sdev->request_queue);
 		device_unregister(&sdev->sdev_dev);
 		transport_remove_device(dev);
+		scsi_dh_remove_device(sdev);
 		device_del(dev);
 	} else
 		put_device(&sdev->sdev_dev);
@@ -1148,31 +1214,29 @@ static void __scsi_remove_target(struct scsi_target *starget)
 void scsi_remove_target(struct device *dev)
 {
 	struct Scsi_Host *shost = dev_to_shost(dev->parent);
-	struct scsi_target *starget, *last = NULL;
+	struct scsi_target *starget;
 	unsigned long flags;
 
-	/* remove targets being careful to lookup next entry before
-	 * deleting the last
-	 */
+restart:
 	spin_lock_irqsave(shost->host_lock, flags);
 	list_for_each_entry(starget, &shost->__targets, siblings) {
-		if (starget->state == STARGET_DEL)
+		if (starget->state == STARGET_DEL ||
+		    starget->state == STARGET_REMOVE ||
+		    starget->state == STARGET_CREATED_REMOVE)
 			continue;
 		if (starget->dev.parent == dev || &starget->dev == dev) {
-			/* assuming new targets arrive at the end */
 			kref_get(&starget->reap_ref);
+			if (starget->state == STARGET_CREATED)
+				starget->state = STARGET_CREATED_REMOVE;
+			else
+				starget->state = STARGET_REMOVE;
 			spin_unlock_irqrestore(shost->host_lock, flags);
-			if (last)
-				scsi_target_reap(last);
-			last = starget;
 			__scsi_remove_target(starget);
-			spin_lock_irqsave(shost->host_lock, flags);
+			scsi_target_reap(starget);
+			goto restart;
 		}
 	}
 	spin_unlock_irqrestore(shost->host_lock, flags);
-
-	if (last)
-		scsi_target_reap(last);
 }
 EXPORT_SYMBOL(scsi_remove_target);
 

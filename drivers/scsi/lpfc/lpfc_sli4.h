@@ -237,6 +237,7 @@ struct lpfc_fcf {
 #define FCF_REDISC_EVT	0x100 /* FCF rediscovery event to worker thread */
 #define FCF_REDISC_FOV	0x200 /* Post FCF rediscovery fast failover */
 #define FCF_REDISC_PROG (FCF_REDISC_PEND | FCF_REDISC_EVT)
+	uint16_t fcf_redisc_attempted;
 	uint32_t addr_mode;
 	uint32_t eligible_fcf_cnt;
 	struct lpfc_fcf_rec current_rec;
@@ -442,6 +443,7 @@ struct lpfc_sli4_lnk_info {
 #define LPFC_LNK_GE	0x0 /* FCoE */
 #define LPFC_LNK_FC	0x1 /* FC   */
 	uint8_t lnk_no;
+	uint8_t optic_state;
 };
 
 #define LPFC_SLI4_HANDLER_CNT		(LPFC_FCP_IO_CHAN_MAX+ \
@@ -454,7 +456,6 @@ struct lpfc_vector_map_info {
 	uint16_t	core_id;
 	uint16_t	irq;
 	uint16_t	channel_id;
-	struct cpumask	maskbits;
 };
 #define LPFC_VECTOR_MAP_EMPTY	0xffff
 

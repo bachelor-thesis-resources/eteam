@@ -124,7 +124,6 @@ static struct scsi_host_template snic_host_template = {
 	.sg_tablesize = SNIC_MAX_SG_DESC_CNT,
 	.max_sectors = 0x800,
 	.shost_attrs = snic_attrs,
-	.use_blk_tags = 1,
 	.track_queue_depth = 1,
 	.cmd_size = sizeof(struct snic_internal_io_state),
 	.proc_name = "snic_scsi",
@@ -533,15 +532,6 @@ snic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	snic->max_tag_id = shost->can_queue;
 
-	ret = scsi_init_shared_tag_map(shost, snic->max_tag_id);
-	if (ret) {
-		SNIC_HOST_ERR(shost,
-			      "Unable to alloc shared tag map. %d\n",
-			      ret);
-
-		goto err_dev_close;
-	}
-
 	shost->max_lun = snic->config.luns_per_tgt;
 	shost->max_id = SNIC_MAX_TARGET;
 
@@ -594,6 +584,7 @@ snic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (!pool) {
 		SNIC_HOST_ERR(shost, "dflt sgl pool creation failed\n");
 
+		ret = -ENOMEM;
 		goto err_free_res;
 	}
 
@@ -604,6 +595,7 @@ snic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (!pool) {
 		SNIC_HOST_ERR(shost, "max sgl pool creation failed\n");
 
+		ret = -ENOMEM;
 		goto err_free_dflt_sgl_pool;
 	}
 
@@ -614,6 +606,7 @@ snic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (!pool) {
 		SNIC_HOST_ERR(shost, "snic tmreq info pool creation failed.\n");
 
+		ret = -ENOMEM;
 		goto err_free_max_sgl_pool;
 	}
 

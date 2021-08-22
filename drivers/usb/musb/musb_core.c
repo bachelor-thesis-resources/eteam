@@ -132,7 +132,7 @@ static inline struct musb *dev_to_musb(struct device *dev)
 /*-------------------------------------------------------------------------*/
 
 #ifndef CONFIG_BLACKFIN
-static int musb_ulpi_read(struct usb_phy *phy, u32 offset)
+static int musb_ulpi_read(struct usb_phy *phy, u32 reg)
 {
 	void __iomem *addr = phy->io_priv;
 	int	i = 0;
@@ -151,7 +151,7 @@ static int musb_ulpi_read(struct usb_phy *phy, u32 offset)
 	 * ULPICarKitControlDisableUTMI after clearing POWER_SUSPENDM.
 	 */
 
-	musb_writeb(addr, MUSB_ULPI_REG_ADDR, (u8)offset);
+	musb_writeb(addr, MUSB_ULPI_REG_ADDR, (u8)reg);
 	musb_writeb(addr, MUSB_ULPI_REG_CONTROL,
 			MUSB_ULPI_REG_REQ | MUSB_ULPI_RDN_WR);
 
@@ -176,7 +176,7 @@ out:
 	return ret;
 }
 
-static int musb_ulpi_write(struct usb_phy *phy, u32 offset, u32 data)
+static int musb_ulpi_write(struct usb_phy *phy, u32 val, u32 reg)
 {
 	void __iomem *addr = phy->io_priv;
 	int	i = 0;
@@ -191,8 +191,8 @@ static int musb_ulpi_write(struct usb_phy *phy, u32 offset, u32 data)
 	power &= ~MUSB_POWER_SUSPENDM;
 	musb_writeb(addr, MUSB_POWER, power);
 
-	musb_writeb(addr, MUSB_ULPI_REG_ADDR, (u8)offset);
-	musb_writeb(addr, MUSB_ULPI_REG_DATA, (u8)data);
+	musb_writeb(addr, MUSB_ULPI_REG_ADDR, (u8)reg);
+	musb_writeb(addr, MUSB_ULPI_REG_DATA, (u8)val);
 	musb_writeb(addr, MUSB_ULPI_REG_CONTROL, MUSB_ULPI_REG_REQ);
 
 	while (!(musb_readb(addr, MUSB_ULPI_REG_CONTROL)
@@ -877,7 +877,7 @@ b_host:
 	 */
 	if (int_usb & MUSB_INTR_RESET) {
 		handled = IRQ_HANDLED;
-		if (devctl & MUSB_DEVCTL_HM) {
+		if (is_host_active(musb)) {
 			/*
 			 * When BABBLE happens what we can depends on which
 			 * platform MUSB is running, because some platforms
@@ -887,9 +887,7 @@ b_host:
 			 * drop the session.
 			 */
 			dev_err(musb->controller, "Babble\n");
-
-			if (is_host_active(musb))
-				musb_recover_from_babble(musb);
+			musb_recover_from_babble(musb);
 		} else {
 			dev_dbg(musb->controller, "BUS RESET as %s\n",
 				usb_otg_state_string(musb->xceiv->otg->state));
@@ -1028,18 +1026,22 @@ void musb_start(struct musb *musb)
 {
 	void __iomem    *regs = musb->mregs;
 	u8              devctl = musb_readb(regs, MUSB_DEVCTL);
+	u8		power;
 
 	dev_dbg(musb->controller, "<== devctl %02x\n", devctl);
 
 	musb_enable_interrupts(musb);
 	musb_writeb(regs, MUSB_TESTMODE, 0);
 
-	/* put into basic highspeed mode and start session */
-	musb_writeb(regs, MUSB_POWER, MUSB_POWER_ISOUPDATE
-			| MUSB_POWER_HSENAB
-			/* ENSUSPEND wedges tusb */
-			/* | MUSB_POWER_ENSUSPEND */
-		   );
+	power = MUSB_POWER_ISOUPDATE;
+	/*
+	 * treating UNKNOWN as unspecified maximum speed, in which case
+	 * we will default to high-speed.
+	 */
+	if (musb->config->maximum_speed == USB_SPEED_HIGH ||
+			musb->config->maximum_speed == USB_SPEED_UNKNOWN)
+		power |= MUSB_POWER_HSENAB;
+	musb_writeb(regs, MUSB_POWER, power);
 
 	musb->is_active = 0;
 	devctl = musb_readb(regs, MUSB_DEVCTL);
@@ -1051,6 +1053,7 @@ void musb_start(struct musb *musb)
 	 * (c) peripheral initiates, using SRP
 	 */
 	if (musb->port_mode != MUSB_PORT_MODE_HOST &&
+			musb->xceiv->otg->state != OTG_STATE_A_WAIT_BCON &&
 			(devctl & MUSB_DEVCTL_VBUS) == MUSB_DEVCTL_VBUS) {
 		musb->is_active = 1;
 	} else {
@@ -1663,7 +1666,7 @@ EXPORT_SYMBOL_GPL(musb_interrupt);
 static bool use_dma = 1;
 
 /* "modprobe ... use_dma=0" etc */
-module_param(use_dma, bool, 0);
+module_param(use_dma, bool, 0644);
 MODULE_PARM_DESC(use_dma, "enable/disable use of DMA");
 
 void musb_dma_completion(struct musb *musb, u8 epnum, u8 transmit)
@@ -1770,14 +1773,23 @@ musb_vbus_show(struct device *dev, struct device_attribute *attr, char *buf)
 	unsigned long	flags;
 	unsigned long	val;
 	int		vbus;
+	u8		devctl;
 
+	pm_runtime_get_sync(dev);
 	spin_lock_irqsave(&musb->lock, flags);
 	val = musb->a_wait_bcon;
-	/* FIXME get_vbus_status() is normally #defined as false...
-	 * and is effectively TUSB-specific.
-	 */
 	vbus = musb_platform_get_vbus_status(musb);
+	if (vbus < 0) {
+		/* Use default MUSB method by means of DEVCTL register */
+		devctl = musb_readb(musb->mregs, MUSB_DEVCTL);
+		if ((devctl & MUSB_DEVCTL_VBUS)
+				== (3 << MUSB_DEVCTL_VBUS_SHIFT))
+			vbus = 1;
+		else
+			vbus = 0;
+	}
 	spin_unlock_irqrestore(&musb->lock, flags);
+	pm_runtime_put_sync(dev);
 
 	return sprintf(buf, "Vbus %s, timeout %lu msec\n",
 			vbus ? "on" : "off", val);
@@ -2005,7 +2017,6 @@ musb_init_controller(struct device *dev, int nIrq, void __iomem *ctrl)
 	/* We need musb_read/write functions initialized for PM */
 	pm_runtime_use_autosuspend(musb->controller);
 	pm_runtime_set_autosuspend_delay(musb->controller, 200);
-	pm_runtime_irq_safe(musb->controller);
 	pm_runtime_enable(musb->controller);
 
 	/* The musb_platform_init() call:
@@ -2083,6 +2094,7 @@ musb_init_controller(struct device *dev, int nIrq, void __iomem *ctrl)
 #ifndef CONFIG_MUSB_PIO_ONLY
 	if (!musb->ops->dma_init || !musb->ops->dma_exit) {
 		dev_err(dev, "DMA controller not set\n");
+		status = -ENODEV;
 		goto fail2;
 	}
 	musb_dma_controller_create = musb->ops->dma_init;
@@ -2119,6 +2131,9 @@ musb_init_controller(struct device *dev, int nIrq, void __iomem *ctrl)
 	/* be sure interrupts are disabled before connecting ISR */
 	musb_platform_disable(musb);
 	musb_generic_disable(musb);
+
+	/* MUSB_POWER_SOFTCONN might be already set, JZ4740 does this. */
+	musb_writeb(musb->mregs, MUSB_POWER, 0);
 
 	/* Init IRQ workqueue before request_irq */
 	INIT_WORK(&musb->irq_work, musb_irq_work);
@@ -2205,6 +2220,12 @@ musb_init_controller(struct device *dev, int nIrq, void __iomem *ctrl)
 		goto fail5;
 
 	pm_runtime_put(musb->controller);
+
+	/*
+	 * For why this is currently needed, see commit 3e43a0725637
+	 * ("usb: musb: core: add pm_runtime_irq_safe()")
+	 */
+	pm_runtime_irq_safe(musb->controller);
 
 	return 0;
 
@@ -2383,7 +2404,8 @@ static void musb_restore_context(struct musb *musb)
 	musb_writew(musb_base, MUSB_INTRTXE, musb->intrtxe);
 	musb_writew(musb_base, MUSB_INTRRXE, musb->intrrxe);
 	musb_writeb(musb_base, MUSB_INTRUSBE, musb->context.intrusbe);
-	musb_writeb(musb_base, MUSB_DEVCTL, musb->context.devctl);
+	if (musb->context.devctl & MUSB_DEVCTL_SESSION)
+		musb_writeb(musb_base, MUSB_DEVCTL, musb->context.devctl);
 
 	for (i = 0; i < musb->config->num_eps; ++i) {
 		struct musb_hw_ep	*hw_ep;
@@ -2448,6 +2470,9 @@ static int musb_suspend(struct device *dev)
 	struct musb	*musb = dev_to_musb(dev);
 	unsigned long	flags;
 
+	musb_platform_disable(musb);
+	musb_generic_disable(musb);
+
 	spin_lock_irqsave(&musb->lock, flags);
 
 	if (is_peripheral_active(musb)) {
@@ -2501,6 +2526,10 @@ static int musb_resume(struct device *dev)
 	pm_runtime_disable(dev);
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
+
+	musb_enable_interrupts(musb);
+	musb_platform_enable(musb);
+
 	return 0;
 }
 

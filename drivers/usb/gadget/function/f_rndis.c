@@ -91,8 +91,10 @@ static inline struct f_rndis *func_to_rndis(struct usb_function *f)
 /* peak (theoretical) bulk transfer rate in bits-per-second */
 static unsigned int bitrate(struct usb_gadget *g)
 {
+	if (gadget_is_superspeed(g) && g->speed >= USB_SPEED_SUPER_PLUS)
+		return 4250000000U;
 	if (gadget_is_superspeed(g) && g->speed == USB_SPEED_SUPER)
-		return 13 * 1024 * 8 * 1000 * 8;
+		return 3750000000U;
 	else if (gadget_is_dualspeed(g) && g->speed == USB_SPEED_HIGH)
 		return 13 * 512 * 8 * 1000 * 8;
 	else
@@ -543,22 +545,20 @@ static int rndis_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 	/* we know alt == 0 */
 
 	if (intf == rndis->ctrl_id) {
-		if (rndis->notify->driver_data) {
-			VDBG(cdev, "reset rndis control %d\n", intf);
-			usb_ep_disable(rndis->notify);
-		}
+		VDBG(cdev, "reset rndis control %d\n", intf);
+		usb_ep_disable(rndis->notify);
+
 		if (!rndis->notify->desc) {
 			VDBG(cdev, "init rndis ctrl %d\n", intf);
 			if (config_ep_by_speed(cdev->gadget, f, rndis->notify))
 				goto fail;
 		}
 		usb_ep_enable(rndis->notify);
-		rndis->notify->driver_data = rndis;
 
 	} else if (intf == rndis->data_id) {
 		struct net_device	*net;
 
-		if (rndis->port.in_ep->driver_data) {
+		if (rndis->port.in_ep->enabled) {
 			DBG(cdev, "reset rndis\n");
 			gether_disconnect(&rndis->port);
 		}
@@ -612,7 +612,7 @@ static void rndis_disable(struct usb_function *f)
 	struct f_rndis		*rndis = func_to_rndis(f);
 	struct usb_composite_dev *cdev = f->config->cdev;
 
-	if (!rndis->notify->driver_data)
+	if (!rndis->notify->enabled)
 		return;
 
 	DBG(cdev, "rndis deactivated\n");
@@ -621,7 +621,7 @@ static void rndis_disable(struct usb_function *f)
 	gether_disconnect(&rndis->port);
 
 	usb_ep_disable(rndis->notify);
-	rndis->notify->driver_data = NULL;
+	rndis->notify->desc = NULL;
 }
 
 /*-------------------------------------------------------------------------*/
@@ -745,13 +745,11 @@ rndis_bind(struct usb_configuration *c, struct usb_function *f)
 	if (!ep)
 		goto fail;
 	rndis->port.in_ep = ep;
-	ep->driver_data = cdev;	/* claim */
 
 	ep = usb_ep_autoconfig(cdev->gadget, &fs_out_desc);
 	if (!ep)
 		goto fail;
 	rndis->port.out_ep = ep;
-	ep->driver_data = cdev;	/* claim */
 
 	/* NOTE:  a status/notification endpoint is, strictly speaking,
 	 * optional.  We don't treat it that way though!  It's simpler,
@@ -761,7 +759,6 @@ rndis_bind(struct usb_configuration *c, struct usb_function *f)
 	if (!ep)
 		goto fail;
 	rndis->notify = ep;
-	ep->driver_data = cdev;	/* claim */
 
 	status = -ENOMEM;
 
@@ -829,14 +826,6 @@ fail:
 		usb_ep_free_request(rndis->notify, rndis->notify_req);
 	}
 
-	/* we might as well release our claims on endpoints */
-	if (rndis->notify)
-		rndis->notify->driver_data = NULL;
-	if (rndis->port.out_ep)
-		rndis->port.out_ep->driver_data = NULL;
-	if (rndis->port.in_ep)
-		rndis->port.in_ep->driver_data = NULL;
-
 	ERROR(cdev, "%s: can't bind, err %d\n", f->name, status);
 
 	return status;
@@ -878,10 +867,10 @@ USB_ETHERNET_CONFIGFS_ITEM_ATTR_QMULT(rndis);
 USB_ETHERNET_CONFIGFS_ITEM_ATTR_IFNAME(rndis);
 
 static struct configfs_attribute *rndis_attrs[] = {
-	&f_rndis_opts_dev_addr.attr,
-	&f_rndis_opts_host_addr.attr,
-	&f_rndis_opts_qmult.attr,
-	&f_rndis_opts_ifname.attr,
+	&rndis_opts_attr_dev_addr,
+	&rndis_opts_attr_host_addr,
+	&rndis_opts_attr_qmult,
+	&rndis_opts_attr_ifname,
 	NULL,
 };
 

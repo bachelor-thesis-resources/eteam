@@ -393,6 +393,14 @@ lpfc_vport_create(struct fc_vport *fc_vport, bool disable)
 	*(struct lpfc_vport **)fc_vport->dd_data = vport;
 	vport->fc_vport = fc_vport;
 
+	/* At this point we are fully registered with SCSI Layer.  */
+	vport->load_flag |= FC_ALLOW_FDMI;
+	if (phba->cfg_fdmi_on > LPFC_FDMI_NO_SUPPORT) {
+		/* Setup appropriate attribute masks */
+		vport->fdmi_hba_mask = phba->pport->fdmi_hba_mask;
+		vport->fdmi_port_mask = phba->pport->fdmi_port_mask;
+	}
+
 	/*
 	 * In SLI4, the vpi must be activated before it can be used
 	 * by the port.
@@ -528,6 +536,12 @@ enable_vport(struct fc_vport *fc_vport)
 
 	spin_lock_irq(shost->host_lock);
 	vport->load_flag |= FC_LOADING;
+	if (vport->fc_flag & FC_VPORT_NEEDS_INIT_VPI) {
+		spin_unlock_irq(shost->host_lock);
+		lpfc_issue_init_vpi(vport);
+		goto out;
+	}
+
 	vport->fc_flag |= FC_VPORT_NEEDS_REG_VPI;
 	spin_unlock_irq(shost->host_lock);
 
@@ -548,6 +562,8 @@ enable_vport(struct fc_vport *fc_vport)
 	} else {
 		lpfc_vport_set_state(vport, FC_VPORT_FAILED);
 	}
+
+out:
 	lpfc_printf_vlog(vport, KERN_ERR, LOG_VPORT,
 			 "1827 Vport Enabled.\n");
 	return VPORT_OK;
@@ -607,27 +623,16 @@ lpfc_vport_delete(struct fc_vport *fc_vport)
 		    vport->port_state < LPFC_VPORT_READY)
 			return -EAGAIN;
 	}
+
 	/*
-	 * This is a bit of a mess.  We want to ensure the shost doesn't get
-	 * torn down until we're done with the embedded lpfc_vport structure.
-	 *
-	 * Beyond holding a reference for this function, we also need a
-	 * reference for outstanding I/O requests we schedule during delete
-	 * processing.  But once we scsi_remove_host() we can no longer obtain
-	 * a reference through scsi_host_get().
-	 *
-	 * So we take two references here.  We release one reference at the
-	 * bottom of the function -- after delinking the vport.  And we
-	 * release the other at the completion of the unreg_vpi that get's
-	 * initiated after we've disposed of all other resources associated
-	 * with the port.
+	 * Take early refcount for outstanding I/O requests we schedule during
+	 * delete processing for unreg_vpi.  Always keep this before
+	 * scsi_remove_host() as we can no longer obtain a reference through
+	 * scsi_host_get() after scsi_host_remove as shost is set to SHOST_DEL.
 	 */
 	if (!scsi_host_get(shost))
 		return VPORT_INVAL;
-	if (!scsi_host_get(shost)) {
-		scsi_host_put(shost);
-		return VPORT_INVAL;
-	}
+
 	lpfc_free_sysfs_attr(vport);
 
 	lpfc_debugfs_terminate(vport);
@@ -775,8 +780,9 @@ skip_logo:
 		if (!(vport->vpi_state & LPFC_VPI_REGISTERED) ||
 				lpfc_mbx_unreg_vpi(vport))
 			scsi_host_put(shost);
-	} else
+	} else {
 		scsi_host_put(shost);
+	}
 
 	lpfc_free_vpi(phba, vport->vpi);
 	vport->work_port_events = 0;

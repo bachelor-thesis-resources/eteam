@@ -25,6 +25,7 @@
 #include <linux/parser.h>
 #include <linux/vmalloc.h>
 #include <linux/uio_driver.h>
+#include <linux/stringify.h>
 #include <net/genetlink.h>
 #include <scsi/scsi_common.h>
 #include <scsi/scsi_proto.h>
@@ -91,7 +92,7 @@ struct tcmu_dev {
 	size_t dev_size;
 	u32 cmdr_size;
 	u32 cmdr_last_cleaned;
-	/* Offset of data ring from start of mb */
+	/* Offset of data area from start of mb */
 	size_t data_off;
 	size_t data_size;
 	/* Ring head + tail values. */
@@ -152,6 +153,14 @@ static struct genl_family tcmu_genl_family = {
 	.mcgrps = tcmu_mcgrps,
 	.n_mcgrps = ARRAY_SIZE(tcmu_mcgrps),
 };
+
+/* Sense Key = 2 (Not Ready)
+ * ASC/ASCQ = 0x0800 (Logical Unit Communication Failure)
+ */
+static const char lu_comm_failure_sense[18] = {
+	0x70, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x0a,
+	0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
+	0x00, 0x00 };
 
 static struct tcmu_cmd *tcmu_alloc_cmd(struct se_cmd *se_cmd)
 {
@@ -330,7 +339,7 @@ static void gather_and_free_data_area(struct tcmu_dev *udev,
 
 /*
  * We can't queue a command until we have space available on the cmd ring *and*
- * space available on the data ring.
+ * space available on the data area.
  *
  * Called with ring lock held.
  */
@@ -371,7 +380,8 @@ static bool is_ring_space_avail(struct tcmu_dev *udev, size_t cmd_size, size_t d
 	return true;
 }
 
-static int tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
+static sense_reason_t
+tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
 {
 	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
 	struct se_cmd *se_cmd = tcmu_cmd->se_cmd;
@@ -385,7 +395,7 @@ static int tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
 	bool copy_to_data_area;
 
 	if (test_bit(TCMU_DEV_BIT_BROKEN, &udev->flags))
-		return -EINVAL;
+		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
 
 	/*
 	 * Must be a certain minimum size for response sense info, but
@@ -408,10 +418,13 @@ static int tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
 	mb = udev->mb_addr;
 	cmd_head = mb->cmd_head % udev->cmdr_size; /* UAM */
 	if ((command_size > (udev->cmdr_size / 2))
-	    || tcmu_cmd->data_length > (udev->data_size - 1))
+	    || tcmu_cmd->data_length > (udev->data_size - 1)) {
 		pr_warn("TCMU: Request of size %zu/%zu may be too big for %u/%zu "
 			"cmd/data ring buffers\n", command_size, tcmu_cmd->data_length,
 			udev->cmdr_size, udev->data_size);
+		spin_unlock_irq(&udev->cmdr_lock);
+		return TCM_INVALID_CDB_FIELD;
+	}
 
 	while (!is_ring_space_avail(udev, command_size, tcmu_cmd->data_length)) {
 		int ret;
@@ -425,7 +438,7 @@ static int tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
 		finish_wait(&udev->wait_cmdr, &__wait);
 		if (!ret) {
 			pr_warn("tcmu: command timed out\n");
-			return -ETIMEDOUT;
+			return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
 		}
 
 		spin_lock_irq(&udev->cmdr_lock);
@@ -460,9 +473,7 @@ static int tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
 	entry->hdr.kflags = 0;
 	entry->hdr.uflags = 0;
 
-	/*
-	 * Fix up iovecs, and handle if allocation in data ring wrapped.
-	 */
+	/* Handle allocating space from the data area */
 	iov = &entry->req.iov[0];
 	iov_cnt = 0;
 	copy_to_data_area = (se_cmd->data_direction == DMA_TO_DEVICE
@@ -495,10 +506,11 @@ static int tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
 	mod_timer(&udev->timeout,
 		round_jiffies_up(jiffies + msecs_to_jiffies(TCMU_TIME_OUT)));
 
-	return 0;
+	return TCM_NO_SENSE;
 }
 
-static int tcmu_queue_cmd(struct se_cmd *se_cmd)
+static sense_reason_t
+tcmu_queue_cmd(struct se_cmd *se_cmd)
 {
 	struct se_device *se_dev = se_cmd->se_dev;
 	struct tcmu_dev *udev = TCMU_DEV(se_dev);
@@ -507,10 +519,10 @@ static int tcmu_queue_cmd(struct se_cmd *se_cmd)
 
 	tcmu_cmd = tcmu_alloc_cmd(se_cmd);
 	if (!tcmu_cmd)
-		return -ENOMEM;
+		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
 
 	ret = tcmu_queue_cmd_ring(tcmu_cmd);
-	if (ret < 0) {
+	if (ret != TCM_NO_SENSE) {
 		pr_err("TCMU: Could not queue command\n");
 		spin_lock_irq(&udev->commands_lock);
 		idr_remove(&udev->commands, tcmu_cmd->cmd_id);
@@ -528,8 +540,10 @@ static void tcmu_handle_completion(struct tcmu_cmd *cmd, struct tcmu_cmd_entry *
 	struct tcmu_dev *udev = cmd->tcmu_dev;
 
 	if (test_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags)) {
-		/* cmd has been completed already from timeout, just reclaim data
-		   ring space */
+		/*
+		 * cmd has been completed already from timeout, just reclaim
+		 * data area space and free cmd
+		 */
 		UPDATE_HEAD(udev->data_tail, cmd->data_length, udev->data_size);
 		return;
 	}
@@ -538,16 +552,12 @@ static void tcmu_handle_completion(struct tcmu_cmd *cmd, struct tcmu_cmd_entry *
 		UPDATE_HEAD(udev->data_tail, cmd->data_length, udev->data_size);
 		pr_warn("TCMU: Userspace set UNKNOWN_OP flag on se_cmd %p\n",
 			cmd->se_cmd);
-		transport_generic_request_failure(cmd->se_cmd,
-			TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE);
-		cmd->se_cmd = NULL;
-		kmem_cache_free(tcmu_cmd_cache, cmd);
-		return;
-	}
-
-	if (entry->rsp.scsi_status == SAM_STAT_CHECK_CONDITION) {
+		entry->rsp.scsi_status = SAM_STAT_CHECK_CONDITION;
+		memcpy(se_cmd->sense_buffer, lu_comm_failure_sense,
+		       sizeof(lu_comm_failure_sense));
+	} else if (entry->rsp.scsi_status == SAM_STAT_CHECK_CONDITION) {
 		memcpy(se_cmd->sense_buffer, entry->rsp.sense_buffer,
-			       se_cmd->scsi_sense_length);
+			       TRANSPORT_SENSE_BUFFER);
 
 		UPDATE_HEAD(udev->data_tail, cmd->data_length, udev->data_size);
 	} else if (se_cmd->se_cmd_flags & SCF_BIDI) {
@@ -577,7 +587,6 @@ static void tcmu_handle_completion(struct tcmu_cmd *cmd, struct tcmu_cmd_entry *
 static unsigned int tcmu_handle_completions(struct tcmu_dev *udev)
 {
 	struct tcmu_mailbox *mb;
-	LIST_HEAD(cpl_cmds);
 	unsigned long flags;
 	int handled = 0;
 
@@ -596,7 +605,14 @@ static unsigned int tcmu_handle_completions(struct tcmu_dev *udev)
 		struct tcmu_cmd_entry *entry = (void *) mb + CMDR_OFF + udev->cmdr_last_cleaned;
 		struct tcmu_cmd *cmd;
 
-		tcmu_flush_dcache_range(entry, sizeof(*entry));
+		/*
+		 * Flush max. up to end of cmd ring since current entry might
+		 * be a padding that is shorter than sizeof(*entry)
+		 */
+		size_t ring_left = head_to_end(udev->cmdr_last_cleaned,
+					       udev->cmdr_size);
+		tcmu_flush_dcache_range(entry, ring_left < sizeof(*entry) ?
+					ring_left : sizeof(*entry));
 
 		if (tcmu_hdr_get_op(entry->hdr.len_op) == TCMU_OP_PAD) {
 			UPDATE_HEAD(udev->cmdr_last_cleaned,
@@ -644,14 +660,14 @@ static int tcmu_check_expired_cmd(int id, void *p, void *data)
 	if (test_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags))
 		return 0;
 
-	if (!time_after(cmd->deadline, jiffies))
+	if (!time_after(jiffies, cmd->deadline))
 		return 0;
 
 	set_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags);
+	memcpy(cmd->se_cmd->sense_buffer, lu_comm_failure_sense,
+	       sizeof(lu_comm_failure_sense));
 	target_complete_cmd(cmd->se_cmd, SAM_STAT_CHECK_CONDITION);
 	cmd->se_cmd = NULL;
-
-	kmem_cache_free(tcmu_cmd_cache, cmd);
 
 	return 0;
 }
@@ -905,10 +921,10 @@ static int tcmu_configure_device(struct se_device *dev)
 	WARN_ON(!PAGE_ALIGNED(udev->data_off));
 	WARN_ON(udev->data_size % PAGE_SIZE);
 
-	info->version = xstr(TCMU_MAILBOX_VERSION);
+	info->version = __stringify(TCMU_MAILBOX_VERSION);
 
 	info->mem[0].name = "tcm-user command & data buffer";
-	info->mem[0].addr = (phys_addr_t) udev->mb_addr;
+	info->mem[0].addr = (phys_addr_t)(uintptr_t)udev->mb_addr;
 	info->mem[0].size = TCMU_RING_SIZE;
 	info->mem[0].memtype = UIO_MEM_VIRTUAL;
 
@@ -1089,26 +1105,24 @@ static sector_t tcmu_get_blocks(struct se_device *dev)
 }
 
 static sense_reason_t
-tcmu_pass_op(struct se_cmd *se_cmd)
-{
-	int ret = tcmu_queue_cmd(se_cmd);
-
-	if (ret != 0)
-		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
-	else
-		return TCM_NO_SENSE;
-}
-
-static sense_reason_t
 tcmu_parse_cdb(struct se_cmd *cmd)
 {
-	return passthrough_parse_cdb(cmd, tcmu_pass_op);
+	return passthrough_parse_cdb(cmd, tcmu_queue_cmd);
+}
+
+static void tcmu_transport_complete(struct se_cmd *cmd, struct scatterlist *sg,
+				    unsigned char *sense_buffer)
+{
+	if (cmd->scsi_status == SAM_STAT_CHECK_CONDITION)
+		/* Setting this flag will prevent target_complete_cmd from
+		 * calling target_complete_failure_work, which would overwrite
+		 * the sense data we already set.
+		 */
+		cmd->se_cmd_flags |= SCF_TRANSPORT_TASK_SENSE;
 }
 
 static const struct target_backend_ops tcmu_ops = {
 	.name			= "user",
-	.inquiry_prod		= "USER",
-	.inquiry_rev		= TCMU_VERSION,
 	.owner			= THIS_MODULE,
 	.transport_flags	= TRANSPORT_FLAG_PASSTHROUGH,
 	.attach_hba		= tcmu_attach_hba,
@@ -1117,6 +1131,7 @@ static const struct target_backend_ops tcmu_ops = {
 	.configure_device	= tcmu_configure_device,
 	.free_device		= tcmu_free_device,
 	.parse_cdb		= tcmu_parse_cdb,
+	.transport_complete	= tcmu_transport_complete,
 	.set_configfs_dev_params = tcmu_set_configfs_dev_params,
 	.show_configfs_dev_params = tcmu_show_configfs_dev_params,
 	.get_device_type	= sbc_get_device_type,

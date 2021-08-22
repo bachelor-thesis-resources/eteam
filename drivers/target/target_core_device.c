@@ -62,21 +62,12 @@ transport_lookup_cmd_lun(struct se_cmd *se_cmd, u64 unpacked_lun)
 	struct se_session *se_sess = se_cmd->se_sess;
 	struct se_node_acl *nacl = se_sess->se_node_acl;
 	struct se_dev_entry *deve;
+	sense_reason_t ret = TCM_NO_SENSE;
 
 	rcu_read_lock();
 	deve = target_nacl_find_deve(nacl, unpacked_lun);
 	if (deve) {
 		atomic_long_inc(&deve->total_cmds);
-
-		if ((se_cmd->data_direction == DMA_TO_DEVICE) &&
-		    (deve->lun_flags & TRANSPORT_LUNFLAGS_READ_ONLY)) {
-			pr_err("TARGET_CORE[%s]: Detected WRITE_PROTECTED LUN"
-				" Access for 0x%08llx\n",
-				se_cmd->se_tfo->get_fabric_name(),
-				unpacked_lun);
-			rcu_read_unlock();
-			return TCM_WRITE_PROTECTED;
-		}
 
 		if (se_cmd->data_direction == DMA_TO_DEVICE)
 			atomic_long_add(se_cmd->data_length,
@@ -86,14 +77,30 @@ transport_lookup_cmd_lun(struct se_cmd *se_cmd, u64 unpacked_lun)
 					&deve->read_bytes);
 
 		se_lun = rcu_dereference(deve->se_lun);
+
+		if (!percpu_ref_tryget_live(&se_lun->lun_ref)) {
+			se_lun = NULL;
+			goto out_unlock;
+		}
+
 		se_cmd->se_lun = rcu_dereference(deve->se_lun);
 		se_cmd->pr_res_key = deve->pr_res_key;
 		se_cmd->orig_fe_lun = unpacked_lun;
 		se_cmd->se_cmd_flags |= SCF_SE_LUN_CMD;
-
-		percpu_ref_get(&se_lun->lun_ref);
 		se_cmd->lun_ref_active = true;
+
+		if ((se_cmd->data_direction == DMA_TO_DEVICE) &&
+		    (deve->lun_flags & TRANSPORT_LUNFLAGS_READ_ONLY)) {
+			pr_err("TARGET_CORE[%s]: Detected WRITE_PROTECTED LUN"
+				" Access for 0x%08llx\n",
+				se_cmd->se_tfo->get_fabric_name(),
+				unpacked_lun);
+			rcu_read_unlock();
+			ret = TCM_WRITE_PROTECTED;
+			goto ref_dev;
+		}
 	}
+out_unlock:
 	rcu_read_unlock();
 
 	if (!se_lun) {
@@ -109,12 +116,6 @@ transport_lookup_cmd_lun(struct se_cmd *se_cmd, u64 unpacked_lun)
 				unpacked_lun);
 			return TCM_NON_EXISTENT_LUN;
 		}
-		/*
-		 * Force WRITE PROTECT for virtual LUN 0
-		 */
-		if ((se_cmd->data_direction != DMA_FROM_DEVICE) &&
-		    (se_cmd->data_direction != DMA_NONE))
-			return TCM_WRITE_PROTECTED;
 
 		se_lun = se_sess->se_tpg->tpg_virt_lun0;
 		se_cmd->se_lun = se_sess->se_tpg->tpg_virt_lun0;
@@ -123,6 +124,15 @@ transport_lookup_cmd_lun(struct se_cmd *se_cmd, u64 unpacked_lun)
 
 		percpu_ref_get(&se_lun->lun_ref);
 		se_cmd->lun_ref_active = true;
+
+		/*
+		 * Force WRITE PROTECT for virtual LUN 0
+		 */
+		if ((se_cmd->data_direction != DMA_FROM_DEVICE) &&
+		    (se_cmd->data_direction != DMA_NONE)) {
+			ret = TCM_WRITE_PROTECTED;
+			goto ref_dev;
+		}
 	}
 	/*
 	 * RCU reference protected by percpu se_lun->lun_ref taken above that
@@ -130,6 +140,7 @@ transport_lookup_cmd_lun(struct se_cmd *se_cmd, u64 unpacked_lun)
 	 * pointer can be kfree_rcu() by the final se_lun->lun_group put via
 	 * target_core_fabric_configfs.c:target_fabric_port_release
 	 */
+ref_dev:
 	se_cmd->se_dev = rcu_dereference_raw(se_lun->lun_se_dev);
 	atomic_long_inc(&se_cmd->se_dev->num_cmds);
 
@@ -140,7 +151,7 @@ transport_lookup_cmd_lun(struct se_cmd *se_cmd, u64 unpacked_lun)
 		atomic_long_add(se_cmd->data_length,
 				&se_cmd->se_dev->read_bytes);
 
-	return 0;
+	return ret;
 }
 EXPORT_SYMBOL(transport_lookup_cmd_lun);
 
@@ -356,7 +367,15 @@ int core_enable_device_list_for_node(
 			kfree(new);
 			return -EINVAL;
 		}
-		BUG_ON(orig->se_lun_acl != NULL);
+		if (orig->se_lun_acl != NULL) {
+			pr_warn_ratelimited("Detected existing explicit"
+				" se_lun_acl->se_lun_group reference for %s"
+				" mapped_lun: %llu, failing\n",
+				 nacl->initiatorname, mapped_lun);
+			mutex_unlock(&nacl->lun_entry_mutex);
+			kfree(new);
+			return -EINVAL;
+		}
 
 		rcu_assign_pointer(new->se_lun, lun);
 		rcu_assign_pointer(new->se_lun_acl, lun_acl);
@@ -427,8 +446,6 @@ void core_disable_device_list_for_node(
 
 	hlist_del_rcu(&orig->link);
 	clear_bit(DEF_PR_REG_ACTIVE, &orig->deve_flags);
-	rcu_assign_pointer(orig->se_lun, NULL);
-	rcu_assign_pointer(orig->se_lun_acl, NULL);
 	orig->lun_flags = 0;
 	orig->creation_time = 0;
 	orig->attach_count--;
@@ -438,6 +455,9 @@ void core_disable_device_list_for_node(
 	 */
 	kref_put(&orig->pr_kref, target_pr_kref_release);
 	wait_for_completion(&orig->pr_comp);
+
+	rcu_assign_pointer(orig->se_lun, NULL);
+	rcu_assign_pointer(orig->se_lun_acl, NULL);
 
 	kfree_rcu(orig, rcu_head);
 
@@ -620,8 +640,6 @@ struct se_lun_acl *core_dev_init_initiator_node_lun_acl(
 
 	lacl->mapped_lun = mapped_lun;
 	lacl->se_lun_nacl = nacl;
-	snprintf(lacl->initiatorname, TRANSPORT_IQN_LEN, "%s",
-		 nacl->initiatorname);
 
 	return lacl;
 }
@@ -656,7 +674,7 @@ int core_dev_add_initiator_node_lun_acl(
 		" InitiatorNode: %s\n", tpg->se_tpg_tfo->get_fabric_name(),
 		tpg->se_tpg_tfo->tpg_get_tag(tpg), lun->unpacked_lun, lacl->mapped_lun,
 		(lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) ? "RW" : "RO",
-		lacl->initiatorname);
+		nacl->initiatorname);
 	/*
 	 * Check to see if there are any existing persistent reservation APTPL
 	 * pre-registrations that need to be enabled for this LUN ACL..
@@ -688,7 +706,7 @@ int core_dev_del_initiator_node_lun_acl(
 		" InitiatorNode: %s Mapped LUN: %llu\n",
 		tpg->se_tpg_tfo->get_fabric_name(),
 		tpg->se_tpg_tfo->tpg_get_tag(tpg), lun->unpacked_lun,
-		lacl->initiatorname, lacl->mapped_lun);
+		nacl->initiatorname, lacl->mapped_lun);
 
 	return 0;
 }
@@ -701,7 +719,7 @@ void core_dev_free_initiator_node_lun_acl(
 		" Mapped LUN: %llu\n", tpg->se_tpg_tfo->get_fabric_name(),
 		tpg->se_tpg_tfo->tpg_get_tag(tpg),
 		tpg->se_tpg_tfo->get_fabric_name(),
-		lacl->initiatorname, lacl->mapped_lun);
+		lacl->se_lun_nacl->initiatorname, lacl->mapped_lun);
 
 	kfree(lacl);
 }
@@ -754,7 +772,7 @@ struct se_device *target_alloc_device(struct se_hba *hba, const char *name)
 	dev->dev_link_magic = SE_DEV_LINK_MAGIC;
 	dev->se_hba = hba;
 	dev->transport = hba->backend->ops;
-	dev->prot_length = sizeof(struct se_dif_v1_tuple);
+	dev->prot_length = sizeof(struct t10_pi_tuple);
 	dev->hba_index = hba->hba_index;
 
 	INIT_LIST_HEAD(&dev->dev_list);
@@ -771,7 +789,6 @@ struct se_device *target_alloc_device(struct se_hba *hba, const char *name)
 	spin_lock_init(&dev->se_tmr_lock);
 	spin_lock_init(&dev->qf_cmd_lock);
 	sema_init(&dev->caw_sem, 1);
-	atomic_set(&dev->dev_ordered_id, 0);
 	INIT_LIST_HEAD(&dev->t10_wwn.t10_vpd_list);
 	spin_lock_init(&dev->t10_wwn.t10_vpd_lock);
 	INIT_LIST_HEAD(&dev->t10_pr.registration_list);
@@ -814,6 +831,7 @@ struct se_device *target_alloc_device(struct se_hba *hba, const char *name)
 	xcopy_lun = &dev->xcopy_lun;
 	rcu_assign_pointer(xcopy_lun->lun_se_dev, dev);
 	init_completion(&xcopy_lun->lun_ref_comp);
+	init_completion(&xcopy_lun->lun_shutdown_comp);
 	INIT_LIST_HEAD(&xcopy_lun->lun_deve_list);
 	INIT_LIST_HEAD(&xcopy_lun->lun_dev_link);
 	mutex_init(&xcopy_lun->lun_tg_pt_md_mutex);
@@ -821,6 +839,51 @@ struct se_device *target_alloc_device(struct se_hba *hba, const char *name)
 
 	return dev;
 }
+
+/*
+ * Check if the underlying struct block_device request_queue supports
+ * the QUEUE_FLAG_DISCARD bit for UNMAP/WRITE_SAME in SCSI + TRIM
+ * in ATA and we need to set TPE=1
+ */
+bool target_configure_unmap_from_queue(struct se_dev_attrib *attrib,
+				       struct request_queue *q)
+{
+	int block_size = queue_logical_block_size(q);
+
+	if (!blk_queue_discard(q))
+		return false;
+
+	attrib->max_unmap_lba_count =
+		q->limits.max_discard_sectors >> (ilog2(block_size) - 9);
+	/*
+	 * Currently hardcoded to 1 in Linux/SCSI code..
+	 */
+	attrib->max_unmap_block_desc_count = 1;
+	attrib->unmap_granularity = q->limits.discard_granularity / block_size;
+	attrib->unmap_granularity_alignment = q->limits.discard_alignment /
+								block_size;
+	return true;
+}
+EXPORT_SYMBOL(target_configure_unmap_from_queue);
+
+/*
+ * Convert from blocksize advertised to the initiator to the 512 byte
+ * units unconditionally used by the Linux block layer.
+ */
+sector_t target_to_linux_sector(struct se_device *dev, sector_t lb)
+{
+	switch (dev->dev_attrib.block_size) {
+	case 4096:
+		return lb << 3;
+	case 2048:
+		return lb << 2;
+	case 1024:
+		return lb << 1;
+	default:
+		return lb;
+	}
+}
+EXPORT_SYMBOL(target_to_linux_sector);
 
 int target_configure_device(struct se_device *dev)
 {
@@ -992,27 +1055,6 @@ passthrough_parse_cdb(struct se_cmd *cmd,
 	sense_reason_t (*exec_cmd)(struct se_cmd *cmd))
 {
 	unsigned char *cdb = cmd->t_task_cdb;
-
-	/*
-	 * Clear a lun set in the cdb if the initiator talking to use spoke
-	 * and old standards version, as we can't assume the underlying device
-	 * won't choke up on it.
-	 */
-	switch (cdb[0]) {
-	case READ_10: /* SBC - RDProtect */
-	case READ_12: /* SBC - RDProtect */
-	case READ_16: /* SBC - RDProtect */
-	case SEND_DIAGNOSTIC: /* SPC - SELF-TEST Code */
-	case VERIFY: /* SBC - VRProtect */
-	case VERIFY_16: /* SBC - VRProtect */
-	case WRITE_VERIFY: /* SBC - VRProtect */
-	case WRITE_VERIFY_12: /* SBC - VRProtect */
-	case MAINTENANCE_IN: /* SPC - Parameter Data Format for SA RTPG */
-		break;
-	default:
-		cdb[1] &= 0x1f; /* clear logical unit number */
-		break;
-	}
 
 	/*
 	 * For REPORT LUNS we always need to emulate the response, for everything

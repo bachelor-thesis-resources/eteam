@@ -71,8 +71,9 @@ static bool iio_buffer_ready(struct iio_dev *indio_dev, struct iio_buffer *buf,
 
 	if (avail >= to_wait) {
 		/* force a flush for non-blocking reads */
-		if (!to_wait && !avail && to_flush)
-			iio_buffer_flush_hwfifo(indio_dev, buf, to_flush);
+		if (!to_wait && avail < to_flush)
+			iio_buffer_flush_hwfifo(indio_dev, buf,
+						to_flush - avail);
 		return true;
 	}
 
@@ -90,19 +91,26 @@ static bool iio_buffer_ready(struct iio_dev *indio_dev, struct iio_buffer *buf,
 
 /**
  * iio_buffer_read_first_n_outer() - chrdev read for buffer access
+ * @filp:	File structure pointer for the char device
+ * @buf:	Destination buffer for iio buffer read
+ * @n:		First n bytes to read
+ * @f_ps:	Long offset provided by the user as a seek position
  *
  * This function relies on all buffer implementations having an
  * iio_buffer as their first element.
+ *
+ * Return: negative values corresponding to error codes or ret != 0
+ *	   for ending the reading activity
  **/
 ssize_t iio_buffer_read_first_n_outer(struct file *filp, char __user *buf,
 				      size_t n, loff_t *f_ps)
 {
 	struct iio_dev *indio_dev = filp->private_data;
 	struct iio_buffer *rb = indio_dev->buffer;
+	DEFINE_WAIT_FUNC(wait, woken_wake_function);
 	size_t datum_size;
-	size_t to_wait = 0;
-	size_t to_read;
-	int ret;
+	size_t to_wait;
+	int ret = 0;
 
 	if (!indio_dev->info)
 		return -ENODEV;
@@ -119,30 +127,46 @@ ssize_t iio_buffer_read_first_n_outer(struct file *filp, char __user *buf,
 	if (!datum_size)
 		return 0;
 
-	to_read = min_t(size_t, n / datum_size, rb->watermark);
+	if (filp->f_flags & O_NONBLOCK)
+		to_wait = 0;
+	else
+		to_wait = min_t(size_t, n / datum_size, rb->watermark);
 
-	if (!(filp->f_flags & O_NONBLOCK))
-		to_wait = to_read;
-
+	add_wait_queue(&rb->pollq, &wait);
 	do {
-		ret = wait_event_interruptible(rb->pollq,
-			iio_buffer_ready(indio_dev, rb, to_wait, to_read));
-		if (ret)
-			return ret;
+		if (!indio_dev->info) {
+			ret = -ENODEV;
+			break;
+		}
 
-		if (!indio_dev->info)
-			return -ENODEV;
+		if (!iio_buffer_ready(indio_dev, rb, to_wait, n / datum_size)) {
+			if (signal_pending(current)) {
+				ret = -ERESTARTSYS;
+				break;
+			}
+
+			wait_woken(&wait, TASK_INTERRUPTIBLE,
+				   MAX_SCHEDULE_TIMEOUT);
+			continue;
+		}
 
 		ret = rb->access->read_first_n(rb, n, buf);
 		if (ret == 0 && (filp->f_flags & O_NONBLOCK))
 			ret = -EAGAIN;
-	 } while (ret == 0);
+	} while (ret == 0);
+	remove_wait_queue(&rb->pollq, &wait);
 
 	return ret;
 }
 
 /**
  * iio_buffer_poll() - poll the buffer to find out if it has data
+ * @filp:	File structure pointer for device access
+ * @wait:	Poll table structure pointer for which the driver adds
+ *		a wait queue
+ *
+ * Return: (POLLIN | POLLRDNORM) if data is available for reading
+ *	   or 0 for other cases
  */
 unsigned int iio_buffer_poll(struct file *filp,
 			     struct poll_table_struct *wait)
@@ -150,7 +174,7 @@ unsigned int iio_buffer_poll(struct file *filp,
 	struct iio_dev *indio_dev = filp->private_data;
 	struct iio_buffer *rb = indio_dev->buffer;
 
-	if (!indio_dev->info)
+	if (!indio_dev->info || rb == NULL)
 		return 0;
 
 	poll_wait(filp, &rb->pollq, wait);
@@ -289,7 +313,7 @@ static int iio_scan_mask_set(struct iio_dev *indio_dev,
 	if (trialmask == NULL)
 		return -ENOMEM;
 	if (!indio_dev->masklength) {
-		WARN_ON("Trying to set scanmask prior to registering buffer\n");
+		WARN(1, "Trying to set scanmask prior to registering buffer\n");
 		goto err_invalid_mask;
 	}
 	bitmap_copy(trialmask, buffer->scan_mask, indio_dev->masklength);
@@ -503,7 +527,7 @@ static int iio_compute_scan_bytes(struct iio_dev *indio_dev,
 {
 	const struct iio_chan_spec *ch;
 	unsigned bytes = 0;
-	int length, i;
+	int length, i, largest = 0;
 
 	/* How much space will the demuxed element take? */
 	for_each_set_bit(i, mask,
@@ -516,6 +540,7 @@ static int iio_compute_scan_bytes(struct iio_dev *indio_dev,
 			length = ch->scan_type.storagebits / 8;
 		bytes = ALIGN(bytes, length);
 		bytes += length;
+		largest = max(largest, length);
 	}
 	if (timestamp) {
 		ch = iio_find_channel_from_si(indio_dev,
@@ -527,7 +552,10 @@ static int iio_compute_scan_bytes(struct iio_dev *indio_dev,
 			length = ch->scan_type.storagebits / 8;
 		bytes = ALIGN(bytes, length);
 		bytes += length;
+		largest = max(largest, length);
 	}
+
+	bytes = ALIGN(bytes, largest);
 	return bytes;
 }
 
@@ -1136,7 +1164,7 @@ int iio_scan_mask_query(struct iio_dev *indio_dev,
 EXPORT_SYMBOL_GPL(iio_scan_mask_query);
 
 /**
- * struct iio_demux_table() - table describing demux memcpy ops
+ * struct iio_demux_table - table describing demux memcpy ops
  * @from:	index to copy from
  * @to:		index to copy to
  * @length:	how many bytes to copy
@@ -1253,9 +1281,6 @@ static int iio_buffer_update_demux(struct iio_dev *indio_dev,
 				       indio_dev->masklength,
 				       in_ind + 1);
 		while (in_ind != out_ind) {
-			in_ind = find_next_bit(indio_dev->active_scan_mask,
-					       indio_dev->masklength,
-					       in_ind + 1);
 			ch = iio_find_channel_from_si(indio_dev, in_ind);
 			if (ch->scan_type.repeat > 1)
 				length = ch->scan_type.storagebits / 8 *
@@ -1264,6 +1289,9 @@ static int iio_buffer_update_demux(struct iio_dev *indio_dev,
 				length = ch->scan_type.storagebits / 8;
 			/* Make sure we are aligned */
 			in_loc = roundup(in_loc, length) + length;
+			in_ind = find_next_bit(indio_dev->active_scan_mask,
+					       indio_dev->masklength,
+					       in_ind + 1);
 		}
 		ch = iio_find_channel_from_si(indio_dev, in_ind);
 		if (ch->scan_type.repeat > 1)

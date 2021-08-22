@@ -292,6 +292,8 @@ static int usb3503_probe(struct usb3503 *hub)
 	if (gpio_is_valid(hub->gpio_reset)) {
 		err = devm_gpio_request_one(dev, hub->gpio_reset,
 				GPIOF_OUT_INIT_LOW, "usb3503 reset");
+		/* Datasheet defines a hardware reset to be at least 100us */
+		usleep_range(100, 10000);
 		if (err) {
 			dev_err(dev,
 				"unable to request GPIO %d as reset pin (%d)\n",
@@ -410,7 +412,7 @@ static int __init usb3503_init(void)
 {
 	int err;
 
-	err = i2c_register_driver(THIS_MODULE, &usb3503_i2c_driver);
+	err = i2c_add_driver(&usb3503_i2c_driver);
 	if (err != 0)
 		pr_err("usb3503: Failed to register I2C driver: %d\n", err);
 

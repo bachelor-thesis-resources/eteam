@@ -42,8 +42,6 @@
 #include <scsi/scsi_proto.h>
 #include <target/target_core_base.h>
 #include <target/target_core_fabric.h>
-#include <target/target_core_fabric_configfs.h>
-#include <target/configfs_macros.h>
 #include <linux/vhost.h>
 #include <linux/virtio_scsi.h>
 #include <linux/llist.h>
@@ -59,6 +57,12 @@
 #define VHOST_SCSI_PREALLOC_SGLS 2048
 #define VHOST_SCSI_PREALLOC_UPAGES 2048
 #define VHOST_SCSI_PREALLOC_PROT_SGLS 512
+
+/* Max number of requests before requeueing the job.
+ * Using this limit prevents one virtqueue from starving others with
+ * request.
+ */
+#define VHOST_SCSI_WEIGHT 256
 
 struct vhost_scsi_inflight {
 	/* Wait for the flush operation to finish */
@@ -90,7 +94,7 @@ struct vhost_scsi_cmd {
 	struct scatterlist *tvc_prot_sgl;
 	struct page **tvc_upages;
 	/* Pointer to response header iovec */
-	struct iovec *tvc_resp_iov;
+	struct iovec tvc_resp_iov;
 	/* Pointer to vhost_scsi for our device */
 	struct vhost_scsi *tvc_vhost;
 	/* Pointer to vhost_virtqueue for the cmd */
@@ -166,9 +170,7 @@ enum {
 /* Note: can't set VIRTIO_F_VERSION_1 yet, since that implies ANY_LAYOUT. */
 enum {
 	VHOST_SCSI_FEATURES = VHOST_FEATURES | (1ULL << VIRTIO_SCSI_F_HOTPLUG) |
-					       (1ULL << VIRTIO_SCSI_F_T10_PI) |
-					       (1ULL << VIRTIO_F_ANY_LAYOUT) |
-					       (1ULL << VIRTIO_F_VERSION_1)
+					       (1ULL << VIRTIO_SCSI_F_T10_PI)
 };
 
 #define VHOST_SCSI_MAX_TARGET	256
@@ -561,7 +563,7 @@ static void vhost_scsi_complete_cmd_work(struct vhost_work *work)
 		memcpy(v_rsp.sense, cmd->tvc_sense_buf,
 		       se_cmd->scsi_sense_length);
 
-		iov_iter_init(&iov_iter, READ, cmd->tvc_resp_iov,
+		iov_iter_init(&iov_iter, READ, &cmd->tvc_resp_iov,
 			      cmd->tvc_in_iovs, sizeof(v_rsp));
 		ret = copy_to_iter(&v_rsp, sizeof(v_rsp), &iov_iter);
 		if (likely(ret == sizeof(v_rsp))) {
@@ -707,6 +709,7 @@ vhost_scsi_iov_to_sgl(struct vhost_scsi_cmd *cmd, bool write,
 		      struct scatterlist *sg, int sg_count)
 {
 	size_t off = iter->iov_offset;
+	struct scatterlist *p = sg;
 	int i, ret;
 
 	for (i = 0; i < iter->nr_segs; i++) {
@@ -715,8 +718,8 @@ vhost_scsi_iov_to_sgl(struct vhost_scsi_cmd *cmd, bool write,
 
 		ret = vhost_scsi_map_to_sgl(cmd, base, len, sg, write);
 		if (ret < 0) {
-			for (i = 0; i < sg_count; i++) {
-				struct page *page = sg_page(&sg[i]);
+			while (p < sg) {
+				struct page *page = sg_page(p++);
 				if (page)
 					put_page(page);
 			}
@@ -858,7 +861,7 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 	u64 tag;
 	u32 exp_data_len, data_direction;
 	unsigned out, in;
-	int head, ret, prot_bytes;
+	int head, ret, prot_bytes, c = 0;
 	size_t req_size, rsp_size = sizeof(struct virtio_scsi_cmd_resp);
 	size_t out_size, in_size;
 	u16 lun;
@@ -877,7 +880,7 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 
 	vhost_disable_notify(&vs->dev, vq);
 
-	for (;;) {
+	do {
 		head = vhost_get_vq_desc(vq, vq->iov,
 					 ARRAY_SIZE(vq->iov), &out, &in,
 					 NULL, NULL);
@@ -1012,7 +1015,8 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 				prot_bytes = vhost32_to_cpu(vq, v_req_pi.pi_bytesin);
 			}
 			/*
-			 * Set prot_iter to data_iter, and advance past any
+			 * Set prot_iter to data_iter and truncate it to
+			 * prot_bytes, and advance data_iter past any
 			 * preceeding prot_bytes that may be present.
 			 *
 			 * Also fix up the exp_data_len to reflect only the
@@ -1021,6 +1025,7 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 			if (prot_bytes) {
 				exp_data_len -= prot_bytes;
 				prot_iter = data_iter;
+				iov_iter_truncate(&prot_iter, prot_bytes);
 				iov_iter_advance(&data_iter, prot_bytes);
 			}
 			tag = vhost64_to_cpu(vq, v_req_pi.tag);
@@ -1058,7 +1063,7 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 		}
 		cmd->tvc_vhost = vs;
 		cmd->tvc_vq = vq;
-		cmd->tvc_resp_iov = &vq->iov[out];
+		cmd->tvc_resp_iov = vq->iov[out];
 		cmd->tvc_in_iovs = in;
 
 		pr_debug("vhost_scsi got command opcode: %#02x, lun: %d\n",
@@ -1091,7 +1096,7 @@ vhost_scsi_handle_vq(struct vhost_scsi *vs, struct vhost_virtqueue *vq)
 		 */
 		INIT_WORK(&cmd->work, vhost_scsi_submission_work);
 		queue_work(vhost_scsi_workqueue, &cmd->work);
-	}
+	} while (likely(!vhost_exceeds_weight(vq, ++c, 0)));
 out:
 	mutex_unlock(&vq->mutex);
 }
@@ -1444,7 +1449,7 @@ static int vhost_scsi_open(struct inode *inode, struct file *f)
 		vqs[i] = &vs->vqs[i].vq;
 		vs->vqs[i].vq.handle_kick = vhost_scsi_handle_kick;
 	}
-	vhost_dev_init(&vs->dev, vqs, VHOST_SCSI_MAX_VQ);
+	vhost_dev_init(&vs->dev, vqs, VHOST_SCSI_MAX_VQ, VHOST_SCSI_WEIGHT, 0);
 
 	vhost_scsi_init_inflight(vs, NULL);
 
@@ -1573,9 +1578,9 @@ static int __init vhost_scsi_register(void)
 	return misc_register(&vhost_scsi_misc);
 }
 
-static int vhost_scsi_deregister(void)
+static void vhost_scsi_deregister(void)
 {
-	return misc_deregister(&vhost_scsi_misc);
+	misc_deregister(&vhost_scsi_misc);
 }
 
 static char *vhost_scsi_dump_proto_id(struct vhost_scsi_tport *tport)
@@ -1686,11 +1691,10 @@ static void vhost_scsi_free_cmd_map_res(struct vhost_scsi_nexus *nexus,
 	}
 }
 
-static ssize_t vhost_scsi_tpg_attrib_store_fabric_prot_type(
-	struct se_portal_group *se_tpg,
-	const char *page,
-	size_t count)
+static ssize_t vhost_scsi_tpg_attrib_fabric_prot_type_store(
+		struct config_item *item, const char *page, size_t count)
 {
+	struct se_portal_group *se_tpg = attrib_to_tpg(item);
 	struct vhost_scsi_tpg *tpg = container_of(se_tpg,
 				struct vhost_scsi_tpg, se_tpg);
 	unsigned long val;
@@ -1709,19 +1713,20 @@ static ssize_t vhost_scsi_tpg_attrib_store_fabric_prot_type(
 	return count;
 }
 
-static ssize_t vhost_scsi_tpg_attrib_show_fabric_prot_type(
-	struct se_portal_group *se_tpg,
-	char *page)
+static ssize_t vhost_scsi_tpg_attrib_fabric_prot_type_show(
+		struct config_item *item, char *page)
 {
+	struct se_portal_group *se_tpg = attrib_to_tpg(item);
 	struct vhost_scsi_tpg *tpg = container_of(se_tpg,
 				struct vhost_scsi_tpg, se_tpg);
 
 	return sprintf(page, "%d\n", tpg->tv_fabric_prot_type);
 }
-TF_TPG_ATTRIB_ATTR(vhost_scsi, fabric_prot_type, S_IRUGO | S_IWUSR);
+
+CONFIGFS_ATTR(vhost_scsi_tpg_attrib_, fabric_prot_type);
 
 static struct configfs_attribute *vhost_scsi_tpg_attrib_attrs[] = {
-	&vhost_scsi_tpg_attrib_fabric_prot_type.attr,
+	&vhost_scsi_tpg_attrib_attr_fabric_prot_type,
 	NULL,
 };
 
@@ -1869,9 +1874,9 @@ static int vhost_scsi_drop_nexus(struct vhost_scsi_tpg *tpg)
 	return 0;
 }
 
-static ssize_t vhost_scsi_tpg_show_nexus(struct se_portal_group *se_tpg,
-					char *page)
+static ssize_t vhost_scsi_tpg_nexus_show(struct config_item *item, char *page)
 {
+	struct se_portal_group *se_tpg = to_tpg(item);
 	struct vhost_scsi_tpg *tpg = container_of(se_tpg,
 				struct vhost_scsi_tpg, se_tpg);
 	struct vhost_scsi_nexus *tv_nexus;
@@ -1890,10 +1895,10 @@ static ssize_t vhost_scsi_tpg_show_nexus(struct se_portal_group *se_tpg,
 	return ret;
 }
 
-static ssize_t vhost_scsi_tpg_store_nexus(struct se_portal_group *se_tpg,
-					 const char *page,
-					 size_t count)
+static ssize_t vhost_scsi_tpg_nexus_store(struct config_item *item,
+		const char *page, size_t count)
 {
+	struct se_portal_group *se_tpg = to_tpg(item);
 	struct vhost_scsi_tpg *tpg = container_of(se_tpg,
 				struct vhost_scsi_tpg, se_tpg);
 	struct vhost_scsi_tport *tport_wwn = tpg->tport;
@@ -1968,10 +1973,10 @@ check_newline:
 	return count;
 }
 
-TF_TPG_BASE_ATTR(vhost_scsi, nexus, S_IRUGO | S_IWUSR);
+CONFIGFS_ATTR(vhost_scsi_tpg_, nexus);
 
 static struct configfs_attribute *vhost_scsi_tpg_attrs[] = {
-	&vhost_scsi_tpg_nexus.attr,
+	&vhost_scsi_tpg_attr_nexus,
 	NULL,
 };
 
@@ -2107,18 +2112,17 @@ static void vhost_scsi_drop_tport(struct se_wwn *wwn)
 }
 
 static ssize_t
-vhost_scsi_wwn_show_attr_version(struct target_fabric_configfs *tf,
-				char *page)
+vhost_scsi_wwn_version_show(struct config_item *item, char *page)
 {
 	return sprintf(page, "TCM_VHOST fabric module %s on %s/%s"
 		"on "UTS_RELEASE"\n", VHOST_SCSI_VERSION, utsname()->sysname,
 		utsname()->machine);
 }
 
-TF_WWN_ATTR_RO(vhost_scsi, version);
+CONFIGFS_ATTR_RO(vhost_scsi_wwn_, version);
 
 static struct configfs_attribute *vhost_scsi_wwn_attrs[] = {
-	&vhost_scsi_wwn_version.attr,
+	&vhost_scsi_wwn_attr_version,
 	NULL,
 };
 
