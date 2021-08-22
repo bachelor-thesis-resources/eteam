@@ -152,7 +152,8 @@ static int rsvp_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 		return -1;
 	nhptr = ip_hdr(skb);
 #endif
-
+	if (unlikely(!head))
+		return -1;
 restart:
 
 #if RSVP_DST_LEN == 4
@@ -283,12 +284,22 @@ static int rsvp_init(struct tcf_proto *tp)
 	return -ENOBUFS;
 }
 
-static void
-rsvp_delete_filter(struct tcf_proto *tp, struct rsvp_filter *f)
+static void rsvp_delete_filter_rcu(struct rcu_head *head)
+{
+	struct rsvp_filter *f = container_of(head, struct rsvp_filter, rcu);
+
+	tcf_exts_destroy(&f->exts);
+	kfree(f);
+}
+
+static void rsvp_delete_filter(struct tcf_proto *tp, struct rsvp_filter *f)
 {
 	tcf_unbind_filter(tp, &f->res);
-	tcf_exts_destroy(&f->exts);
-	kfree_rcu(f, rcu);
+	/* all classifiers are required to call tcf_exts_destroy() after rcu
+	 * grace period, since converted-to-rcu actions are relying on that
+	 * in cleanup() callback
+	 */
+	call_rcu(&f->rcu, rsvp_delete_filter_rcu);
 }
 
 static bool rsvp_destroy(struct tcf_proto *tp, bool force)
@@ -444,10 +455,8 @@ static u32 gen_tunnel(struct rsvp_head *data)
 
 static const struct nla_policy rsvp_policy[TCA_RSVP_MAX + 1] = {
 	[TCA_RSVP_CLASSID]	= { .type = NLA_U32 },
-	[TCA_RSVP_DST]		= { .type = NLA_BINARY,
-				    .len = RSVP_DST_LEN * sizeof(u32) },
-	[TCA_RSVP_SRC]		= { .type = NLA_BINARY,
-				    .len = RSVP_DST_LEN * sizeof(u32) },
+	[TCA_RSVP_DST]		= { .len = RSVP_DST_LEN * sizeof(u32) },
+	[TCA_RSVP_SRC]		= { .len = RSVP_DST_LEN * sizeof(u32) },
 	[TCA_RSVP_PINFO]	= { .len = sizeof(struct tc_rsvp_pinfo) },
 };
 

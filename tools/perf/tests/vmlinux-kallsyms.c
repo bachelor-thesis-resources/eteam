@@ -68,7 +68,7 @@ int test__vmlinux_matches_kallsyms(void)
 	 * to see if the running kernel was relocated by checking if it has the
 	 * same value in the vmlinux file we load.
 	 */
-	kallsyms_map = machine__kernel_map(&kallsyms, type);
+	kallsyms_map = machine__kernel_map(&kallsyms);
 
 	/*
 	 * Step 5:
@@ -80,7 +80,7 @@ int test__vmlinux_matches_kallsyms(void)
 		goto out;
 	}
 
-	vmlinux_map = machine__kernel_map(&vmlinux, type);
+	vmlinux_map = machine__kernel_map(&vmlinux);
 
 	/*
 	 * Step 6:
@@ -126,7 +126,7 @@ int test__vmlinux_matches_kallsyms(void)
 
 		if (pair && UM(pair->start) == mem_start) {
 next_pair:
-			if (strcmp(sym->name, pair->name) == 0) {
+			if (arch__compare_symbol_names(sym->name, pair->name) == 0) {
 				/*
 				 * kallsyms don't have the symbol end, so we
 				 * set that by using the next symbol start - 1,

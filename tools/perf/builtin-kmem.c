@@ -329,7 +329,7 @@ static int build_alloc_func_list(void)
 		return -EINVAL;
 	}
 
-	kernel_map = machine->vmlinux_maps[MAP__FUNCTION];
+	kernel_map = machine__kernel_map(machine);
 	if (map__load(kernel_map, NULL) < 0) {
 		pr_err("cannot load kernel map\n");
 		return -ENOENT;
@@ -664,6 +664,7 @@ static char *compact_gfp_flags(char *gfp_flags)
 			new = realloc(new_flags, len + strlen(cpt) + 2);
 			if (new == NULL) {
 				free(new_flags);
+				free(orig_flags);
 				return NULL;
 			}
 

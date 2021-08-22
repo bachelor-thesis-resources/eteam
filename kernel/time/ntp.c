@@ -39,6 +39,7 @@ static u64			tick_length_base;
 #define MAX_TICKADJ		500LL		/* usecs */
 #define MAX_TICKADJ_SCALED \
 	(((MAX_TICKADJ * NSEC_PER_USEC) << NTP_SCALE_SHIFT) / NTP_INTERVAL_FREQ)
+#define MAX_TAI_OFFSET		100000
 
 /*
  * phase-lock loop variables
@@ -99,7 +100,7 @@ static time64_t			ntp_next_leap_sec = TIME64_MAX;
 static int pps_valid;		/* signal watchdog counter */
 static long pps_tf[3];		/* phase median filter */
 static long pps_jitter;		/* current jitter (ns) */
-static struct timespec pps_fbase; /* beginning of the last freq interval */
+static struct timespec64 pps_fbase; /* beginning of the last freq interval */
 static int pps_shift;		/* current interval duration (s) (shift) */
 static int pps_intcnt;		/* interval counter */
 static s64 pps_freq;		/* frequency offset (scaled ns/s) */
@@ -487,6 +488,11 @@ out:
 }
 
 #ifdef CONFIG_GENERIC_CMOS_UPDATE
+int __weak update_persistent_clock(struct timespec now)
+{
+	return -ENODEV;
+}
+
 int __weak update_persistent_clock64(struct timespec64 now64)
 {
 	struct timespec now;
@@ -504,7 +510,7 @@ static DECLARE_DELAYED_WORK(sync_cmos_work, sync_cmos_clock);
 static void sync_cmos_clock(struct work_struct *work)
 {
 	struct timespec64 now;
-	struct timespec next;
+	struct timespec64 next;
 	int fail = 1;
 
 	/*
@@ -554,7 +560,7 @@ static void sync_cmos_clock(struct work_struct *work)
 		next.tv_nsec -= NSEC_PER_SEC;
 	}
 	queue_delayed_work(system_power_efficient_wq,
-			   &sync_cmos_work, timespec_to_jiffies(&next));
+			   &sync_cmos_work, timespec64_to_jiffies(&next));
 }
 
 void ntp_notify_cmos_timer(void)
@@ -628,7 +634,8 @@ static inline void process_adjtimex_modes(struct timex *txc,
 		time_constant = max(time_constant, 0l);
 	}
 
-	if (txc->modes & ADJ_TAI && txc->constant > 0)
+	if (txc->modes & ADJ_TAI &&
+			txc->constant >= 0 && txc->constant <= MAX_TAI_OFFSET)
 		*time_tai = txc->constant;
 
 	if (txc->modes & ADJ_OFFSET)
@@ -669,8 +676,24 @@ int ntp_validate_timex(struct timex *txc)
 			return -EINVAL;
 	}
 
-	if ((txc->modes & ADJ_SETOFFSET) && (!capable(CAP_SYS_TIME)))
-		return -EPERM;
+	if (txc->modes & ADJ_SETOFFSET) {
+		/* In order to inject time, you gotta be super-user! */
+		if (!capable(CAP_SYS_TIME))
+			return -EPERM;
+
+		if (txc->modes & ADJ_NANO) {
+			struct timespec ts;
+
+			ts.tv_sec = txc->time.tv_sec;
+			ts.tv_nsec = txc->time.tv_usec;
+			if (!timespec_inject_offset_valid(&ts))
+				return -EINVAL;
+
+		} else {
+			if (!timeval_inject_offset_valid(&txc->time))
+				return -EINVAL;
+		}
+	}
 
 	/*
 	 * Check for potential multiplication overflows that can
@@ -768,13 +791,13 @@ int __do_adjtimex(struct timex *txc, struct timespec64 *ts, s32 *time_tai)
  * pps_normtime.nsec has a range of ( -NSEC_PER_SEC / 2, NSEC_PER_SEC / 2 ]
  * while timespec.tv_nsec has a range of [0, NSEC_PER_SEC) */
 struct pps_normtime {
-	__kernel_time_t	sec;	/* seconds */
+	s64		sec;	/* seconds */
 	long		nsec;	/* nanoseconds */
 };
 
 /* normalize the timestamp so that nsec is in the
    ( -NSEC_PER_SEC / 2, NSEC_PER_SEC / 2 ] interval */
-static inline struct pps_normtime pps_normalize_ts(struct timespec ts)
+static inline struct pps_normtime pps_normalize_ts(struct timespec64 ts)
 {
 	struct pps_normtime norm = {
 		.sec = ts.tv_sec,
@@ -856,7 +879,7 @@ static long hardpps_update_freq(struct pps_normtime freq_norm)
 		pps_errcnt++;
 		pps_dec_freq_interval();
 		printk_deferred(KERN_ERR
-			"hardpps: PPSERROR: interval too long - %ld s\n",
+			"hardpps: PPSERROR: interval too long - %lld s\n",
 			freq_norm.sec);
 		return 0;
 	}
@@ -943,7 +966,7 @@ static void hardpps_update_phase(long error)
  * This code is based on David Mills's reference nanokernel
  * implementation. It was mostly rewritten but keeps the same idea.
  */
-void __hardpps(const struct timespec *phase_ts, const struct timespec *raw_ts)
+void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_ts)
 {
 	struct pps_normtime pts_norm, freq_norm;
 
@@ -964,7 +987,7 @@ void __hardpps(const struct timespec *phase_ts, const struct timespec *raw_ts)
 	}
 
 	/* ok, now we have a base for frequency calculation */
-	freq_norm = pps_normalize_ts(timespec_sub(*raw_ts, pps_fbase));
+	freq_norm = pps_normalize_ts(timespec64_sub(*raw_ts, pps_fbase));
 
 	/* check that the signal is in the range
 	 * [1s - MAXFREQ us, 1s + MAXFREQ us], otherwise reject it */

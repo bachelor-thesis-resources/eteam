@@ -18,6 +18,7 @@ char dso__symtab_origin(const struct dso *dso)
 		[DSO_BINARY_TYPE__BUILD_ID_CACHE]		= 'B',
 		[DSO_BINARY_TYPE__FEDORA_DEBUGINFO]		= 'f',
 		[DSO_BINARY_TYPE__UBUNTU_DEBUGINFO]		= 'u',
+		[DSO_BINARY_TYPE__MIXEDUP_UBUNTU_DEBUGINFO]	= 'x',
 		[DSO_BINARY_TYPE__OPENEMBEDDED_DEBUGINFO]	= 'o',
 		[DSO_BINARY_TYPE__BUILDID_DEBUGINFO]		= 'b',
 		[DSO_BINARY_TYPE__SYSTEM_PATH_DSO]		= 'd',
@@ -71,6 +72,21 @@ int dso__read_binary_type_filename(const struct dso *dso,
 	case DSO_BINARY_TYPE__UBUNTU_DEBUGINFO:
 		len = __symbol__join_symfs(filename, size, "/usr/lib/debug");
 		snprintf(filename + len, size - len, "%s", dso->long_name);
+		break;
+
+	case DSO_BINARY_TYPE__MIXEDUP_UBUNTU_DEBUGINFO:
+		/*
+		 * Ubuntu can mixup /usr/lib with /lib, putting debuginfo in
+		 * /usr/lib/debug/lib when it is expected to be in
+		 * /usr/lib/debug/usr/lib
+		 */
+		if (strlen(dso->long_name) < 9 ||
+		    strncmp(dso->long_name, "/usr/lib/", 9)) {
+			ret = -1;
+			break;
+		}
+		len = __symbol__join_symfs(filename, size, "/usr/lib/debug");
+		snprintf(filename + len, size - len, "%s", dso->long_name + 4);
 		break;
 
 	case DSO_BINARY_TYPE__OPENEMBEDDED_DEBUGINFO:
@@ -249,6 +265,8 @@ int __kmod_path__parse(struct kmod_path *m, const char *path,
 		if ((strncmp(name, "[kernel.kallsyms]", 17) == 0) ||
 		    (strncmp(name, "[guest.kernel.kallsyms", 22) == 0) ||
 		    (strncmp(name, "[vdso]", 6) == 0) ||
+		    (strncmp(name, "[vdso32]", 8) == 0) ||
+		    (strncmp(name, "[vdsox32]", 9) == 0) ||
 		    (strncmp(name, "[vsyscall]", 10) == 0)) {
 			m->kmod = false;
 
@@ -933,6 +951,7 @@ static struct dso *__dso__findlink_by_longname(struct rb_root *root,
 		/* Add new node and rebalance tree */
 		rb_link_node(&dso->rb_node, parent, p);
 		rb_insert_color(&dso->rb_node, root);
+		dso->root = root;
 	}
 	return NULL;
 }
@@ -945,15 +964,30 @@ static inline struct dso *__dso__find_by_longname(struct rb_root *root,
 
 void dso__set_long_name(struct dso *dso, const char *name, bool name_allocated)
 {
+	struct rb_root *root = dso->root;
+
 	if (name == NULL)
 		return;
 
 	if (dso->long_name_allocated)
 		free((char *)dso->long_name);
 
+	if (root) {
+		rb_erase(&dso->rb_node, root);
+		/*
+		 * __dso__findlink_by_longname() isn't guaranteed to add it
+		 * back, so a clean removal is required here.
+		 */
+		RB_CLEAR_NODE(&dso->rb_node);
+		dso->root = NULL;
+	}
+
 	dso->long_name		 = name;
 	dso->long_name_len	 = strlen(name);
 	dso->long_name_allocated = name_allocated;
+
+	if (root)
+		__dso__findlink_by_longname(root, dso, NULL);
 }
 
 void dso__set_short_name(struct dso *dso, const char *name, bool name_allocated)
@@ -1046,6 +1080,7 @@ struct dso *dso__new(const char *name)
 		dso->kernel = DSO_TYPE_USER;
 		dso->needs_swap = DSO_SWAP__UNSET;
 		RB_CLEAR_NODE(&dso->rb_node);
+		dso->root = NULL;
 		INIT_LIST_HEAD(&dso->node);
 		INIT_LIST_HEAD(&dso->data.open_entry);
 		pthread_mutex_init(&dso->lock, NULL);
