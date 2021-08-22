@@ -775,10 +775,10 @@ struct sctp_transport {
 		hb_sent:1,
 
 		/* Is the Path MTU update pending on this tranport */
-		pmtu_pending:1;
+		pmtu_pending:1,
 
-	/* Has this transport moved the ctsn since we last sacked */
-	__u32 sack_generation;
+		/* Has this transport moved the ctsn since we last sacked */
+		sack_generation:1;
 	u32 dst_cookie;
 
 	struct flowi fl;
@@ -829,6 +829,8 @@ struct sctp_transport {
 	__u32 flight_size;
 
 	__u32 burst_limited;	/* Holds old cwnd when max.burst is applied */
+
+	__u32 dst_pending_confirm;	/* need to confirm neighbour */
 
 	/* Destination */
 	struct dst_entry *dst;
@@ -966,6 +968,8 @@ unsigned long sctp_transport_timeout(struct sctp_transport *);
 void sctp_transport_reset(struct sctp_transport *);
 void sctp_transport_update_pmtu(struct sock *, struct sctp_transport *, u32);
 void sctp_transport_immediate_rtx(struct sctp_transport *);
+void sctp_transport_dst_release(struct sctp_transport *t);
+void sctp_transport_dst_confirm(struct sctp_transport *t);
 
 
 /* This is the structure we use to queue packets as they come into
@@ -1482,19 +1486,20 @@ struct sctp_association {
 			prsctp_capable:1,   /* Can peer do PR-SCTP? */
 			auth_capable:1;     /* Is peer doing SCTP-AUTH? */
 
-		/* Ack State   : This flag indicates if the next received
+		/* sack_needed : This flag indicates if the next received
 		 *             : packet is to be responded to with a
-		 *             : SACK. This is initializedto 0.  When a packet
-		 *             : is received it is incremented. If this value
+		 *             : SACK. This is initialized to 0.  When a packet
+		 *             : is received sack_cnt is incremented. If this value
 		 *             : reaches 2 or more, a SACK is sent and the
 		 *             : value is reset to 0. Note: This is used only
 		 *             : when no DATA chunks are received out of
 		 *             : order.  When DATA chunks are out of order,
 		 *             : SACK's are not delayed (see Section 6).
 		 */
-		__u8    sack_needed;     /* Do we need to sack the peer? */
+		__u8    sack_needed:1,     /* Do we need to sack the peer? */
+			sack_generation:1,
+			zero_window_announced:1;
 		__u32	sack_cnt;
-		__u32	sack_generation;
 
 		__u32   adaptation_ind;	 /* Adaptation Code point. */
 

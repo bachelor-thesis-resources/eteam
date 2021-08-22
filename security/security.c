@@ -56,18 +56,13 @@ int __init security_init(void)
 	pr_info("Security Framework initialized\n");
 
 	/*
-	 * Always load the capability module.
+	 * Load minor LSMs, with the capability module always first.
 	 */
 	capability_add_hooks();
-#ifdef CONFIG_SECURITY_YAMA_STACKED
-	/*
-	 * If Yama is configured for stacking load it next.
-	 */
 	yama_add_hooks();
-#endif
+
 	/*
-	 * Load the chosen module if there is one.
-	 * This will also find yama if it is stacking
+	 * Load all the remaining security modules.
 	 */
 	do_security_initcalls();
 
@@ -438,6 +433,7 @@ int security_path_rmdir(struct path *dir, struct dentry *dentry)
 		return 0;
 	return call_int_hook(path_rmdir, 0, dir, dentry);
 }
+EXPORT_SYMBOL(security_path_rmdir);
 
 int security_path_unlink(struct path *dir, struct dentry *dentry)
 {
@@ -454,6 +450,7 @@ int security_path_symlink(struct path *dir, struct dentry *dentry,
 		return 0;
 	return call_int_hook(path_symlink, 0, dir, dentry, old_name);
 }
+EXPORT_SYMBOL(security_path_symlink);
 
 int security_path_link(struct dentry *old_dentry, struct path *new_dir,
 		       struct dentry *new_dentry)
@@ -462,6 +459,7 @@ int security_path_link(struct dentry *old_dentry, struct path *new_dir,
 		return 0;
 	return call_int_hook(path_link, 0, old_dentry, new_dir, new_dentry);
 }
+EXPORT_SYMBOL(security_path_link);
 
 int security_path_rename(struct path *old_dir, struct dentry *old_dentry,
 			 struct path *new_dir, struct dentry *new_dentry,
@@ -489,6 +487,7 @@ int security_path_truncate(struct path *path)
 		return 0;
 	return call_int_hook(path_truncate, 0, path);
 }
+EXPORT_SYMBOL(security_path_truncate);
 
 int security_path_chmod(struct path *path, umode_t mode)
 {
@@ -496,6 +495,7 @@ int security_path_chmod(struct path *path, umode_t mode)
 		return 0;
 	return call_int_hook(path_chmod, 0, path, mode);
 }
+EXPORT_SYMBOL(security_path_chmod);
 
 int security_path_chown(struct path *path, kuid_t uid, kgid_t gid)
 {
@@ -503,6 +503,7 @@ int security_path_chown(struct path *path, kuid_t uid, kgid_t gid)
 		return 0;
 	return call_int_hook(path_chown, 0, path, uid, gid);
 }
+EXPORT_SYMBOL(security_path_chown);
 
 int security_path_chroot(struct path *path)
 {
@@ -588,6 +589,7 @@ int security_inode_readlink(struct dentry *dentry)
 		return 0;
 	return call_int_hook(inode_readlink, 0, dentry);
 }
+EXPORT_SYMBOL(security_inode_readlink);
 
 int security_inode_follow_link(struct dentry *dentry, struct inode *inode,
 			       bool rcu)
@@ -603,6 +605,7 @@ int security_inode_permission(struct inode *inode, int mask)
 		return 0;
 	return call_int_hook(inode_permission, 0, inode, mask);
 }
+EXPORT_SYMBOL(security_inode_permission);
 
 int security_inode_setattr(struct dentry *dentry, struct iattr *attr)
 {
@@ -741,6 +744,7 @@ int security_file_permission(struct file *file, int mask)
 
 	return fsnotify_perm(file, mask);
 }
+EXPORT_SYMBOL(security_file_permission);
 
 int security_file_alloc(struct file *file)
 {
@@ -776,7 +780,7 @@ static inline unsigned long mmap_prot(struct file *file, unsigned long prot)
 	 * ditto if it's not on noexec mount, except that on !MMU we need
 	 * NOMMU_MAP_EXEC (== VM_MAYEXEC) in this case
 	 */
-	if (!(file->f_path.mnt->mnt_flags & MNT_NOEXEC)) {
+	if (!path_noexec(&file->f_path)) {
 #ifndef CONFIG_MMU
 		if (file->f_op->mmap_capabilities) {
 			unsigned caps = file->f_op->mmap_capabilities(file);
@@ -800,6 +804,7 @@ int security_mmap_file(struct file *file, unsigned long prot,
 		return ret;
 	return ima_file_mmap(file, prot);
 }
+EXPORT_SYMBOL(security_mmap_file);
 
 int security_mmap_addr(unsigned long addr)
 {
@@ -866,6 +871,13 @@ int security_cred_alloc_blank(struct cred *cred, gfp_t gfp)
 
 void security_cred_free(struct cred *cred)
 {
+	/*
+	 * There is a failure case in prepare_creds() that
+	 * may result in a call here with ->security being NULL.
+	 */
+	if (unlikely(cred->security == NULL))
+		return;
+
 	call_void_hook(cred_free, cred);
 }
 

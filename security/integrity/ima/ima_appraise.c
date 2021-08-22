@@ -147,6 +147,8 @@ void ima_get_hash_algo(struct evm_ima_xattr_data *xattr_value, int xattr_len,
 		break;
 	case IMA_XATTR_DIGEST_NG:
 		hash->algo = xattr_value->digest[0];
+		if (hash->algo >= HASH_ALGO__LAST)
+			hash->algo = ima_hash_algo;
 		break;
 	case IMA_XATTR_DIGEST:
 		/* this is for backward compatibility */
@@ -189,7 +191,7 @@ int ima_appraise_measurement(int func, struct integrity_iint_cache *iint,
 {
 	static const char op[] = "appraise_data";
 	char *cause = "unknown";
-	struct dentry *dentry = file->f_path.dentry;
+	struct dentry *dentry = file_dentry(file);
 	struct inode *inode = d_backing_inode(dentry);
 	enum integrity_status status = INTEGRITY_UNKNOWN;
 	int rc = xattr_len, hash_start = 0;
@@ -203,10 +205,12 @@ int ima_appraise_measurement(int func, struct integrity_iint_cache *iint,
 
 		cause = "missing-hash";
 		status = INTEGRITY_NOLABEL;
-		if (opened & FILE_CREATED) {
+		if (opened & FILE_CREATED)
 			iint->flags |= IMA_NEW_FILE;
+		if ((iint->flags & IMA_NEW_FILE) &&
+		    (!(iint->flags & IMA_DIGSIG_REQUIRED) ||
+		     (inode->i_size == 0)))
 			status = INTEGRITY_PASS;
-		}
 		goto out;
 	}
 
@@ -289,11 +293,14 @@ out:
  */
 void ima_update_xattr(struct integrity_iint_cache *iint, struct file *file)
 {
-	struct dentry *dentry = file->f_path.dentry;
+	struct dentry *dentry = file_dentry(file);
 	int rc = 0;
 
 	/* do not collect and update hash for digital signatures */
 	if (iint->flags & IMA_DIGSIG)
+		return;
+
+	if (iint->ima_file_status != INTEGRITY_PASS)
 		return;
 
 	rc = ima_collect_measurement(iint, file, NULL, NULL);
@@ -378,14 +385,10 @@ int ima_inode_setxattr(struct dentry *dentry, const char *xattr_name,
 	result = ima_protect_xattr(dentry, xattr_name, xattr_value,
 				   xattr_value_len);
 	if (result == 1) {
-		bool digsig;
-
 		if (!xattr_value_len || (xvalue->type >= IMA_XATTR_LAST))
 			return -EINVAL;
-		digsig = (xvalue->type == EVM_IMA_XATTR_DIGSIG);
-		if (!digsig && (ima_appraise & IMA_APPRAISE_ENFORCE))
-			return -EPERM;
-		ima_reset_appraise_flags(d_backing_inode(dentry), digsig);
+		ima_reset_appraise_flags(d_backing_inode(dentry),
+			 (xvalue->type == EVM_IMA_XATTR_DIGSIG) ? 1 : 0);
 		result = 0;
 	}
 	return result;

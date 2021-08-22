@@ -19,50 +19,49 @@ static inline void gro_cells_receive(struct gro_cells *gcells, struct sk_buff *s
 	struct gro_cell *cell;
 	struct net_device *dev = skb->dev;
 
+	rcu_read_lock();
+	if (unlikely(!(dev->flags & IFF_UP)))
+		goto drop;
+
 	if (!gcells->cells || skb_cloned(skb) || !(dev->features & NETIF_F_GRO)) {
 		netif_rx(skb);
-		return;
+		goto unlock;
 	}
 
 	cell = this_cpu_ptr(gcells->cells);
 
 	if (skb_queue_len(&cell->napi_skbs) > netdev_max_backlog) {
+drop:
 		atomic_long_inc(&dev->rx_dropped);
 		kfree_skb(skb);
-		return;
+		goto unlock;
 	}
-
-	/* We run in BH context */
-	spin_lock(&cell->napi_skbs.lock);
 
 	__skb_queue_tail(&cell->napi_skbs, skb);
 	if (skb_queue_len(&cell->napi_skbs) == 1)
 		napi_schedule(&cell->napi);
 
-	spin_unlock(&cell->napi_skbs.lock);
+unlock:
+	rcu_read_unlock();
 }
 
-/* called unser BH context */
+/* called under BH context */
 static inline int gro_cell_poll(struct napi_struct *napi, int budget)
 {
 	struct gro_cell *cell = container_of(napi, struct gro_cell, napi);
 	struct sk_buff *skb;
 	int work_done = 0;
 
-	spin_lock(&cell->napi_skbs.lock);
 	while (work_done < budget) {
 		skb = __skb_dequeue(&cell->napi_skbs);
 		if (!skb)
 			break;
-		spin_unlock(&cell->napi_skbs.lock);
 		napi_gro_receive(napi, skb);
 		work_done++;
-		spin_lock(&cell->napi_skbs.lock);
 	}
 
 	if (work_done < budget)
-		napi_complete(napi);
-	spin_unlock(&cell->napi_skbs.lock);
+		napi_complete_done(napi, work_done);
 	return work_done;
 }
 
@@ -77,7 +76,7 @@ static inline int gro_cells_init(struct gro_cells *gcells, struct net_device *de
 	for_each_possible_cpu(i) {
 		struct gro_cell *cell = per_cpu_ptr(gcells->cells, i);
 
-		skb_queue_head_init(&cell->napi_skbs);
+		__skb_queue_head_init(&cell->napi_skbs);
 		netif_napi_add(dev, &cell->napi, gro_cell_poll, 64);
 		napi_enable(&cell->napi);
 	}
@@ -92,8 +91,10 @@ static inline void gro_cells_destroy(struct gro_cells *gcells)
 		return;
 	for_each_possible_cpu(i) {
 		struct gro_cell *cell = per_cpu_ptr(gcells->cells, i);
+
+		napi_disable(&cell->napi);
 		netif_napi_del(&cell->napi);
-		skb_queue_purge(&cell->napi_skbs);
+		__skb_queue_purge(&cell->napi_skbs);
 	}
 	free_percpu(gcells->cells);
 	gcells->cells = NULL;

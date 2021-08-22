@@ -321,7 +321,7 @@ struct acpi_csrt_descriptor {
  * DBG2 - Debug Port Table 2
  *        Version 0 (Both main table and subtables)
  *
- * Conforms to "Microsoft Debug Port Table 2 (DBG2)", May 22 2012.
+ * Conforms to "Microsoft Debug Port Table 2 (DBG2)", December 10, 2015
  *
  ******************************************************************************/
 
@@ -371,6 +371,11 @@ struct acpi_dbg2_device {
 
 #define ACPI_DBG2_16550_COMPATIBLE  0x0000
 #define ACPI_DBG2_16550_SUBSET      0x0001
+#define ACPI_DBG2_ARM_PL011         0x0003
+#define ACPI_DBG2_ARM_SBSA_32BIT    0x000D
+#define ACPI_DBG2_ARM_SBSA_GENERIC  0x000E
+#define ACPI_DBG2_ARM_DCC           0x000F
+#define ACPI_DBG2_BCM2835           0x0010
 
 #define ACPI_DBG2_1394_STANDARD     0x0000
 
@@ -1186,20 +1191,29 @@ enum acpi_spmi_interface_types {
  * December 19, 2014
  *
  * NOTE: There are two versions of the table with the same signature --
- * the client version and the server version.
+ * the client version and the server version. The common platform_class
+ * field is used to differentiate the two types of tables.
  *
  ******************************************************************************/
 
-struct acpi_table_tcpa_client {
+struct acpi_table_tcpa_hdr {
 	struct acpi_table_header header;	/* Common ACPI table header */
 	u16 platform_class;
+};
+
+/*
+ * Values for platform_class above.
+ * This is how the client and server subtables are differentiated
+ */
+#define ACPI_TCPA_CLIENT_TABLE          0
+#define ACPI_TCPA_SERVER_TABLE          1
+
+struct acpi_table_tcpa_client {
 	u32 minimum_log_length;	/* Minimum length for the event log area */
 	u64 log_address;	/* Address of the event log area */
 };
 
 struct acpi_table_tcpa_server {
-	struct acpi_table_header header;	/* Common ACPI table header */
-	u16 platform_class;
 	u16 reserved;
 	u64 minimum_log_length;	/* Minimum length for the event log area */
 	u64 log_address;	/* Address of the event log area */

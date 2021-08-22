@@ -34,6 +34,9 @@
 
 #define BOND_DEFAULT_MIIMON	100
 
+#ifndef __long_aligned
+#define __long_aligned __attribute__((aligned((sizeof(long)))))
+#endif
 /*
  * Less bad way to call ioctl from within the kernel; this needs to be
  * done some other way to get the call out of interrupt context.
@@ -138,18 +141,14 @@ struct bond_params {
 	struct reciprocal_value reciprocal_packets_per_slave;
 	u16 ad_actor_sys_prio;
 	u16 ad_user_port_key;
-	u8 ad_actor_system[ETH_ALEN];
+
+	/* 2 bytes of padding : see ether_addr_equal_64bits() */
+	u8 ad_actor_system[ETH_ALEN + 2];
 };
 
 struct bond_parm_tbl {
 	char *modename;
 	int mode;
-};
-
-struct netdev_notify_work {
-	struct delayed_work	work;
-	struct net_device	*dev;
-	struct netdev_bonding_info bonding_info;
 };
 
 struct slave {
@@ -165,7 +164,8 @@ struct slave {
 	u8     backup:1,   /* indicates backup slave. Value corresponds with
 			      BOND_STATE_ACTIVE and BOND_STATE_BACKUP */
 	       inactive:1, /* indicates inactive slave */
-	       should_notify:1; /* indicateds whether the state changed */
+	       should_notify:1, /* indicates whether the state changed */
+	       should_notify_link:1; /* indicates whether the link changed */
 	u8     duplex;
 	u32    original_mtu;
 	u32    link_failure_count;
@@ -177,9 +177,15 @@ struct slave {
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	struct netpoll *np;
 #endif
+	struct delayed_work notify_work;
 	struct kobject kobj;
 	struct rtnl_link_stats64 slave_stats;
 };
+
+static inline struct slave *to_slave(struct kobject *kobj)
+{
+	return container_of(kobj, struct slave, kobj);
+}
 
 struct bond_up_slave {
 	unsigned int	count;
@@ -214,6 +220,7 @@ struct bonding {
 	 * ALB mode (6) - to sync the use and modifications of its hash table
 	 */
 	spinlock_t mode_lock;
+	spinlock_t stats_lock;
 	u8	 send_peer_notif;
 	u8       igmp_retrans;
 #ifdef CONFIG_PROC_FS
@@ -308,6 +315,13 @@ static inline bool bond_mode_uses_primary(int mode)
 static inline bool bond_uses_primary(struct bonding *bond)
 {
 	return bond_mode_uses_primary(BOND_MODE(bond));
+}
+
+static inline struct net_device *bond_option_active_slave_get_rcu(struct bonding *bond)
+{
+	struct slave *slave = rcu_dereference(bond->curr_active_slave);
+
+	return bond_uses_primary(bond) && slave ? slave->dev : NULL;
 }
 
 static inline bool bond_slave_is_up(struct slave *slave)
@@ -497,10 +511,35 @@ static inline bool bond_is_slave_inactive(struct slave *slave)
 	return slave->inactive;
 }
 
-static inline void bond_set_slave_link_state(struct slave *slave, int state)
+static inline void bond_set_slave_link_state(struct slave *slave, int state,
+					     bool notify)
 {
+	if (slave->link == state)
+		return;
+
 	slave->link = state;
-	bond_queue_slave_event(slave);
+	if (notify) {
+		bond_queue_slave_event(slave);
+		slave->should_notify_link = 0;
+	} else {
+		if (slave->should_notify_link)
+			slave->should_notify_link = 0;
+		else
+			slave->should_notify_link = 1;
+	}
+}
+
+static inline void bond_slave_link_notify(struct bonding *bond)
+{
+	struct list_head *iter;
+	struct slave *tmp;
+
+	bond_for_each_slave(bond, tmp, iter) {
+		if (tmp->should_notify_link) {
+			bond_queue_slave_event(tmp);
+			tmp->should_notify_link = 0;
+		}
+	}
 }
 
 static inline __be32 bond_confirm_addr(struct net_device *dev, __be32 dst, __be32 local)
@@ -658,6 +697,9 @@ extern struct bond_parm_tbl ad_select_tbl[];
 
 /* exported from bond_netlink.c */
 extern struct rtnl_link_ops bond_link_ops;
+
+/* exported from bond_sysfs_slave.c */
+extern const struct sysfs_ops slave_sysfs_ops;
 
 static inline void bond_tx_drop(struct net_device *dev, struct sk_buff *skb)
 {

@@ -107,7 +107,7 @@ int v9fs_fid_xattr_set(struct p9_fid *fid, const char *name,
 {
 	struct kvec kvec = {.iov_base = (void *)value, .iov_len = value_len};
 	struct iov_iter from;
-	int retval;
+	int retval, err;
 
 	iov_iter_kvec(&from, WRITE | ITER_KVEC, &kvec, 1, value_len);
 
@@ -128,7 +128,9 @@ int v9fs_fid_xattr_set(struct p9_fid *fid, const char *name,
 			 retval);
 	else
 		p9_client_write(fid, 0, &from, &retval);
-	p9_client_clunk(fid);
+	err = p9_client_clunk(fid);
+	if (!retval && err)
+		retval = err;
 	return retval;
 }
 
@@ -136,6 +138,48 @@ ssize_t v9fs_listxattr(struct dentry *dentry, char *buffer, size_t buffer_size)
 {
 	return v9fs_xattr_get(dentry, NULL, buffer, buffer_size);
 }
+
+static int v9fs_xattr_handler_get(const struct xattr_handler *handler,
+				  struct dentry *dentry, const char *name,
+				  void *buffer, size_t size)
+{
+	const char *full_name = xattr_full_name(handler, name);
+
+	if (strcmp(name, "") == 0)
+		return -EINVAL;
+	return v9fs_xattr_get(dentry, full_name, buffer, size);
+}
+
+static int v9fs_xattr_handler_set(const struct xattr_handler *handler,
+				  struct dentry *dentry, const char *name,
+				  const void *value, size_t size, int flags)
+{
+	const char *full_name = xattr_full_name(handler, name);
+
+	if (strcmp(name, "") == 0)
+		return -EINVAL;
+	return v9fs_xattr_set(dentry, full_name, value, size, flags);
+}
+
+static struct xattr_handler v9fs_xattr_user_handler = {
+	.prefix	= XATTR_USER_PREFIX,
+	.get	= v9fs_xattr_handler_get,
+	.set	= v9fs_xattr_handler_set,
+};
+
+static struct xattr_handler v9fs_xattr_trusted_handler = {
+	.prefix	= XATTR_TRUSTED_PREFIX,
+	.get	= v9fs_xattr_handler_get,
+	.set	= v9fs_xattr_handler_set,
+};
+
+#ifdef CONFIG_9P_FS_SECURITY
+static struct xattr_handler v9fs_xattr_security_handler = {
+	.prefix	= XATTR_SECURITY_PREFIX,
+	.get	= v9fs_xattr_handler_get,
+	.set	= v9fs_xattr_handler_set,
+};
+#endif
 
 const struct xattr_handler *v9fs_xattr_handlers[] = {
 	&v9fs_xattr_user_handler,

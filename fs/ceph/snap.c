@@ -338,12 +338,6 @@ static int build_snap_context(struct ceph_snap_realm *realm)
 		return 0;
 	}
 
-	if (num == 0 && realm->seq == ceph_empty_snapc->seq) {
-		ceph_get_snap_context(ceph_empty_snapc);
-		snapc = ceph_empty_snapc;
-		goto done;
-	}
-
 	/* alloc new snap context */
 	err = -ENOMEM;
 	if (num > (SIZE_MAX - sizeof(*snapc)) / sizeof(u64))
@@ -381,7 +375,6 @@ static int build_snap_context(struct ceph_snap_realm *realm)
 	     realm->ino, realm, snapc, snapc->seq,
 	     (unsigned int) snapc->num_snaps);
 
-done:
 	ceph_put_snap_context(realm->cached_context);
 	realm->cached_context = snapc;
 	return 0;
@@ -574,7 +567,12 @@ void ceph_queue_cap_snap(struct ceph_inode_info *ci)
 	capsnap = NULL;
 
 update_snapc:
-	if (ci->i_head_snapc) {
+       if (ci->i_wrbuffer_ref_head == 0 &&
+           ci->i_wr_ref == 0 &&
+           ci->i_dirty_caps == 0 &&
+           ci->i_flushing_caps == 0) {
+               ci->i_head_snapc = NULL;
+       } else {
 		ci->i_head_snapc = ceph_get_snap_context(new_snapc);
 		dout(" new snapc is %p\n", new_snapc);
 	}
@@ -618,7 +616,8 @@ int __ceph_finish_cap_snap(struct ceph_inode_info *ci,
 	     capsnap->size);
 
 	spin_lock(&mdsc->snap_flush_lock);
-	list_add_tail(&ci->i_snap_flush_item, &mdsc->snap_flush_list);
+	if (list_empty(&ci->i_snap_flush_item))
+		list_add_tail(&ci->i_snap_flush_item, &mdsc->snap_flush_list);
 	spin_unlock(&mdsc->snap_flush_lock);
 	return 1;  /* caller may want to ceph_flush_snaps */
 }

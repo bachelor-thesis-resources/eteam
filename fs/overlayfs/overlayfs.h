@@ -27,6 +27,8 @@ enum ovl_path_type {
 #define OVL_XATTR_PRE_LEN  16
 #define OVL_XATTR_OPAQUE   OVL_XATTR_PRE_NAME"opaque"
 
+extern const char *ovl_whiteout_xattr; /* XXX: should be ^^ */
+
 static inline int ovl_do_rmdir(struct inode *dir, struct dentry *dentry)
 {
 	int err = vfs_rmdir(dir, dentry);
@@ -93,7 +95,14 @@ static inline int ovl_do_symlink(struct inode *dir, struct dentry *dentry,
 static inline int ovl_do_setxattr(struct dentry *dentry, const char *name,
 				  const void *value, size_t size, int flags)
 {
-	int err = vfs_setxattr(dentry, name, value, size, flags);
+	struct inode *inode = dentry->d_inode;
+	int err = -EOPNOTSUPP;
+
+	mutex_lock(&inode->i_mutex);
+	if (inode->i_op->setxattr)
+		err = inode->i_op->setxattr(dentry, name, value, size, flags);
+	mutex_unlock(&inode->i_mutex);
+
 	pr_debug("setxattr(%pd2, \"%s\", \"%*s\", 0x%x) = %i\n",
 		 dentry, name, (int) size, (char *) value, flags, err);
 	return err;
@@ -101,7 +110,14 @@ static inline int ovl_do_setxattr(struct dentry *dentry, const char *name,
 
 static inline int ovl_do_removexattr(struct dentry *dentry, const char *name)
 {
-	int err = vfs_removexattr(dentry, name);
+	struct inode *inode = dentry->d_inode;
+	int err = -EOPNOTSUPP;
+
+	mutex_lock(&inode->i_mutex);
+	if (inode->i_op->removexattr)
+		err = inode->i_op->removexattr(dentry, name);
+	mutex_unlock(&inode->i_mutex);
+
 	pr_debug("removexattr(%pd2, \"%s\") = %i\n", dentry, name, err);
 	return err;
 }
@@ -124,13 +140,30 @@ static inline int ovl_do_rename(struct inode *olddir, struct dentry *olddentry,
 	return err;
 }
 
-static inline int ovl_do_whiteout(struct inode *dir, struct dentry *dentry)
+#ifdef CONFIG_OVERLAY_FS_V1
+extern int ovl_config_legacy(struct dentry *dentry);
+#else
+#define ovl_config_legacy(x) (0)
+#endif
+
+int ovl_do_whiteout_v1(struct inode *dir, struct dentry *dentry);
+
+static inline int ovl_do_whiteout_v2(struct inode *dir, struct dentry *dentry)
 {
 	int err = vfs_whiteout(dir, dentry);
 	pr_debug("whiteout(%pd2) = %i\n", dentry, err);
 	return err;
 }
+static inline int ovl_do_whiteout(struct inode *dir, struct dentry *dentry,
+				  struct dentry *ovlentry)
+{
+	if (ovl_config_legacy(ovlentry))
+		return ovl_do_whiteout_v1(dir, dentry);
 
+	return ovl_do_whiteout_v2(dir, dentry);
+}
+
+struct super_block *ovl_same_sb(struct super_block *sb);
 enum ovl_path_type ovl_path_type(struct dentry *dentry);
 u64 ovl_dentry_version_get(struct dentry *dentry);
 void ovl_dentry_version_inc(struct dentry *dentry);
@@ -149,7 +182,8 @@ int ovl_want_write(struct dentry *dentry);
 void ovl_drop_write(struct dentry *dentry);
 bool ovl_dentry_is_opaque(struct dentry *dentry);
 void ovl_dentry_set_opaque(struct dentry *dentry, bool opaque);
-bool ovl_is_whiteout(struct dentry *dentry);
+bool ovl_is_whiteout(struct dentry *dentry, int is_legacy);
+const struct cred *ovl_override_creds(struct super_block *sb);
 void ovl_dentry_update(struct dentry *dentry, struct dentry *upperdentry);
 struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
 			  unsigned int flags);
@@ -157,12 +191,16 @@ struct file *ovl_path_open(struct path *path, int flags);
 
 struct dentry *ovl_upper_create(struct dentry *upperdir, struct dentry *dentry,
 				struct kstat *stat, const char *link);
+int ovl_dentry_root_may(struct dentry *dentry, struct path *realpath, int mode);
 
 /* readdir.c */
 extern const struct file_operations ovl_dir_operations;
 int ovl_check_empty_dir(struct dentry *dentry, struct list_head *list);
 void ovl_cleanup_whiteouts(struct dentry *upper, struct list_head *list);
 void ovl_cache_free(struct list_head *list);
+int ovl_check_d_type_supported(struct path *realpath);
+void ovl_workdir_cleanup(struct inode *dir, struct vfsmount *mnt,
+			 struct dentry *dentry, int level);
 
 /* inode.c */
 int ovl_setattr(struct dentry *dentry, struct iattr *attr);
@@ -174,6 +212,7 @@ ssize_t ovl_getxattr(struct dentry *dentry, const char *name,
 ssize_t ovl_listxattr(struct dentry *dentry, char *list, size_t size);
 int ovl_removexattr(struct dentry *dentry, const char *name);
 struct inode *ovl_d_select_inode(struct dentry *dentry, unsigned file_flags);
+bool ovl_is_private_xattr(const char *name);
 
 struct inode *ovl_new_inode(struct super_block *sb, umode_t mode,
 			    struct ovl_entry *oe);
@@ -181,6 +220,7 @@ static inline void ovl_copyattr(struct inode *from, struct inode *to)
 {
 	to->i_uid = from->i_uid;
 	to->i_gid = from->i_gid;
+	to->i_mode = from->i_mode;
 }
 
 /* dir.c */
@@ -194,7 +234,6 @@ void ovl_cleanup(struct inode *dir, struct dentry *dentry);
 /* copy_up.c */
 int ovl_copy_up(struct dentry *dentry);
 int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
-		    struct path *lowerpath, struct kstat *stat,
-		    struct iattr *attr);
+		    struct path *lowerpath, struct kstat *stat);
 int ovl_copy_xattr(struct dentry *old, struct dentry *new);
 int ovl_set_attr(struct dentry *upper, struct kstat *stat);

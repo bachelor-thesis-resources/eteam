@@ -36,7 +36,7 @@ static const char *keyring_name[INTEGRITY_KEYRING_MAX] = {
 int integrity_digsig_verify(const unsigned int id, const char *sig, int siglen,
 			    const char *digest, int digestlen)
 {
-	if (id >= INTEGRITY_KEYRING_MAX)
+	if (id >= INTEGRITY_KEYRING_MAX || siglen < 2)
 		return -EINVAL;
 
 	if (!keyring[id]) {
@@ -105,7 +105,7 @@ int __init integrity_load_x509(const unsigned int id, const char *path)
 				   rc,
 				   ((KEY_POS_ALL & ~KEY_POS_SETATTR) |
 				    KEY_USR_VIEW | KEY_USR_READ),
-				   KEY_ALLOC_NOT_IN_QUOTA | KEY_ALLOC_TRUSTED);
+				   KEY_ALLOC_NOT_IN_QUOTA);
 	if (IS_ERR(key)) {
 		rc = PTR_ERR(key);
 		pr_err("Problem loading X.509 certificate (%d): %s\n",

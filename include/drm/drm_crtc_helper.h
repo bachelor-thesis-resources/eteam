@@ -108,8 +108,10 @@ struct drm_crtc_helper_funcs {
 	/* atomic helpers */
 	int (*atomic_check)(struct drm_crtc *crtc,
 			    struct drm_crtc_state *state);
-	void (*atomic_begin)(struct drm_crtc *crtc);
-	void (*atomic_flush)(struct drm_crtc *crtc);
+	void (*atomic_begin)(struct drm_crtc *crtc,
+			     struct drm_crtc_state *old_crtc_state);
+	void (*atomic_flush)(struct drm_crtc *crtc,
+			     struct drm_crtc_state *old_crtc_state);
 };
 
 /**
@@ -187,10 +189,13 @@ extern bool drm_crtc_helper_set_mode(struct drm_crtc *crtc,
 				     struct drm_display_mode *mode,
 				     int x, int y,
 				     struct drm_framebuffer *old_fb);
+extern void drm_helper_crtc_enable_color_mgmt(struct drm_crtc *crtc,
+					      int degamma_lut_size,
+					      int gamma_lut_size);
 extern bool drm_helper_crtc_in_use(struct drm_crtc *crtc);
 extern bool drm_helper_encoder_in_use(struct drm_encoder *encoder);
 
-extern void drm_helper_connector_dpms(struct drm_connector *connector, int mode);
+extern int drm_helper_connector_dpms(struct drm_connector *connector, int mode);
 
 extern void drm_helper_move_panel_connectors_to_head(struct drm_device *);
 
@@ -238,5 +243,7 @@ extern void drm_kms_helper_hotplug_event(struct drm_device *dev);
 
 extern void drm_kms_helper_poll_disable(struct drm_device *dev);
 extern void drm_kms_helper_poll_enable(struct drm_device *dev);
+extern void drm_kms_helper_poll_enable_locked(struct drm_device *dev);
+extern bool drm_kms_helper_is_poll_worker(void);
 
 #endif

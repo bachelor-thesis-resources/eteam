@@ -34,8 +34,10 @@
  *  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <linux/fs.h>
 #include <linux/slab.h>
-#include <linux/nfs_fs.h>
+#include <linux/posix_acl.h>
+
 #include "nfsfh.h"
 #include "nfsd.h"
 #include "acl.h"
@@ -100,7 +102,7 @@ deny_mask_from_posix(unsigned short perm, u32 flags)
 /* We only map from NFSv4 to POSIX ACLs when setting ACLs, when we err on the
  * side of being more restrictive, so the mode bit mapping below is
  * pessimistic.  An optimistic version would be needed to handle DENY's,
- * but we espect to coalesce all ALLOWs and DENYs before mapping to mode
+ * but we expect to coalesce all ALLOWs and DENYs before mapping to mode
  * bits. */
 
 static void
@@ -458,7 +460,7 @@ init_state(struct posix_acl_state *state, int cnt)
 	state->empty = 1;
 	/*
 	 * In the worst case, each individual acl could be for a distinct
-	 * named user or group, but we don't no which, so we allocate
+	 * named user or group, but we don't know which, so we allocate
 	 * enough space for either:
 	 */
 	alloc = sizeof(struct posix_ace_state_array)
@@ -768,9 +770,6 @@ nfsd4_set_nfs4_acl(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	dentry = fhp->fh_dentry;
 	inode = d_inode(dentry);
 
-	if (!inode->i_op->set_acl || !IS_POSIXACL(inode))
-		return nfserr_attrnotsupp;
-
 	if (S_ISDIR(inode->i_mode))
 		flags = NFS4_ACL_DIR;
 
@@ -780,16 +779,19 @@ nfsd4_set_nfs4_acl(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	if (host_error < 0)
 		goto out_nfserr;
 
-	host_error = inode->i_op->set_acl(inode, pacl, ACL_TYPE_ACCESS);
+	fh_lock(fhp);
+
+	host_error = set_posix_acl(inode, ACL_TYPE_ACCESS, pacl);
 	if (host_error < 0)
-		goto out_release;
+		goto out_drop_lock;
 
 	if (S_ISDIR(inode->i_mode)) {
-		host_error = inode->i_op->set_acl(inode, dpacl,
-						  ACL_TYPE_DEFAULT);
+		host_error = set_posix_acl(inode, ACL_TYPE_DEFAULT, dpacl);
 	}
 
-out_release:
+out_drop_lock:
+	fh_unlock(fhp);
+
 	posix_acl_release(pacl);
 	posix_acl_release(dpacl);
 out_nfserr:

@@ -47,6 +47,13 @@ typedef __uint64_t	xfs_filblks_t;	/* number of blocks in a file */
 typedef	__int64_t	xfs_srtblock_t;	/* signed version of xfs_rtblock_t */
 typedef __int64_t	xfs_sfiloff_t;	/* signed block number in a file */
 
+
+/*
+ * New verifiers will return the instruction address of the failing check.
+ * NULL means everything is ok.
+ */
+typedef void *		xfs_failaddr_t;
+
 /*
  * Null values for the types.
  */

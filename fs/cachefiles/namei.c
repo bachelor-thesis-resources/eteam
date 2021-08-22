@@ -190,11 +190,12 @@ try_again:
 	/* an old object from a previous incarnation is hogging the slot - we
 	 * need to wait for it to be destroyed */
 wait_for_old_object:
+	clear_bit(CACHEFILES_OBJECT_ACTIVE, &object->flags);
+
 	if (fscache_object_is_live(&xobject->fscache)) {
 		pr_err("\n");
 		pr_err("Error: Unexpected object collision\n");
 		cachefiles_printk_object(object, xobject);
-		BUG();
 	}
 	atomic_inc(&xobject->usage);
 	write_unlock(&cache->active_lock);
@@ -251,7 +252,6 @@ wait_for_old_object:
 	goto try_again;
 
 requeue:
-	clear_bit(CACHEFILES_OBJECT_ACTIVE, &object->flags);
 	cache->cache.ops->put_object(&xobject->fscache);
 	_leave(" = -ETIMEDOUT");
 	return -ETIMEDOUT;
@@ -318,7 +318,7 @@ try_again:
 	trap = lock_rename(cache->graveyard, dir);
 
 	/* do some checks before getting the grave dentry */
-	if (rep->d_parent != dir) {
+	if (rep->d_parent != dir || IS_DEADDIR(d_inode(rep))) {
 		/* the entry was probably culled when we dropped the parent dir
 		 * lock */
 		unlock_rename(cache->graveyard, dir);
@@ -654,6 +654,8 @@ lookup_again:
 			ret = -EPERM;
 			aops = d_backing_inode(object->dentry)->i_mapping->a_ops;
 			if (!aops->bmap)
+				goto check_error;
+			if (object->dentry->d_sb->s_blocksize > PAGE_SIZE)
 				goto check_error;
 
 			object->backer = object->dentry;
