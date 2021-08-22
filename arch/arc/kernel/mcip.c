@@ -11,29 +11,33 @@
 #include <linux/smp.h>
 #include <linux/irq.h>
 #include <linux/spinlock.h>
+#include <asm/irqflags-arcv2.h>
 #include <asm/mcip.h>
+#include <asm/setup.h>
+
+#define SOFTIRQ_IRQ	21
 
 static char smp_cpuinfo_buf[128];
 static int idu_detected;
 
 static DEFINE_RAW_SPINLOCK(mcip_lock);
 
-/*
- * Any SMP specific init any CPU does when it comes up.
- * Here we setup the CPU to enable Inter-Processor-Interrupts
- * Called for each CPU
- * -Master      : init_IRQ()
- * -Other(s)    : start_kernel_secondary()
- */
-void mcip_init_smp(unsigned int cpu)
+static void mcip_setup_per_cpu(int cpu)
 {
 	smp_ipi_irq_setup(cpu, IPI_IRQ);
+	smp_ipi_irq_setup(cpu, SOFTIRQ_IRQ);
 }
 
 static void mcip_ipi_send(int cpu)
 {
 	unsigned long flags;
 	int ipi_was_pending;
+
+	/* ARConnect can only send IPI to others */
+	if (unlikely(cpu == raw_smp_processor_id())) {
+		arc_softirq_trigger(SOFTIRQ_IRQ);
+		return;
+	}
 
 	/*
 	 * NOTE: We must spin here if the other cpu hasn't yet
@@ -69,6 +73,11 @@ static void mcip_ipi_clear(int irq)
 	unsigned long flags;
 	unsigned int __maybe_unused copy;
 
+	if (unlikely(irq == SOFTIRQ_IRQ)) {
+		arc_softirq_clear(irq);
+		return;
+	}
+
 	raw_spin_lock_irqsave(&mcip_lock, flags);
 
 	/* Who sent the IPI */
@@ -96,34 +105,8 @@ static void mcip_ipi_clear(int irq)
 #endif
 }
 
-volatile int wake_flag;
-
-static void mcip_wakeup_cpu(int cpu, unsigned long pc)
+static void mcip_probe_n_setup(void)
 {
-	BUG_ON(cpu == 0);
-	wake_flag = cpu;
-}
-
-void arc_platform_smp_wait_to_boot(int cpu)
-{
-	while (wake_flag != cpu)
-		;
-
-	wake_flag = 0;
-	__asm__ __volatile__("j @first_lines_of_secondary	\n");
-}
-
-struct plat_smp_ops plat_smp_ops = {
-	.info		= smp_cpuinfo_buf,
-	.cpu_kick	= mcip_wakeup_cpu,
-	.ipi_send	= mcip_ipi_send,
-	.ipi_clear	= mcip_ipi_clear,
-};
-
-void mcip_init_early_smp(void)
-{
-#define IS_AVAIL1(var, str)    ((var) ? str : "")
-
 	struct mcip_bcr {
 #ifdef CONFIG_CPU_BIG_ENDIAN
 		unsigned int pad3:8,
@@ -160,6 +143,14 @@ void mcip_init_early_smp(void)
 	if (IS_ENABLED(CONFIG_ARC_HAS_GRTC) && !mp.grtc)
 		panic("kernel trying to use non-existent GRTC\n");
 }
+
+struct plat_smp_ops plat_smp_ops = {
+	.info		= smp_cpuinfo_buf,
+	.init_early_smp	= mcip_probe_n_setup,
+	.init_per_cpu	= mcip_setup_per_cpu,
+	.ipi_send	= mcip_ipi_send,
+	.ipi_clear	= mcip_ipi_clear,
+};
 
 /***************************************************************************
  * ARCv2 Interrupt Distribution Unit (IDU)
@@ -252,9 +243,10 @@ static struct irq_chip idu_irq_chip = {
 
 static int idu_first_irq;
 
-static void idu_cascade_isr(unsigned int core_irq, struct irq_desc *desc)
+static void idu_cascade_isr(struct irq_desc *desc)
 {
 	struct irq_domain *domain = irq_desc_get_handler_data(desc);
+	unsigned int core_irq = irq_desc_get_irq(desc);
 	unsigned int idu_irq;
 
 	idu_irq = core_irq - idu_first_irq;

@@ -12,9 +12,9 @@ ifeq ($(CROSS_COMPILE),)
 CROSS_COMPILE := arc-linux-
 endif
 
-KBUILD_DEFCONFIG := nsim_700_defconfig
+KBUILD_DEFCONFIG := nsim_hs_defconfig
 
-cflags-y	+= -fno-common -pipe -fno-builtin -D__linux__
+cflags-y	+= -fno-common -pipe -fno-builtin -mmedium-calls -D__linux__
 cflags-$(CONFIG_ISA_ARCOMPACT)	+= -mA7
 cflags-$(CONFIG_ISA_ARCV2)	+= -mcpu=archs
 
@@ -48,8 +48,6 @@ endif
 
 endif
 
-cflags-$(CONFIG_ARC_DW2_UNWIND)		+= -fasynchronous-unwind-tables
-
 # By default gcc 4.8 generates dwarf4 which kernel unwinder can't grok
 ifeq ($(atleast_gcc48),y)
 cflags-$(CONFIG_ARC_DW2_UNWIND)		+= -gdwarf-2
@@ -74,14 +72,10 @@ ldflags-$(CONFIG_CPU_BIG_ENDIAN)	+= -EB
 # --build-id w/o "-marclinux". Default arc-elf32-ld is OK
 ldflags-$(upto_gcc44)			+= -marclinux
 
-ifndef CONFIG_ARC_HAS_HW_MPY
-	cflags-y	+= -mno-mpy
-endif
-
 LIBGCC	:= $(shell $(CC) $(cflags-y) --print-libgcc-file-name)
 
 # Modules with short calls might break for calls into builtin-kernel
-KBUILD_CFLAGS_MODULE	+= -mlong-calls
+KBUILD_CFLAGS_MODULE	+= -mlong-calls -mno-millicode
 
 # Finally dump eveything into kernel build system
 KBUILD_CFLAGS	+= $(cflags-y)
@@ -114,6 +108,7 @@ bootpImage: vmlinux
 
 boot_targets += uImage uImage.bin uImage.gz
 
+PHONY += $(boot_targets)
 $(boot_targets): vmlinux
 	$(Q)$(MAKE) $(build)=$(boot) $(boot)/$@
 
@@ -121,20 +116,7 @@ $(boot_targets): vmlinux
 	$(Q)$(MAKE) $(build)=$(boot)/dts $(boot)/dts/$@
 
 dtbs: scripts
-	$(Q)$(MAKE) $(build)=$(boot)/dts dtbs
+	$(Q)$(MAKE) $(build)=$(boot)/dts
 
 archclean:
 	$(Q)$(MAKE) $(clean)=$(boot)
-
-# Hacks to enable final link due to absence of link-time branch relexation
-# and gcc choosing optimal(shorter) branches at -O3
-#
-# vineetg Feb 2010: -mlong-calls switched off for overall kernel build
-# However lib/decompress_inflate.o (.init.text) calls
-# zlib_inflate_workspacesize (.text) causing relocation errors.
-# Thus forcing all exten calls in this file to be long calls
-export CFLAGS_decompress_inflate.o = -mmedium-calls
-export CFLAGS_initramfs.o = -mmedium-calls
-ifdef CONFIG_SMP
-export CFLAGS_core.o = -mmedium-calls
-endif

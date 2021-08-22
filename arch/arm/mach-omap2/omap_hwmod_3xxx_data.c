@@ -26,7 +26,6 @@
 #include <linux/platform_data/asoc-ti-mcbsp.h>
 #include <linux/platform_data/spi-omap2-mcspi.h>
 #include <linux/platform_data/iommu-omap.h>
-#include <linux/platform_data/mailbox-omap.h>
 #include <plat/dmtimer.h>
 
 #include "soc.h"
@@ -724,8 +723,20 @@ static struct omap_hwmod omap3xxx_dss_dispc_hwmod = {
  * display serial interface controller
  */
 
+static struct omap_hwmod_class_sysconfig omap3xxx_dsi_sysc = {
+	.rev_offs	= 0x0000,
+	.sysc_offs	= 0x0010,
+	.syss_offs	= 0x0014,
+	.sysc_flags	= (SYSC_HAS_AUTOIDLE | SYSC_HAS_CLOCKACTIVITY |
+			   SYSC_HAS_ENAWAKEUP | SYSC_HAS_SIDLEMODE |
+			   SYSC_HAS_SOFTRESET | SYSS_HAS_RESET_STATUS),
+	.idlemodes	= (SIDLE_FORCE | SIDLE_NO | SIDLE_SMART),
+	.sysc_fields	= &omap_hwmod_sysc_type1,
+};
+
 static struct omap_hwmod_class omap3xxx_dsi_hwmod_class = {
 	.name = "dsi",
+	.sysc	= &omap3xxx_dsi_sysc,
 };
 
 static struct omap_hwmod_irq_info omap3xxx_dsi1_irqs[] = {
@@ -1506,26 +1517,9 @@ static struct omap_hwmod_class omap3xxx_mailbox_hwmod_class = {
 	.sysc = &omap3xxx_mailbox_sysc,
 };
 
-static struct omap_mbox_dev_info omap3xxx_mailbox_info[] = {
-	{ .name = "dsp", .tx_id = 0, .rx_id = 1 },
-};
-
-static struct omap_mbox_pdata omap3xxx_mailbox_attrs = {
-	.num_users	= 2,
-	.num_fifos	= 2,
-	.info_cnt	= ARRAY_SIZE(omap3xxx_mailbox_info),
-	.info		= omap3xxx_mailbox_info,
-};
-
-static struct omap_hwmod_irq_info omap3xxx_mailbox_irqs[] = {
-	{ .irq = 26 + OMAP_INTC_START, },
-	{ .irq = -1 },
-};
-
 static struct omap_hwmod omap3xxx_mailbox_hwmod = {
 	.name		= "mailbox",
 	.class		= &omap3xxx_mailbox_hwmod_class,
-	.mpu_irqs	= omap3xxx_mailbox_irqs,
 	.main_clk	= "mailboxes_ick",
 	.prcm		= {
 		.omap2 = {
@@ -1536,7 +1530,6 @@ static struct omap_hwmod omap3xxx_mailbox_hwmod = {
 			.idlest_idle_bit = OMAP3430_ST_MAILBOXES_SHIFT,
 		},
 	},
-	.dev_attr	= &omap3xxx_mailbox_attrs,
 };
 
 /*
@@ -3276,20 +3269,10 @@ static struct omap_hwmod_ocp_if omap3xxx_l4_per__mcbsp3_sidetone = {
 	.user		= OCP_USER_MPU,
 };
 
-static struct omap_hwmod_addr_space omap3xxx_mailbox_addrs[] = {
-	{
-		.pa_start	= 0x48094000,
-		.pa_end		= 0x480941ff,
-		.flags		= ADDR_TYPE_RT,
-	},
-	{ }
-};
-
 /* l4_core -> mailbox */
 static struct omap_hwmod_ocp_if omap3xxx_l4_core__mailbox = {
 	.master		= &omap3xxx_l4_core_hwmod,
 	.slave		= &omap3xxx_mailbox_hwmod,
-	.addr		= omap3xxx_mailbox_addrs,
 	.user		= OCP_USER_MPU | OCP_USER_SDMA,
 };
 
@@ -3902,16 +3885,20 @@ static struct omap_hwmod_ocp_if *omap3xxx_dss_hwmod_ocp_ifs[] __initdata = {
  * Return: 0 if device named @dev_name is not likely to be accessible,
  * or 1 if it is likely to be accessible.
  */
-static int __init omap3xxx_hwmod_is_hs_ip_block_usable(struct device_node *bus,
-						       const char *dev_name)
+static bool __init omap3xxx_hwmod_is_hs_ip_block_usable(struct device_node *bus,
+							const char *dev_name)
 {
+	struct device_node *node;
+	bool available;
+
 	if (!bus)
-		return (omap_type() == OMAP2_DEVICE_TYPE_GP) ? 1 : 0;
+		return omap_type() == OMAP2_DEVICE_TYPE_GP;
 
-	if (of_device_is_available(of_find_node_by_name(bus, dev_name)))
-		return 1;
+	node = of_get_child_by_name(bus, dev_name);
+	available = of_device_is_available(node);
+	of_node_put(node);
 
-	return 0;
+	return available;
 }
 
 int __init omap3xxx_hwmod_init(void)
@@ -3980,15 +3967,20 @@ int __init omap3xxx_hwmod_init(void)
 
 	if (h_sham && omap3xxx_hwmod_is_hs_ip_block_usable(bus, "sham")) {
 		r = omap_hwmod_register_links(h_sham);
-		if (r < 0)
+		if (r < 0) {
+			of_node_put(bus);
 			return r;
+		}
 	}
 
 	if (h_aes && omap3xxx_hwmod_is_hs_ip_block_usable(bus, "aes")) {
 		r = omap_hwmod_register_links(h_aes);
-		if (r < 0)
+		if (r < 0) {
+			of_node_put(bus);
 			return r;
+		}
 	}
+	of_node_put(bus);
 
 	/*
 	 * Register hwmod links specific to certain ES levels of a

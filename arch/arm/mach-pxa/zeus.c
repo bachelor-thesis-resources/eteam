@@ -13,6 +13,7 @@
 
 #include <linux/cpufreq.h>
 #include <linux/interrupt.h>
+#include <linux/leds.h>
 #include <linux/irq.h>
 #include <linux/pm.h>
 #include <linux/gpio.h>
@@ -105,8 +106,9 @@ static inline unsigned long zeus_irq_pending(void)
 	return __raw_readw(ZEUS_CPLD_ISA_IRQ) & zeus_irq_enabled_mask;
 }
 
-static void zeus_irq_handler(unsigned int irq, struct irq_desc *desc)
+static void zeus_irq_handler(struct irq_desc *desc)
 {
+	unsigned int irq;
 	unsigned long pending;
 
 	pending = zeus_irq_pending();
@@ -151,7 +153,7 @@ static void __init zeus_init_irq(void)
 		isa_irq = zeus_bit_to_irq(level);
 		irq_set_chip_and_handler(isa_irq, &zeus_irq_chip,
 					 handle_edge_irq);
-		set_irq_flags(isa_irq, IRQF_VALID | IRQF_PROBE);
+		irq_clear_status_flags(isa_irq, IRQ_NOREQUEST | IRQ_NOPROBE);
 	}
 
 	irq_set_irq_type(gpio_to_irq(ZEUS_ISA_GPIO), IRQ_TYPE_EDGE_RISING);
@@ -556,7 +558,7 @@ static struct pxaohci_platform_data zeus_ohci_platform_data = {
 	.flags		= ENABLE_PORT_ALL | POWER_SENSE_LOW,
 };
 
-static void zeus_register_ohci(void)
+static void __init zeus_register_ohci(void)
 {
 	/* Port 2 is shared between host and client interface. */
 	UP2OCR = UP2OCR_HXOE | UP2OCR_HXS | UP2OCR_DMPDE | UP2OCR_DPPDE;

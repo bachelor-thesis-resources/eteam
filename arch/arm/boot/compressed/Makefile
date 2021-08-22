@@ -3,6 +3,7 @@
 #
 # create a compressed vmlinuz image from the original vmlinux
 #
+KBUILD_CFLAGS := $(filter-out -fstack-protector, $(KBUILD_CFLAGS)) -fno-stack-protector
 
 OBJS		=
 
@@ -49,10 +50,6 @@ OBJS		+= big-endian.o
 else
 # The endian should be set by h/w design.
 endif
-endif
-
-ifeq ($(CONFIG_ARCH_SHMOBILE_LEGACY),y)
-OBJS		+= head-shmobile.o
 endif
 
 #
