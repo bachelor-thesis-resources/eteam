@@ -45,9 +45,7 @@ int msm_gem_prime_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma)
 {
 	int ret;
 
-	mutex_lock(&obj->dev->struct_mutex);
 	ret = drm_gem_mmap_obj(obj, obj->size, vma);
-	mutex_unlock(&obj->dev->struct_mutex);
 	if (ret < 0)
 		return ret;
 
@@ -71,4 +69,11 @@ void msm_gem_prime_unpin(struct drm_gem_object *obj)
 {
 	if (!obj->import_attach)
 		msm_gem_put_pages(obj);
+}
+
+struct reservation_object *msm_gem_prime_res_obj(struct drm_gem_object *obj)
+{
+	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+
+	return msm_obj->resv;
 }

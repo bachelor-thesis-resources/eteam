@@ -554,10 +554,18 @@ struct dma_chan *dma_get_slave_channel(struct dma_chan *chan)
 	mutex_lock(&dma_list_mutex);
 
 	if (chan->client_count == 0) {
+		struct dma_device *device = chan->device;
+
+		dma_cap_set(DMA_PRIVATE, device->cap_mask);
+		device->privatecnt++;
 		err = dma_chan_get(chan);
-		if (err)
+		if (err) {
 			pr_debug("%s: failed to get %s: (%d)\n",
 				__func__, dma_chan_name(chan), err);
+			chan = NULL;
+			if (--device->privatecnt == 0)
+				dma_cap_clear(DMA_PRIVATE, device->cap_mask);
+		}
 	} else
 		chan = NULL;
 
@@ -1015,12 +1023,14 @@ static struct dmaengine_unmap_pool *__get_unmap_pool(int nr)
 	switch (order) {
 	case 0 ... 1:
 		return &unmap_pool[0];
+#if IS_ENABLED(CONFIG_DMA_ENGINE_RAID)
 	case 2 ... 4:
 		return &unmap_pool[1];
 	case 5 ... 7:
 		return &unmap_pool[2];
 	case 8:
 		return &unmap_pool[3];
+#endif
 	default:
 		BUG();
 		return NULL;
@@ -1066,11 +1076,9 @@ static void dmaengine_destroy_unmap_pool(void)
 	for (i = 0; i < ARRAY_SIZE(unmap_pool); i++) {
 		struct dmaengine_unmap_pool *p = &unmap_pool[i];
 
-		if (p->pool)
-			mempool_destroy(p->pool);
+		mempool_destroy(p->pool);
 		p->pool = NULL;
-		if (p->cache)
-			kmem_cache_destroy(p->cache);
+		kmem_cache_destroy(p->cache);
 		p->cache = NULL;
 	}
 }

@@ -36,11 +36,12 @@
 
 #include <linux/pci.h>
 #include <linux/export.h>
+#include <linux/nospec.h>
 
 static int drm_version(struct drm_device *dev, void *data,
 		       struct drm_file *file_priv);
 
-/**
+/*
  * Get the bus id.
  *
  * \param inode device inode.
@@ -75,7 +76,7 @@ drm_unset_busid(struct drm_device *dev,
 	master->unique_len = 0;
 }
 
-/**
+/*
  * Set the bus id.
  *
  * \param inode device inode.
@@ -149,7 +150,7 @@ static int drm_set_busid(struct drm_device *dev, struct drm_file *file_priv)
 	return 0;
 }
 
-/**
+/*
  * Get a mapping information.
  *
  * \param inode device inode.
@@ -201,7 +202,7 @@ static int drm_getmap(struct drm_device *dev, void *data,
 	return 0;
 }
 
-/**
+/*
  * Get client information.
  *
  * \param inode device inode.
@@ -244,7 +245,7 @@ static int drm_getclient(struct drm_device *dev, void *data,
 	}
 }
 
-/**
+/*
  * Get statistics information.
  *
  * \param inode device inode.
@@ -265,7 +266,7 @@ static int drm_getstats(struct drm_device *dev, void *data,
 	return 0;
 }
 
-/**
+/*
  * Get device/driver capabilities
  */
 static int drm_getcap(struct drm_device *dev, void *data, struct drm_file *file_priv)
@@ -318,7 +319,7 @@ static int drm_getcap(struct drm_device *dev, void *data, struct drm_file *file_
 	return 0;
 }
 
-/**
+/*
  * Set device/driver capabilities
  */
 static int
@@ -352,7 +353,7 @@ drm_setclientcap(struct drm_device *dev, void *data, struct drm_file *file_priv)
 	return 0;
 }
 
-/**
+/*
  * Setversion ioctl.
  *
  * \param inode device inode.
@@ -406,7 +407,18 @@ done:
 	return retcode;
 }
 
-/** No-op ioctl. */
+/**
+ * drm_noop - DRM no-op ioctl implemntation
+ * @dev: DRM device for the ioctl
+ * @data: data pointer for the ioctl
+ * @file_priv: DRM file for the ioctl call
+ *
+ * This no-op implementation for drm ioctls is useful for deprecated
+ * functionality where we can't return a failure code because existing userspace
+ * checks the result of the ioctl, but doesn't care about the action.
+ *
+ * Always returns successfully with 0.
+ */
 int drm_noop(struct drm_device *dev, void *data,
 	     struct drm_file *file_priv)
 {
@@ -416,6 +428,28 @@ int drm_noop(struct drm_device *dev, void *data,
 EXPORT_SYMBOL(drm_noop);
 
 /**
+ * drm_invalid_op - DRM invalid ioctl implemntation
+ * @dev: DRM device for the ioctl
+ * @data: data pointer for the ioctl
+ * @file_priv: DRM file for the ioctl call
+ *
+ * This no-op implementation for drm ioctls is useful for deprecated
+ * functionality where we really don't want to allow userspace to call the ioctl
+ * any more. This is the case for old ums interfaces for drivers that
+ * transitioned to kms gradually and so kept the old legacy tables around. This
+ * only applies to radeon and i915 kms drivers, other drivers shouldn't need to
+ * use this function.
+ *
+ * Always fails with a return value of -EINVAL.
+ */
+int drm_invalid_op(struct drm_device *dev, void *data,
+		   struct drm_file *file_priv)
+{
+	return -EINVAL;
+}
+EXPORT_SYMBOL(drm_invalid_op);
+
+/*
  * Copy and IOCTL return string to user space
  */
 static int drm_copy_field(char __user *buf, size_t *buf_len, const char *value)
@@ -438,7 +472,7 @@ static int drm_copy_field(char __user *buf, size_t *buf_len, const char *value)
 	return 0;
 }
 
-/**
+/*
  * Get version information
  *
  * \param inode device inode.
@@ -470,7 +504,7 @@ static int drm_version(struct drm_device *dev, void *data,
 	return err;
 }
 
-/**
+/*
  * drm_ioctl_permit - Check ioctl permissions against caller
  *
  * @flags: ioctl permission flags.
@@ -480,7 +514,7 @@ static int drm_version(struct drm_device *dev, void *data,
  * indicated permissions. If so, returns zero. Otherwise returns an
  * error code suitable for ioctl return.
  */
-static int drm_ioctl_permit(u32 flags, struct drm_file *file_priv)
+int drm_ioctl_permit(u32 flags, struct drm_file *file_priv)
 {
 	/* ROOT_ONLY is only for CAP_SYS_ADMIN */
 	if (unlikely((flags & DRM_ROOT_ONLY) && !capable(CAP_SYS_ADMIN)))
@@ -508,6 +542,7 @@ static int drm_ioctl_permit(u32 flags, struct drm_file *file_priv)
 
 	return 0;
 }
+EXPORT_SYMBOL(drm_ioctl_permit);
 
 #define DRM_IOCTL_DEF(ioctl, _func, _flags)	\
 	[DRM_IOCTL_NR(ioctl)] = {		\
@@ -517,9 +552,10 @@ static int drm_ioctl_permit(u32 flags, struct drm_file *file_priv)
 		.name = #ioctl			\
 	}
 
-/** Ioctl table */
+/* Ioctl table */
 static const struct drm_ioctl_desc drm_ioctls[] = {
-	DRM_IOCTL_DEF(DRM_IOCTL_VERSION, drm_version, DRM_UNLOCKED|DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF(DRM_IOCTL_VERSION, drm_version,
+		      DRM_UNLOCKED|DRM_RENDER_ALLOW|DRM_CONTROL_ALLOW),
 	DRM_IOCTL_DEF(DRM_IOCTL_GET_UNIQUE, drm_getunique, 0),
 	DRM_IOCTL_DEF(DRM_IOCTL_GET_MAGIC, drm_getmagic, 0),
 	DRM_IOCTL_DEF(DRM_IOCTL_IRQ_BUSID, drm_irq_by_busid, DRM_MASTER|DRM_ROOT_ONLY),
@@ -569,7 +605,7 @@ static const struct drm_ioctl_desc drm_ioctls[] = {
 
 	DRM_IOCTL_DEF(DRM_IOCTL_CONTROL, drm_control, DRM_AUTH|DRM_MASTER|DRM_ROOT_ONLY),
 
-#if __OS_HAS_AGP
+#if IS_ENABLED(CONFIG_AGP)
 	DRM_IOCTL_DEF(DRM_IOCTL_AGP_ACQUIRE, drm_agp_acquire_ioctl, DRM_AUTH|DRM_MASTER|DRM_ROOT_ONLY),
 	DRM_IOCTL_DEF(DRM_IOCTL_AGP_RELEASE, drm_agp_release_ioctl, DRM_AUTH|DRM_MASTER|DRM_ROOT_ONLY),
 	DRM_IOCTL_DEF(DRM_IOCTL_AGP_ENABLE, drm_agp_enable_ioctl, DRM_AUTH|DRM_MASTER|DRM_ROOT_ONLY),
@@ -633,16 +669,16 @@ static const struct drm_ioctl_desc drm_ioctls[] = {
 #define DRM_CORE_IOCTL_COUNT	ARRAY_SIZE( drm_ioctls )
 
 /**
- * Called whenever a process performs an ioctl on /dev/drm.
- *
- * \param inode device inode.
- * \param file_priv DRM file private.
- * \param cmd command.
- * \param arg user argument.
- * \return zero on success or negative number on failure.
+ * drm_ioctl - ioctl callback implementation for DRM drivers
+ * @filp: file this ioctl is called on
+ * @cmd: ioctl cmd number
+ * @arg: user argument
  *
  * Looks up the ioctl function in the ::ioctls table, checking for root
  * previleges if so required, and dispatches to the respective function.
+ *
+ * Returns:
+ * Zero on success, negative error code on failure.
  */
 long drm_ioctl(struct file *filp,
 	      unsigned int cmd, unsigned long arg)
@@ -656,21 +692,28 @@ long drm_ioctl(struct file *filp,
 	char stack_kdata[128];
 	char *kdata = NULL;
 	unsigned int usize, asize, drv_size;
+	bool is_driver_ioctl;
 
 	dev = file_priv->minor->dev;
 
 	if (drm_device_is_unplugged(dev))
 		return -ENODEV;
 
-	if (nr >= DRM_COMMAND_BASE && nr < DRM_COMMAND_END) {
+	is_driver_ioctl = nr >= DRM_COMMAND_BASE && nr < DRM_COMMAND_END;
+
+	if (is_driver_ioctl) {
 		/* driver ioctl */
-		if (nr - DRM_COMMAND_BASE >= dev->driver->num_ioctls)
+		unsigned int index = nr - DRM_COMMAND_BASE;
+
+		if (index >= dev->driver->num_ioctls)
 			goto err_i1;
-		ioctl = &dev->driver->ioctls[nr - DRM_COMMAND_BASE];
+		index = array_index_nospec(index, dev->driver->num_ioctls);
+		ioctl = &dev->driver->ioctls[index];
 	} else {
 		/* core ioctl */
 		if (nr >= DRM_CORE_IOCTL_COUNT)
 			goto err_i1;
+		nr = array_index_nospec(nr, DRM_CORE_IOCTL_COUNT);
 		ioctl = &drm_ioctls[nr];
 	}
 
@@ -721,7 +764,10 @@ long drm_ioctl(struct file *filp,
 		memset(kdata, 0, usize);
 	}
 
-	if (ioctl->flags & DRM_UNLOCKED)
+	/* Enforce sane locking for kms driver ioctls. Core ioctls are
+	 * too messy still. */
+	if ((drm_core_check_feature(dev, DRIVER_MODESET) && is_driver_ioctl) ||
+	    (ioctl->flags & DRM_UNLOCKED))
 		retcode = func(dev, kdata, file_priv);
 	else {
 		mutex_lock(&drm_global_mutex);
@@ -752,9 +798,15 @@ EXPORT_SYMBOL(drm_ioctl);
 
 /**
  * drm_ioctl_flags - Check for core ioctl and return ioctl permission flags
+ * @nr: ioctl number
+ * @flags: where to return the ioctl permission flags
  *
- * @nr: Ioctl number.
- * @flags: Where to return the ioctl permission flags
+ * This ioctl is only used by the vmwgfx driver to augment the access checks
+ * done by the drm core and insofar a pretty decent layering violation. This
+ * shouldn't be used by any drivers.
+ *
+ * Returns:
+ * True if the @nr corresponds to a DRM core ioctl numer, false otherwise.
  */
 bool drm_ioctl_flags(unsigned int nr, unsigned int *flags)
 {
@@ -763,6 +815,7 @@ bool drm_ioctl_flags(unsigned int nr, unsigned int *flags)
 
 	if (nr >= DRM_CORE_IOCTL_COUNT)
 		return false;
+	nr = array_index_nospec(nr, DRM_CORE_IOCTL_COUNT);
 
 	*flags = drm_ioctls[nr].flags;
 	return true;

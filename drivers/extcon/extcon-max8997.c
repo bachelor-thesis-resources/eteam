@@ -148,11 +148,11 @@ struct max8997_muic_info {
 static const unsigned int max8997_extcon_cable[] = {
 	EXTCON_USB,
 	EXTCON_USB_HOST,
-	EXTCON_TA,
-	EXTCON_FAST_CHARGER,
-	EXTCON_SLOW_CHARGER,
-	EXTCON_CHARGE_DOWNSTREAM,
-	EXTCON_MHL,
+	EXTCON_CHG_USB_DCP,
+	EXTCON_CHG_USB_FAST,
+	EXTCON_CHG_USB_SLOW,
+	EXTCON_CHG_USB_CDP,
+	EXTCON_DISP_MHL,
 	EXTCON_DOCK,
 	EXTCON_JIG,
 	EXTCON_NONE,
@@ -320,12 +320,10 @@ static int max8997_muic_handle_usb(struct max8997_muic_info *info,
 {
 	int ret = 0;
 
-	if (usb_type == MAX8997_USB_HOST) {
-		ret = max8997_muic_set_path(info, info->path_usb, attached);
-		if (ret < 0) {
-			dev_err(info->dev, "failed to update muic register\n");
-			return ret;
-		}
+	ret = max8997_muic_set_path(info, info->path_usb, attached);
+	if (ret < 0) {
+		dev_err(info->dev, "failed to update muic register\n");
+		return ret;
 	}
 
 	switch (usb_type) {
@@ -403,7 +401,7 @@ static int max8997_muic_adc_handler(struct max8997_muic_info *info)
 			return ret;
 		break;
 	case MAX8997_MUIC_ADC_MHL:
-		extcon_set_cable_state_(info->edev, EXTCON_MHL, attached);
+		extcon_set_cable_state_(info->edev, EXTCON_DISP_MHL, attached);
 		break;
 	case MAX8997_MUIC_ADC_FACTORY_MODE_USB_OFF:
 	case MAX8997_MUIC_ADC_FACTORY_MODE_USB_ON:
@@ -486,18 +484,19 @@ static int max8997_muic_chg_handler(struct max8997_muic_info *info)
 		}
 		break;
 	case MAX8997_CHARGER_TYPE_DOWNSTREAM_PORT:
-		extcon_set_cable_state_(info->edev, EXTCON_CHARGE_DOWNSTREAM,
+		extcon_set_cable_state_(info->edev, EXTCON_CHG_USB_CDP,
 					attached);
 		break;
 	case MAX8997_CHARGER_TYPE_DEDICATED_CHG:
-		extcon_set_cable_state_(info->edev, EXTCON_TA, attached);
+		extcon_set_cable_state_(info->edev, EXTCON_CHG_USB_DCP,
+					attached);
 		break;
 	case MAX8997_CHARGER_TYPE_500MA:
-		extcon_set_cable_state_(info->edev, EXTCON_SLOW_CHARGER,
+		extcon_set_cable_state_(info->edev, EXTCON_CHG_USB_SLOW,
 					attached);
 		break;
 	case MAX8997_CHARGER_TYPE_1A:
-		extcon_set_cable_state_(info->edev, EXTCON_FAST_CHARGER,
+		extcon_set_cable_state_(info->edev, EXTCON_CHG_USB_FAST,
 					attached);
 		break;
 	default:

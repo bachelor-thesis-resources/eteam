@@ -19,8 +19,6 @@ static const struct acpi_device_id acpi_pnp_device_ids[] = {
 	{"PNP0600"},		/* Generic ESDI/IDE/ATA compatible hard disk controller */
 	/* floppy */
 	{"PNP0700"},
-	/* ipmi_si */
-	{"IPI0001"},
 	/* tpm_inf_pnp */
 	{"IFX0101"},		/* Infineon TPMs */
 	{"IFX0102"},		/* Infineon TPMs */
@@ -318,9 +316,12 @@ static const struct acpi_device_id acpi_pnp_device_ids[] = {
 	{""},
 };
 
-static bool matching_id(char *idstr, char *list_id)
+static bool matching_id(const char *idstr, const char *list_id)
 {
 	int i;
+
+	if (strlen(idstr) != strlen(list_id))
+		return false;
 
 	if (memcmp(idstr, list_id, 3))
 		return false;
@@ -335,7 +336,7 @@ static bool matching_id(char *idstr, char *list_id)
 	return true;
 }
 
-static bool acpi_pnp_match(char *idstr, const struct acpi_device_id **matchid)
+static bool acpi_pnp_match(const char *idstr, const struct acpi_device_id **matchid)
 {
 	const struct acpi_device_id *devid;
 

@@ -114,7 +114,7 @@ static ssize_t show_label(struct device *dev, struct device_attribute *devattr,
 	return sprintf(buf, "%s\n", sdata->label);
 }
 
-static int __init get_logical_cpu(int hwcpu)
+static int get_logical_cpu(int hwcpu)
 {
 	int cpu;
 
@@ -125,9 +125,8 @@ static int __init get_logical_cpu(int hwcpu)
 	return -ENOENT;
 }
 
-static void __init make_sensor_label(struct device_node *np,
-				     struct sensor_data *sdata,
-				     const char *label)
+static void make_sensor_label(struct device_node *np,
+			      struct sensor_data *sdata, const char *label)
 {
 	u32 id;
 	size_t n;
@@ -474,11 +473,18 @@ static const struct platform_device_id opal_sensor_driver_ids[] = {
 };
 MODULE_DEVICE_TABLE(platform, opal_sensor_driver_ids);
 
+static const struct of_device_id opal_sensor_match[] = {
+	{ .compatible	= "ibm,opal-sensor" },
+	{ },
+};
+MODULE_DEVICE_TABLE(of, opal_sensor_match);
+
 static struct platform_driver ibmpowernv_driver = {
 	.probe		= ibmpowernv_probe,
 	.id_table	= opal_sensor_driver_ids,
 	.driver		= {
 		.name	= DRVNAME,
+		.of_match_table	= opal_sensor_match,
 	},
 };
 

@@ -20,10 +20,6 @@
  *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  *  General Public License for more details.
  *
- *  You should have received a copy of the GNU General Public License along
- *  with this program; if not, write to the Free Software Foundation, Inc.,
- *  59 Temple Place, Suite 330, Boston, MA 02111-1307 USA.
- *
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  */
 
@@ -317,6 +313,77 @@ static struct dmi_system_id acpi_osi_dmi_table[] __initdata = {
 	},
 
 	/*
+	 * The following Lenovo models have a broken workaround in the
+	 * acpi_video backlight implementation to meet the Windows 8
+	 * requirement of 101 backlight levels. Reverting to pre-Win8
+	 * behavior fixes the problem.
+	 */
+	{
+	.callback = dmi_disable_osi_win8,
+	.ident = "Lenovo ThinkPad L430",
+	.matches = {
+		     DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+		     DMI_MATCH(DMI_PRODUCT_VERSION, "ThinkPad L430"),
+		},
+	},
+	{
+	.callback = dmi_disable_osi_win8,
+	.ident = "Lenovo ThinkPad T430",
+	.matches = {
+		     DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+		     DMI_MATCH(DMI_PRODUCT_VERSION, "ThinkPad T430"),
+		},
+	},
+	{
+	.callback = dmi_disable_osi_win8,
+	.ident = "Lenovo ThinkPad T430s",
+	.matches = {
+		     DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+		     DMI_MATCH(DMI_PRODUCT_VERSION, "ThinkPad T430s"),
+		},
+	},
+	{
+	.callback = dmi_disable_osi_win8,
+	.ident = "Lenovo ThinkPad T530",
+	.matches = {
+		     DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+		     DMI_MATCH(DMI_PRODUCT_VERSION, "ThinkPad T530"),
+		},
+	},
+	{
+	.callback = dmi_disable_osi_win8,
+	.ident = "Lenovo ThinkPad W530",
+	.matches = {
+		     DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+		     DMI_MATCH(DMI_PRODUCT_VERSION, "ThinkPad W530"),
+		},
+	},
+	{
+	.callback = dmi_disable_osi_win8,
+	.ident = "Lenovo ThinkPad X1 Carbon",
+	.matches = {
+		     DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+		     DMI_MATCH(DMI_PRODUCT_VERSION, "ThinkPad X1 Carbon"),
+		},
+	},
+	{
+	.callback = dmi_disable_osi_win8,
+	.ident = "Lenovo ThinkPad X230",
+	.matches = {
+		     DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+		     DMI_MATCH(DMI_PRODUCT_VERSION, "ThinkPad X230"),
+		},
+	},
+	{
+	.callback = dmi_disable_osi_win8,
+	.ident = "Lenovo ThinkPad Edge E330",
+	.matches = {
+		     DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+		     DMI_MATCH(DMI_PRODUCT_VERSION, "ThinkPad Edge E330"),
+		},
+	},
+
+	/*
 	 * BIOS invocation of _OSI(Linux) is almost always a BIOS bug.
 	 * Linux ignores it, except for the machines enumerated below.
 	 */
@@ -348,6 +415,34 @@ static struct dmi_system_id acpi_osi_dmi_table[] __initdata = {
 	 .matches = {
 		      DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
 		      DMI_MATCH(DMI_PRODUCT_NAME, "XPS 13 9343"),
+		},
+	},
+	/*
+	 * Resolves a quirk with the Dell Latitude 3350 that
+	 * causes the ethernet adapter to not function.
+	 */
+	{
+	 .callback = dmi_enable_rev_override,
+	 .ident = "DELL Latitude 3350",
+	 .matches = {
+		      DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+		      DMI_MATCH(DMI_PRODUCT_NAME, "Latitude 3350"),
+		},
+	},
+	{
+	 .callback = dmi_enable_rev_override,
+	 .ident = "DELL Precision 5520",
+	 .matches = {
+		      DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+		      DMI_MATCH(DMI_PRODUCT_NAME, "Precision 5520"),
+		},
+	},
+	{
+	 .callback = dmi_enable_rev_override,
+	 .ident = "DELL Precision 3520",
+	 .matches = {
+		      DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+		      DMI_MATCH(DMI_PRODUCT_NAME, "Precision 3520"),
 		},
 	},
 #endif

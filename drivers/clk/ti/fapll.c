@@ -9,6 +9,7 @@
  * GNU General Public License for more details.
  */
 
+#include <linux/clk.h>
 #include <linux/clk-provider.h>
 #include <linux/delay.h>
 #include <linux/err.h>
@@ -167,7 +168,7 @@ static unsigned long ti_fapll_recalc_rate(struct clk_hw *hw,
 {
 	struct fapll_data *fd = to_fapll(hw);
 	u32 fapll_n, fapll_p, v;
-	long long rate;
+	u64 rate;
 
 	if (ti_fapll_clock_is_bypass(fd))
 		return parent_rate;
@@ -313,7 +314,7 @@ static unsigned long ti_fapll_synth_recalc_rate(struct clk_hw *hw,
 {
 	struct fapll_synth *synth = to_synth(hw);
 	u32 synth_div_m;
-	long long rate;
+	u64 rate;
 
 	/* The audio_pll_clk1 is hardwired to produce 32.768KiHz clock */
 	if (!synth->div)
@@ -496,6 +497,7 @@ static struct clk * __init ti_fapll_synth_setup(struct fapll_data *fd,
 {
 	struct clk_init_data *init;
 	struct fapll_synth *synth;
+	struct clk *clk = ERR_PTR(-ENOMEM);
 
 	init = kzalloc(sizeof(*init), GFP_KERNEL);
 	if (!init)
@@ -518,13 +520,19 @@ static struct clk * __init ti_fapll_synth_setup(struct fapll_data *fd,
 	synth->hw.init = init;
 	synth->clk_pll = pll_clk;
 
-	return clk_register(NULL, &synth->hw);
+	clk = clk_register(NULL, &synth->hw);
+	if (IS_ERR(clk)) {
+		pr_err("failed to register clock\n");
+		goto free;
+	}
+
+	return clk;
 
 free:
 	kfree(synth);
 	kfree(init);
 
-	return ERR_PTR(-ENOMEM);
+	return clk;
 }
 
 static void __init ti_fapll_setup(struct device_node *node)
@@ -558,8 +566,7 @@ static void __init ti_fapll_setup(struct device_node *node)
 		goto free;
 	}
 
-	parent_name[0] = of_clk_get_parent_name(node, 0);
-	parent_name[1] = of_clk_get_parent_name(node, 1);
+	of_clk_parent_fill(node, parent_name, 2);
 	init->parent_names = parent_name;
 
 	fd->clk_ref = of_clk_get(node, 0);

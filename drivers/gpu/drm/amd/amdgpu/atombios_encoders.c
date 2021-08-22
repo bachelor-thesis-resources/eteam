@@ -98,6 +98,7 @@ amdgpu_atombios_encoder_set_backlight_level(struct amdgpu_encoder *amdgpu_encode
 		case ENCODER_OBJECT_ID_INTERNAL_KLDSCP_LVTMA:
 		case ENCODER_OBJECT_ID_INTERNAL_UNIPHY1:
 		case ENCODER_OBJECT_ID_INTERNAL_UNIPHY2:
+		case ENCODER_OBJECT_ID_INTERNAL_UNIPHY3:
 			if (dig->backlight_level == 0)
 				amdgpu_atombios_encoder_setup_dig_transmitter(encoder,
 								       ATOM_TRANSMITTER_ACTION_LCD_BLOFF, 0, 0);
@@ -297,6 +298,10 @@ bool amdgpu_atombios_encoder_mode_fixup(struct drm_encoder *encoder,
 	if ((mode->flags & DRM_MODE_FLAG_INTERLACE)
 	    && (mode->crtc_vsync_start < (mode->crtc_vdisplay + 2)))
 		adjusted_mode->crtc_vsync_start = adjusted_mode->crtc_vdisplay + 2;
+
+	/* vertical FP must be at least 1 */
+	if (mode->crtc_vsync_start == mode->crtc_vdisplay)
+		adjusted_mode->crtc_vsync_start++;
 
 	/* get the native mode for scaling */
 	if (amdgpu_encoder->active_device & (ATOM_DEVICE_LCD_SUPPORT))
@@ -812,7 +817,7 @@ amdgpu_atombios_encoder_setup_dig_transmitter(struct drm_encoder *encoder, int a
 			else
 				args.v1.ucConfig |= ATOM_TRANSMITTER_CONFIG_DIG1_ENCODER;
 
-			if ((adev->flags & AMDGPU_IS_APU) &&
+			if ((adev->flags & AMD_IS_APU) &&
 			    (amdgpu_encoder->encoder_id == ENCODER_OBJECT_ID_INTERNAL_UNIPHY)) {
 				if (is_dp ||
 				    !amdgpu_dig_monitor_is_duallink(encoder, amdgpu_encoder->pixel_clock)) {
@@ -1279,8 +1284,7 @@ amdgpu_atombios_encoder_setup_dig(struct drm_encoder *encoder, int action)
 			amdgpu_atombios_encoder_setup_dig_encoder(encoder, ATOM_ENCODER_CMD_DP_VIDEO_ON, 0);
 		}
 		if (amdgpu_encoder->devices & (ATOM_DEVICE_LCD_SUPPORT))
-			amdgpu_atombios_encoder_setup_dig_transmitter(encoder,
-							       ATOM_TRANSMITTER_ACTION_LCD_BLON, 0, 0);
+			amdgpu_atombios_encoder_set_backlight_level(amdgpu_encoder, dig->backlight_level);
 		if (ext_encoder)
 			amdgpu_atombios_encoder_setup_external_encoder(encoder, ext_encoder, ATOM_ENABLE);
 	} else {

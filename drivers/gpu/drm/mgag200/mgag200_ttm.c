@@ -274,6 +274,9 @@ int mgag200_mm_init(struct mga_device *mdev)
 		return ret;
 	}
 
+	arch_io_reserve_memtype_wc(pci_resource_start(dev->pdev, 0),
+				   pci_resource_len(dev->pdev, 0));
+
 	mdev->fb_mtrr = arch_phys_wc_add(pci_resource_start(dev->pdev, 0),
 					 pci_resource_len(dev->pdev, 0));
 
@@ -282,10 +285,14 @@ int mgag200_mm_init(struct mga_device *mdev)
 
 void mgag200_mm_fini(struct mga_device *mdev)
 {
+	struct drm_device *dev = mdev->dev;
+
 	ttm_bo_device_release(&mdev->ttm.bdev);
 
 	mgag200_ttm_global_release(mdev);
 
+	arch_io_free_memtype_wc(pci_resource_start(dev->pdev, 0),
+				pci_resource_len(dev->pdev, 0));
 	arch_phys_wc_del(mdev->fb_mtrr);
 	mdev->fb_mtrr = 0;
 }
@@ -378,7 +385,7 @@ int mgag200_bo_pin(struct mgag200_bo *bo, u32 pl_flag, u64 *gpu_addr)
 
 int mgag200_bo_unpin(struct mgag200_bo *bo)
 {
-	int i, ret;
+	int i;
 	if (!bo->pin_count) {
 		DRM_ERROR("unpin bad %p\n", bo);
 		return 0;
@@ -389,11 +396,7 @@ int mgag200_bo_unpin(struct mgag200_bo *bo)
 
 	for (i = 0; i < bo->placement.num_placement ; i++)
 		bo->placements[i].flags &= ~TTM_PL_FLAG_NO_EVICT;
-	ret = ttm_bo_validate(&bo->bo, &bo->placement, false, false);
-	if (ret)
-		return ret;
-
-	return 0;
+	return ttm_bo_validate(&bo->bo, &bo->placement, false, false);
 }
 
 int mgag200_bo_push_sysram(struct mgag200_bo *bo)

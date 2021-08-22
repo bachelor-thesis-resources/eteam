@@ -54,7 +54,8 @@ static void etm4_os_unlock(void *info)
 
 static bool etm4_arch_supported(u8 arch)
 {
-	switch (arch) {
+	/* Mask out the minor version number */
+	switch (arch & 0xf0) {
 	case ETM_ARCH_V4:
 		break;
 	default:
@@ -136,7 +137,9 @@ static void etm4_enable_hw(void *info)
 		writel_relaxed(drvdata->cntr_val[i],
 			       drvdata->base + TRCCNTVRn(i));
 	}
-	for (i = 0; i < drvdata->nr_resource; i++)
+
+	/* Resource selector pair 0 is always implemented and reserved */
+	for (i = 2; i < drvdata->nr_resource * 2; i++)
 		writel_relaxed(drvdata->res_ctrl[i],
 			       drvdata->base + TRCRSCTLRn(i));
 
@@ -155,7 +158,7 @@ static void etm4_enable_hw(void *info)
 			       drvdata->base + TRCACATRn(i));
 	}
 	for (i = 0; i < drvdata->numcidc; i++)
-		writeq_relaxed(drvdata->ctxid_val[i],
+		writeq_relaxed(drvdata->ctxid_pid[i],
 			       drvdata->base + TRCCIDCVRn(i));
 	writel_relaxed(drvdata->ctxid_mask0, drvdata->base + TRCCIDCCTLR0);
 	writel_relaxed(drvdata->ctxid_mask1, drvdata->base + TRCCIDCCTLR1);
@@ -489,8 +492,9 @@ static ssize_t reset_store(struct device *dev,
 		drvdata->cntr_val[i] = 0x0;
 	}
 
-	drvdata->res_idx = 0x0;
-	for (i = 0; i < drvdata->nr_resource; i++)
+	/* Resource selector pair 0 is always implemented and reserved */
+	drvdata->res_idx = 0x2;
+	for (i = 2; i < drvdata->nr_resource * 2; i++)
 		drvdata->res_ctrl[i] = 0x0;
 
 	for (i = 0; i < drvdata->nr_ss_cmp; i++) {
@@ -506,8 +510,11 @@ static ssize_t reset_store(struct device *dev,
 	}
 
 	drvdata->ctxid_idx = 0x0;
-	for (i = 0; i < drvdata->numcidc; i++)
-		drvdata->ctxid_val[i] = 0x0;
+	for (i = 0; i < drvdata->numcidc; i++) {
+		drvdata->ctxid_pid[i] = 0x0;
+		drvdata->ctxid_vpid[i] = 0x0;
+	}
+
 	drvdata->ctxid_mask0 = 0x0;
 	drvdata->ctxid_mask1 = 0x0;
 
@@ -1729,7 +1736,7 @@ static ssize_t res_idx_store(struct device *dev,
 	if (kstrtoul(buf, 16, &val))
 		return -EINVAL;
 	/* Resource selector pair 0 is always implemented and reserved */
-	if ((val == 0) || (val >= drvdata->nr_resource))
+	if (val < 2 || val >= drvdata->nr_resource * 2)
 		return -EINVAL;
 
 	/*
@@ -1815,7 +1822,7 @@ static ssize_t ctxid_idx_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(ctxid_idx);
 
-static ssize_t ctxid_val_show(struct device *dev,
+static ssize_t ctxid_pid_show(struct device *dev,
 			      struct device_attribute *attr,
 			      char *buf)
 {
@@ -1825,17 +1832,17 @@ static ssize_t ctxid_val_show(struct device *dev,
 
 	spin_lock(&drvdata->spinlock);
 	idx = drvdata->ctxid_idx;
-	val = (unsigned long)drvdata->ctxid_val[idx];
+	val = (unsigned long)drvdata->ctxid_vpid[idx];
 	spin_unlock(&drvdata->spinlock);
 	return scnprintf(buf, PAGE_SIZE, "%#lx\n", val);
 }
 
-static ssize_t ctxid_val_store(struct device *dev,
+static ssize_t ctxid_pid_store(struct device *dev,
 			       struct device_attribute *attr,
 			       const char *buf, size_t size)
 {
 	u8 idx;
-	unsigned long val;
+	unsigned long vpid, pid;
 	struct etmv4_drvdata *drvdata = dev_get_drvdata(dev->parent);
 
 	/*
@@ -1845,16 +1852,19 @@ static ssize_t ctxid_val_store(struct device *dev,
 	 */
 	if (!drvdata->ctxid_size || !drvdata->numcidc)
 		return -EINVAL;
-	if (kstrtoul(buf, 16, &val))
+	if (kstrtoul(buf, 16, &vpid))
 		return -EINVAL;
+
+	pid = coresight_vpid_to_pid(vpid);
 
 	spin_lock(&drvdata->spinlock);
 	idx = drvdata->ctxid_idx;
-	drvdata->ctxid_val[idx] = (u64)val;
+	drvdata->ctxid_pid[idx] = (u64)pid;
+	drvdata->ctxid_vpid[idx] = (u64)vpid;
 	spin_unlock(&drvdata->spinlock);
 	return size;
 }
-static DEVICE_ATTR_RW(ctxid_val);
+static DEVICE_ATTR_RW(ctxid_pid);
 
 static ssize_t ctxid_masks_show(struct device *dev,
 				struct device_attribute *attr,
@@ -1949,7 +1959,7 @@ static ssize_t ctxid_masks_store(struct device *dev,
 		 */
 		for (j = 0; j < 8; j++) {
 			if (maskbyte & 1)
-				drvdata->ctxid_val[i] &= ~(0xFF << (j * 8));
+				drvdata->ctxid_pid[i] &= ~(0xFF << (j * 8));
 			maskbyte >>= 1;
 		}
 		/* Select the next ctxid comparator mask value */
@@ -2193,7 +2203,7 @@ static struct attribute *coresight_etmv4_attrs[] = {
 	&dev_attr_res_idx.attr,
 	&dev_attr_res_ctrl.attr,
 	&dev_attr_ctxid_idx.attr,
-	&dev_attr_ctxid_val.attr,
+	&dev_attr_ctxid_pid.attr,
 	&dev_attr_ctxid_masks.attr,
 	&dev_attr_vmid_idx.attr,
 	&dev_attr_vmid_val.attr,
@@ -2210,7 +2220,7 @@ static ssize_t name##_show(struct device *_dev,				\
 	return scnprintf(buf, PAGE_SIZE, "0x%x\n",			\
 			 readl_relaxed(drvdata->base + offset));	\
 }									\
-DEVICE_ATTR_RO(name)
+static DEVICE_ATTR_RO(name)
 
 coresight_simple_func(trcoslsr, TRCOSLSR);
 coresight_simple_func(trcpdcr, TRCPDCR);
@@ -2410,8 +2420,13 @@ static void etm4_init_arch_data(void *info)
 	drvdata->nr_addr_cmp = BMVAL(etmidr4, 0, 3);
 	/* NUMPC, bits[15:12] number of PE comparator inputs for tracing */
 	drvdata->nr_pe_cmp = BMVAL(etmidr4, 12, 15);
-	/* NUMRSPAIR, bits[19:16] the number of resource pairs for tracing */
-	drvdata->nr_resource = BMVAL(etmidr4, 16, 19);
+	/*
+	 * NUMRSPAIR, bits[19:16]
+	 * The number of resource pairs conveyed by the HW starts at 0, i.e a
+	 * value of 0x0 indicate 1 resource pair, 0x1 indicate two and so on.
+	 * As such add 1 to the value of NUMRSPAIR for a better representation.
+	 */
+	drvdata->nr_resource = BMVAL(etmidr4, 16, 19) + 1;
 	/*
 	 * NUMSSCC, bits[23:20] the number of single-shot
 	 * comparator control for tracing
@@ -2498,6 +2513,8 @@ static void etm4_init_default_data(struct etmv4_drvdata *drvdata)
 		drvdata->cntr_val[i] = 0x0;
 	}
 
+	/* Resource selector pair 0 is always implemented and reserved */
+	drvdata->res_idx = 0x2;
 	for (i = 2; i < drvdata->nr_resource * 2; i++)
 		drvdata->res_ctrl[i] = 0x0;
 
@@ -2513,8 +2530,11 @@ static void etm4_init_default_data(struct etmv4_drvdata *drvdata)
 		drvdata->addr_type[1] = ETM_ADDR_TYPE_RANGE;
 	}
 
-	for (i = 0; i < drvdata->numcidc; i++)
-		drvdata->ctxid_val[i] = 0x0;
+	for (i = 0; i < drvdata->numcidc; i++) {
+		drvdata->ctxid_pid[i] = 0x0;
+		drvdata->ctxid_vpid[i] = 0x0;
+	}
+
 	drvdata->ctxid_mask0 = 0x0;
 	drvdata->ctxid_mask1 = 0x0;
 
@@ -2665,17 +2685,6 @@ err_coresight_register:
 	return ret;
 }
 
-static int etm4_remove(struct amba_device *adev)
-{
-	struct etmv4_drvdata *drvdata = amba_get_drvdata(adev);
-
-	coresight_unregister(drvdata->csdev);
-	if (--etm4_count == 0)
-		unregister_hotcpu_notifier(&etm4_cpu_notifier);
-
-	return 0;
-}
-
 static struct amba_id etm4_ids[] = {
 	{       /* ETM 4.0 - Qualcomm */
 		.id	= 0x0003b95d,
@@ -2693,9 +2702,9 @@ static struct amba_id etm4_ids[] = {
 static struct amba_driver etm4x_driver = {
 	.drv = {
 		.name   = "coresight-etm4x",
+		.suppress_bind_attrs = true,
 	},
 	.probe		= etm4_probe,
-	.remove		= etm4_remove,
 	.id_table	= etm4_ids,
 };
 
