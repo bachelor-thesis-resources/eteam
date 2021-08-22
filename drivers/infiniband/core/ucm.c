@@ -46,8 +46,11 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 
+#include <linux/nospec.h>
+
 #include <asm/uaccess.h>
 
+#include <rdma/ib.h>
 #include <rdma/ib_cm.h>
 #include <rdma/ib_user_cm.h>
 #include <rdma/ib_marshall.h>
@@ -109,7 +112,7 @@ enum {
 #define IB_UCM_BASE_DEV MKDEV(IB_UCM_MAJOR, IB_UCM_BASE_MINOR)
 
 static void ib_ucm_add_one(struct ib_device *device);
-static void ib_ucm_remove_one(struct ib_device *device);
+static void ib_ucm_remove_one(struct ib_device *device, void *client_data);
 
 static struct ib_client ucm_client = {
 	.name   = "ucm",
@@ -658,8 +661,7 @@ static ssize_t ib_ucm_listen(struct ib_ucm_file *file,
 	if (result)
 		goto out;
 
-	result = ib_cm_listen(ctx->cm_id, cmd.service_id, cmd.service_mask,
-			      NULL);
+	result = ib_cm_listen(ctx->cm_id, cmd.service_id, cmd.service_mask);
 out:
 	ib_ucm_ctx_put(ctx);
 	return result;
@@ -1104,6 +1106,9 @@ static ssize_t ib_ucm_write(struct file *filp, const char __user *buf,
 	struct ib_ucm_cmd_hdr hdr;
 	ssize_t result;
 
+	if (WARN_ON_ONCE(!ib_safe_file_access(filp)))
+		return -EACCES;
+
 	if (len < sizeof(hdr))
 		return -EINVAL;
 
@@ -1112,6 +1117,7 @@ static ssize_t ib_ucm_write(struct file *filp, const char __user *buf,
 
 	if (hdr.cmd >= ARRAY_SIZE(ucm_cmd_table))
 		return -EINVAL;
+	hdr.cmd = array_index_nospec(hdr.cmd, ARRAY_SIZE(ucm_cmd_table));
 
 	if (hdr.in + sizeof(hdr) > len)
 		return -EINVAL;
@@ -1310,9 +1316,9 @@ err:
 	return;
 }
 
-static void ib_ucm_remove_one(struct ib_device *device)
+static void ib_ucm_remove_one(struct ib_device *device, void *client_data)
 {
-	struct ib_ucm_device *ucm_dev = ib_get_client_data(device, &ucm_client);
+	struct ib_ucm_device *ucm_dev = client_data;
 
 	if (!ucm_dev)
 		return;
@@ -1345,6 +1351,11 @@ static int __init ib_ucm_init(void)
 		printk(KERN_ERR "ucm: couldn't register client\n");
 		goto error3;
 	}
+
+	printk(KERN_ERR "ucm: This module is DEPRECATED and can expose your\n");
+	printk(KERN_ERR "ucm: system to attacks! Use at your own risk!!!\n");
+	add_taint(TAINT_FORCED_MODULE, LOCKDEP_STILL_OK);
+
 	return 0;
 
 error3:

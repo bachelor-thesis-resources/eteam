@@ -63,6 +63,9 @@ read_attribute(bset_tree_stats);
 
 read_attribute(state);
 read_attribute(cache_read_races);
+read_attribute(reclaim);
+read_attribute(flush_write);
+read_attribute(retry_flush_write);
 read_attribute(writeback_keys_done);
 read_attribute(writeback_keys_failed);
 read_attribute(io_errors);
@@ -105,6 +108,41 @@ rw_attribute(cache_replacement_policy);
 rw_attribute(btree_shrinker_disabled);
 rw_attribute(copy_gc_enabled);
 rw_attribute(size);
+
+static ssize_t bch_snprint_string_list(char *buf, size_t size, const char * const list[],
+			    size_t selected)
+{
+	char *out = buf;
+	size_t i;
+
+	for (i = 0; list[i]; i++)
+		out += snprintf(out, buf + size - out,
+				i == selected ? "[%s] " : "%s ", list[i]);
+
+	out[-1] = '\n';
+	return out - buf;
+}
+
+static ssize_t bch_read_string_list(const char *buf, const char * const list[])
+{
+	size_t i;
+	char *s, *d = kstrndup(buf, PAGE_SIZE - 1, GFP_KERNEL);
+	if (!d)
+		return -ENOMEM;
+
+	s = strim(d);
+
+	for (i = 0; list[i]; i++)
+		if (!strcmp(list[i], s))
+			break;
+
+	kfree(d);
+
+	if (!list[i])
+		return -EINVAL;
+
+	return i;
+}
 
 SHOW(__bch_cached_dev)
 {
@@ -166,7 +204,7 @@ SHOW(__bch_cached_dev)
 	sysfs_hprint(dirty_data,
 		     bcache_dev_sectors_dirty(&dc->disk) << 9);
 
-	sysfs_hprint(stripe_size,	dc->disk.stripe_size << 9);
+	sysfs_hprint(stripe_size,	 ((uint64_t)dc->disk.stripe_size) << 9);
 	var_printf(partial_stripes_expensive,	"%u");
 
 	var_hprint(sequential_cutoff);
@@ -191,7 +229,7 @@ STORE(__cached_dev)
 {
 	struct cached_dev *dc = container_of(kobj, struct cached_dev,
 					     disk.kobj);
-	unsigned v = size;
+	ssize_t v;
 	struct cache_set *c;
 	struct kobj_uevent_env *env;
 
@@ -215,7 +253,9 @@ STORE(__cached_dev)
 	d_strtoul(writeback_rate_d_term);
 	d_strtoul_nonzero(writeback_rate_p_term_inverse);
 
-	d_strtoi_h(sequential_cutoff);
+	sysfs_strtoul_clamp(sequential_cutoff,
+			    dc->sequential_cutoff,
+			    0, UINT_MAX);
 	d_strtoi_h(readahead);
 
 	if (attr == &sysfs_clear_stats)
@@ -226,7 +266,7 @@ STORE(__cached_dev)
 		bch_cached_dev_run(dc);
 
 	if (attr == &sysfs_cache_mode) {
-		ssize_t v = bch_read_string_list(buf, bch_cache_modes + 1);
+		v = bch_read_string_list(buf, bch_cache_modes + 1);
 
 		if (v < 0)
 			return v;
@@ -263,17 +303,20 @@ STORE(__cached_dev)
 	}
 
 	if (attr == &sysfs_attach) {
-		if (bch_parse_uuid(buf, dc->sb.set_uuid) < 16)
+		uint8_t		set_uuid[16];
+
+		if (bch_parse_uuid(buf, set_uuid) < 16)
 			return -EINVAL;
 
+		v = -ENOENT;
 		list_for_each_entry(c, &bch_cache_sets, list) {
-			v = bch_cached_dev_attach(dc, c);
+			v = bch_cached_dev_attach(dc, c, set_uuid);
 			if (!v)
 				return size;
 		}
 
 		pr_err("Can't attach %s: cache set not found", buf);
-		size = v;
+		return v;
 	}
 
 	if (attr == &sysfs_detach && dc->disk.c)
@@ -541,6 +584,15 @@ SHOW(__bch_cache_set)
 	sysfs_print(cache_read_races,
 		    atomic_long_read(&c->cache_read_races));
 
+	sysfs_print(reclaim,
+		    atomic_long_read(&c->reclaim));
+
+	sysfs_print(flush_write,
+		    atomic_long_read(&c->flush_write));
+
+	sysfs_print(retry_flush_write,
+		    atomic_long_read(&c->retry_flush_write));
+
 	sysfs_print(writeback_keys_done,
 		    atomic_long_read(&c->writeback_keys_done));
 	sysfs_print(writeback_keys_failed,
@@ -642,8 +694,17 @@ STORE(__bch_cache_set)
 		c->error_limit = strtoul_or_return(buf) << IO_ERROR_SHIFT;
 
 	/* See count_io_errors() for why 88 */
-	if (attr == &sysfs_io_error_halflife)
-		c->error_decay = strtoul_or_return(buf) / 88;
+	if (attr == &sysfs_io_error_halflife) {
+		unsigned long v = 0;
+		ssize_t ret;
+
+		ret = strtoul_safe_clamp(buf, v, 0, UINT_MAX);
+		if (!ret) {
+			c->error_decay = v / 88;
+			return size;
+		}
+		return ret;
+	}
 
 	sysfs_strtoul(journal_delay_ms,		c->journal_delay_ms);
 	sysfs_strtoul(verify,			c->verify);
@@ -714,6 +775,9 @@ static struct attribute *bch_cache_set_internal_files[] = {
 
 	&sysfs_bset_tree_stats,
 	&sysfs_cache_read_races,
+	&sysfs_reclaim,
+	&sysfs_flush_write,
+	&sysfs_retry_flush_write,
 	&sysfs_writeback_keys_done,
 	&sysfs_writeback_keys_failed,
 
@@ -756,7 +820,7 @@ SHOW(__bch_cache)
 
 	if (attr == &sysfs_priority_stats) {
 		int cmp(const void *l, const void *r)
-		{	return *((uint16_t *) r) - *((uint16_t *) l); }
+		{	cond_resched(); return *((uint16_t *) r) - *((uint16_t *) l); }
 
 		struct bucket *b;
 		size_t n = ca->sb.nbuckets, i;

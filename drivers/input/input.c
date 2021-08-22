@@ -674,13 +674,19 @@ EXPORT_SYMBOL(input_close_device);
  */
 static void input_dev_release_keys(struct input_dev *dev)
 {
+	bool need_sync = false;
 	int code;
 
 	if (is_event_supported(EV_KEY, dev->evbit, EV_MAX)) {
-		for_each_set_bit(code, dev->key, KEY_CNT)
+		for_each_set_bit(code, dev->key, KEY_CNT) {
 			input_pass_event(dev, EV_KEY, code, 0);
+			need_sync = true;
+		}
+
+		if (need_sync)
+			input_pass_event(dev, EV_SYN, SYN_REPORT, 1);
+
 		memset(dev->key, 0, sizeof(dev->key));
-		input_pass_event(dev, EV_SYN, SYN_REPORT, 1);
 	}
 }
 
@@ -845,16 +851,18 @@ static int input_default_setkeycode(struct input_dev *dev,
 		}
 	}
 
-	__clear_bit(*old_keycode, dev->keybit);
-	__set_bit(ke->keycode, dev->keybit);
-
-	for (i = 0; i < dev->keycodemax; i++) {
-		if (input_fetch_keycode(dev, i) == *old_keycode) {
-			__set_bit(*old_keycode, dev->keybit);
-			break; /* Setting the bit twice is useless, so break */
+	if (*old_keycode <= KEY_MAX) {
+		__clear_bit(*old_keycode, dev->keybit);
+		for (i = 0; i < dev->keycodemax; i++) {
+			if (input_fetch_keycode(dev, i) == *old_keycode) {
+				__set_bit(*old_keycode, dev->keybit);
+				/* Setting the bit twice is useless, so break */
+				break;
+			}
 		}
 	}
 
+	__set_bit(ke->keycode, dev->keybit);
 	return 0;
 }
 
@@ -910,9 +918,13 @@ int input_set_keycode(struct input_dev *dev,
 	 * Simulate keyup event if keycode is not present
 	 * in the keymap anymore
 	 */
-	if (test_bit(EV_KEY, dev->evbit) &&
-	    !is_event_supported(old_keycode, dev->keybit, KEY_MAX) &&
-	    __test_and_clear_bit(old_keycode, dev->key)) {
+	if (old_keycode > KEY_MAX) {
+		dev_warn(dev->dev.parent ?: &dev->dev,
+			 "%s: got too big old keycode %#x\n",
+			 __func__, old_keycode);
+	} else if (test_bit(EV_KEY, dev->evbit) &&
+		   !is_event_supported(old_keycode, dev->keybit, KEY_MAX) &&
+		   __test_and_clear_bit(old_keycode, dev->key)) {
 		struct input_value vals[] =  {
 			{ EV_KEY, old_keycode, 0 },
 			input_value_sync
@@ -2039,6 +2051,23 @@ static void devm_input_device_unregister(struct device *dev, void *res)
 }
 
 /**
+ * input_enable_softrepeat - enable software autorepeat
+ * @dev: input device
+ * @delay: repeat delay
+ * @period: repeat period
+ *
+ * Enable software autorepeat on the input device.
+ */
+void input_enable_softrepeat(struct input_dev *dev, int delay, int period)
+{
+	dev->timer.data = (unsigned long) dev;
+	dev->timer.function = input_repeat_key;
+	dev->rep[REP_DELAY] = delay;
+	dev->rep[REP_PERIOD] = period;
+}
+EXPORT_SYMBOL(input_enable_softrepeat);
+
+/**
  * input_register_device - register device with input core
  * @dev: device to be registered
  *
@@ -2102,12 +2131,8 @@ int input_register_device(struct input_dev *dev)
 	 * If delay and period are pre-set by the driver, then autorepeating
 	 * is handled by the driver itself and we don't do it in input.c.
 	 */
-	if (!dev->rep[REP_DELAY] && !dev->rep[REP_PERIOD]) {
-		dev->timer.data = (long) dev;
-		dev->timer.function = input_repeat_key;
-		dev->rep[REP_DELAY] = 250;
-		dev->rep[REP_PERIOD] = 33;
-	}
+	if (!dev->rep[REP_DELAY] && !dev->rep[REP_PERIOD])
+		input_enable_softrepeat(dev, 250, 33);
 
 	if (!dev->getkeycode)
 		dev->getkeycode = input_default_getkeycode;

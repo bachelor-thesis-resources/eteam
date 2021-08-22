@@ -444,16 +444,11 @@ static int joydev_handle_JSIOCSAXMAP(struct joydev *joydev,
 	len = min(len, sizeof(joydev->abspam));
 
 	/* Validate the map. */
-	abspam = kmalloc(len, GFP_KERNEL);
-	if (!abspam)
-		return -ENOMEM;
+	abspam = memdup_user(argp, len);
+	if (IS_ERR(abspam))
+		return PTR_ERR(abspam);
 
-	if (copy_from_user(abspam, argp, len)) {
-		retval = -EFAULT;
-		goto out;
-	}
-
-	for (i = 0; i < joydev->nabs; i++) {
+	for (i = 0; i < len && i < joydev->nabs; i++) {
 		if (abspam[i] > ABS_MAX) {
 			retval = -EINVAL;
 			goto out;
@@ -477,19 +472,17 @@ static int joydev_handle_JSIOCSBTNMAP(struct joydev *joydev,
 	int i;
 	int retval = 0;
 
+	if (len % sizeof(*keypam))
+		return -EINVAL;
+
 	len = min(len, sizeof(joydev->keypam));
 
 	/* Validate the map. */
-	keypam = kmalloc(len, GFP_KERNEL);
-	if (!keypam)
-		return -ENOMEM;
+	keypam = memdup_user(argp, len);
+	if (IS_ERR(keypam))
+		return PTR_ERR(keypam);
 
-	if (copy_from_user(keypam, argp, len)) {
-		retval = -EFAULT;
-		goto out;
-	}
-
-	for (i = 0; i < joydev->nkey; i++) {
+	for (i = 0; i < (len / 2) && i < joydev->nkey; i++) {
 		if (keypam[i] > KEY_MAX || keypam[i] < BTN_MISC) {
 			retval = -EINVAL;
 			goto out;
@@ -859,12 +852,11 @@ static int joydev_connect(struct input_handler *handler, struct input_dev *dev,
 	joydev->handle.handler = handler;
 	joydev->handle.private = joydev;
 
-	for (i = 0; i < ABS_CNT; i++)
-		if (test_bit(i, dev->absbit)) {
-			joydev->absmap[i] = joydev->nabs;
-			joydev->abspam[joydev->nabs] = i;
-			joydev->nabs++;
-		}
+	for_each_set_bit(i, dev->absbit, ABS_CNT) {
+		joydev->absmap[i] = joydev->nabs;
+		joydev->abspam[joydev->nabs] = i;
+		joydev->nabs++;
+	}
 
 	for (i = BTN_JOYSTICK - BTN_MISC; i < KEY_MAX - BTN_MISC + 1; i++)
 		if (test_bit(i + BTN_MISC, dev->keybit)) {

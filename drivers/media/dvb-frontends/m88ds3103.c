@@ -18,6 +18,27 @@
 
 static struct dvb_frontend_ops m88ds3103_ops;
 
+/* write single register with mask */
+static int m88ds3103_update_bits(struct m88ds3103_dev *dev,
+				u8 reg, u8 mask, u8 val)
+{
+	int ret;
+	u8 tmp;
+
+	/* no need for read if whole reg is written */
+	if (mask != 0xff) {
+		ret = regmap_bulk_read(dev->regmap, reg, &tmp, 1);
+		if (ret)
+			return ret;
+
+		val &= mask;
+		tmp &= ~mask;
+		val |= tmp;
+	}
+
+	return regmap_bulk_write(dev->regmap, reg, &val, 1);
+}
+
 /* write reg val table using reg addr auto increment */
 static int m88ds3103_wr_reg_val_tab(struct m88ds3103_dev *dev,
 		const struct m88ds3103_reg_val *tab, int tab_len)
@@ -288,6 +309,9 @@ static int m88ds3103_set_frontend(struct dvb_frontend *fe)
 	u16 u16tmp, divide_ratio = 0;
 	u32 tuner_frequency, target_mclk;
 	s32 s32tmp;
+	static const struct reg_sequence reset_buf[] = {
+		{0x07, 0x80}, {0x07, 0x00}
+	};
 
 	dev_dbg(&client->dev,
 		"delivery_system=%d modulation=%d frequency=%u symbol_rate=%d inversion=%d pilot=%d rolloff=%d\n",
@@ -300,11 +324,7 @@ static int m88ds3103_set_frontend(struct dvb_frontend *fe)
 	}
 
 	/* reset */
-	ret = regmap_write(dev->regmap, 0x07, 0x80);
-	if (ret)
-		goto err;
-
-	ret = regmap_write(dev->regmap, 0x07, 0x00);
+	ret = regmap_multi_reg_write(dev->regmap, reset_buf, 2);
 	if (ret)
 		goto err;
 
@@ -394,10 +414,10 @@ static int m88ds3103_set_frontend(struct dvb_frontend *fe)
 			u8tmp2 = 0x00; /* 0b00 */
 			break;
 		}
-		ret = regmap_update_bits(dev->regmap, 0x22, 0xc0, u8tmp1 << 6);
+		ret = m88ds3103_update_bits(dev, 0x22, 0xc0, u8tmp1 << 6);
 		if (ret)
 			goto err;
-		ret = regmap_update_bits(dev->regmap, 0x24, 0xc0, u8tmp2 << 6);
+		ret = m88ds3103_update_bits(dev, 0x24, 0xc0, u8tmp2 << 6);
 		if (ret)
 			goto err;
 	}
@@ -455,13 +475,13 @@ static int m88ds3103_set_frontend(struct dvb_frontend *fe)
 			if (ret)
 				goto err;
 		}
-		ret = regmap_update_bits(dev->regmap, 0x9d, 0x08, 0x08);
+		ret = m88ds3103_update_bits(dev, 0x9d, 0x08, 0x08);
 		if (ret)
 			goto err;
 		ret = regmap_write(dev->regmap, 0xf1, 0x01);
 		if (ret)
 			goto err;
-		ret = regmap_update_bits(dev->regmap, 0x30, 0x80, 0x80);
+		ret = m88ds3103_update_bits(dev, 0x30, 0x80, 0x80);
 		if (ret)
 			goto err;
 	}
@@ -498,7 +518,7 @@ static int m88ds3103_set_frontend(struct dvb_frontend *fe)
 	switch (dev->cfg->ts_mode) {
 	case M88DS3103_TS_SERIAL:
 	case M88DS3103_TS_SERIAL_D7:
-		ret = regmap_update_bits(dev->regmap, 0x29, 0x20, u8tmp1);
+		ret = m88ds3103_update_bits(dev, 0x29, 0x20, u8tmp1);
 		if (ret)
 			goto err;
 		u8tmp1 = 0;
@@ -567,11 +587,11 @@ static int m88ds3103_set_frontend(struct dvb_frontend *fe)
 	if (ret)
 		goto err;
 
-	ret = regmap_update_bits(dev->regmap, 0x4d, 0x02, dev->cfg->spec_inv << 1);
+	ret = m88ds3103_update_bits(dev, 0x4d, 0x02, dev->cfg->spec_inv << 1);
 	if (ret)
 		goto err;
 
-	ret = regmap_update_bits(dev->regmap, 0x30, 0x10, dev->cfg->agc_inv << 4);
+	ret = m88ds3103_update_bits(dev, 0x30, 0x10, dev->cfg->agc_inv << 4);
 	if (ret)
 		goto err;
 
@@ -625,13 +645,13 @@ static int m88ds3103_init(struct dvb_frontend *fe)
 	dev->warm = false;
 
 	/* wake up device from sleep */
-	ret = regmap_update_bits(dev->regmap, 0x08, 0x01, 0x01);
+	ret = m88ds3103_update_bits(dev, 0x08, 0x01, 0x01);
 	if (ret)
 		goto err;
-	ret = regmap_update_bits(dev->regmap, 0x04, 0x01, 0x00);
+	ret = m88ds3103_update_bits(dev, 0x04, 0x01, 0x00);
 	if (ret)
 		goto err;
-	ret = regmap_update_bits(dev->regmap, 0x23, 0x10, 0x00);
+	ret = m88ds3103_update_bits(dev, 0x23, 0x10, 0x00);
 	if (ret)
 		goto err;
 
@@ -749,18 +769,18 @@ static int m88ds3103_sleep(struct dvb_frontend *fe)
 		utmp = 0x29;
 	else
 		utmp = 0x27;
-	ret = regmap_update_bits(dev->regmap, utmp, 0x01, 0x00);
+	ret = m88ds3103_update_bits(dev, utmp, 0x01, 0x00);
 	if (ret)
 		goto err;
 
 	/* sleep */
-	ret = regmap_update_bits(dev->regmap, 0x08, 0x01, 0x00);
+	ret = m88ds3103_update_bits(dev, 0x08, 0x01, 0x00);
 	if (ret)
 		goto err;
-	ret = regmap_update_bits(dev->regmap, 0x04, 0x01, 0x01);
+	ret = m88ds3103_update_bits(dev, 0x04, 0x01, 0x01);
 	if (ret)
 		goto err;
-	ret = regmap_update_bits(dev->regmap, 0x23, 0x10, 0x10);
+	ret = m88ds3103_update_bits(dev, 0x23, 0x10, 0x10);
 	if (ret)
 		goto err;
 
@@ -992,12 +1012,12 @@ static int m88ds3103_set_tone(struct dvb_frontend *fe,
 	}
 
 	utmp = tone << 7 | dev->cfg->envelope_mode << 5;
-	ret = regmap_update_bits(dev->regmap, 0xa2, 0xe0, utmp);
+	ret = m88ds3103_update_bits(dev, 0xa2, 0xe0, utmp);
 	if (ret)
 		goto err;
 
 	utmp = 1 << 2;
-	ret = regmap_update_bits(dev->regmap, 0xa1, reg_a1_mask, utmp);
+	ret = m88ds3103_update_bits(dev, 0xa1, reg_a1_mask, utmp);
 	if (ret)
 		goto err;
 
@@ -1047,7 +1067,7 @@ static int m88ds3103_set_voltage(struct dvb_frontend *fe,
 	voltage_dis ^= dev->cfg->lnb_en_pol;
 
 	utmp = voltage_dis << 1 | voltage_sel << 0;
-	ret = regmap_update_bits(dev->regmap, 0xa2, 0x03, utmp);
+	ret = m88ds3103_update_bits(dev, 0xa2, 0x03, utmp);
 	if (ret)
 		goto err;
 
@@ -1080,7 +1100,7 @@ static int m88ds3103_diseqc_send_master_cmd(struct dvb_frontend *fe,
 	}
 
 	utmp = dev->cfg->envelope_mode << 5;
-	ret = regmap_update_bits(dev->regmap, 0xa2, 0xe0, utmp);
+	ret = m88ds3103_update_bits(dev, 0xa2, 0xe0, utmp);
 	if (ret)
 		goto err;
 
@@ -1115,12 +1135,12 @@ static int m88ds3103_diseqc_send_master_cmd(struct dvb_frontend *fe,
 	} else {
 		dev_dbg(&client->dev, "diseqc tx timeout\n");
 
-		ret = regmap_update_bits(dev->regmap, 0xa1, 0xc0, 0x40);
+		ret = m88ds3103_update_bits(dev, 0xa1, 0xc0, 0x40);
 		if (ret)
 			goto err;
 	}
 
-	ret = regmap_update_bits(dev->regmap, 0xa2, 0xc0, 0x80);
+	ret = m88ds3103_update_bits(dev, 0xa2, 0xc0, 0x80);
 	if (ret)
 		goto err;
 
@@ -1152,7 +1172,7 @@ static int m88ds3103_diseqc_send_burst(struct dvb_frontend *fe,
 	}
 
 	utmp = dev->cfg->envelope_mode << 5;
-	ret = regmap_update_bits(dev->regmap, 0xa2, 0xe0, utmp);
+	ret = m88ds3103_update_bits(dev, 0xa2, 0xe0, utmp);
 	if (ret)
 		goto err;
 
@@ -1194,12 +1214,12 @@ static int m88ds3103_diseqc_send_burst(struct dvb_frontend *fe,
 	} else {
 		dev_dbg(&client->dev, "diseqc tx timeout\n");
 
-		ret = regmap_update_bits(dev->regmap, 0xa1, 0xc0, 0x40);
+		ret = m88ds3103_update_bits(dev, 0xa1, 0xc0, 0x40);
 		if (ret)
 			goto err;
 	}
 
-	ret = regmap_update_bits(dev->regmap, 0xa2, 0xc0, 0x80);
+	ret = m88ds3103_update_bits(dev, 0xa2, 0xc0, 0x80);
 	if (ret)
 		goto err;
 
@@ -1260,11 +1280,12 @@ static int m88ds3103_select(struct i2c_adapter *adap, void *mux_priv, u32 chan)
  * New users must use I2C client binding directly!
  */
 struct dvb_frontend *m88ds3103_attach(const struct m88ds3103_config *cfg,
-		struct i2c_adapter *i2c, struct i2c_adapter **tuner_i2c_adapter)
+				      struct i2c_adapter *i2c,
+				      struct i2c_adapter **tuner_i2c_adapter)
 {
 	struct i2c_client *client;
 	struct i2c_board_info board_info;
-	struct m88ds3103_platform_data pdata;
+	struct m88ds3103_platform_data pdata = {};
 
 	pdata.clk = cfg->clock;
 	pdata.i2c_wr_max = cfg->i2c_wr_max;
@@ -1407,6 +1428,8 @@ static int m88ds3103_probe(struct i2c_client *client,
 	case M88DS3103_CHIP_ID:
 		break;
 	default:
+		ret = -ENODEV;
+		dev_err(&client->dev, "Unknown device. Chip_id=%02x\n", dev->chip_id);
 		goto err_kfree;
 	}
 
@@ -1435,13 +1458,13 @@ static int m88ds3103_probe(struct i2c_client *client,
 		goto err_kfree;
 
 	/* sleep */
-	ret = regmap_update_bits(dev->regmap, 0x08, 0x01, 0x00);
+	ret = m88ds3103_update_bits(dev, 0x08, 0x01, 0x00);
 	if (ret)
 		goto err_kfree;
-	ret = regmap_update_bits(dev->regmap, 0x04, 0x01, 0x01);
+	ret = m88ds3103_update_bits(dev, 0x04, 0x01, 0x01);
 	if (ret)
 		goto err_kfree;
-	ret = regmap_update_bits(dev->regmap, 0x23, 0x10, 0x10);
+	ret = m88ds3103_update_bits(dev, 0x23, 0x10, 0x10);
 	if (ret)
 		goto err_kfree;
 
@@ -1495,7 +1518,6 @@ MODULE_DEVICE_TABLE(i2c, m88ds3103_id_table);
 
 static struct i2c_driver m88ds3103_driver = {
 	.driver = {
-		.owner	= THIS_MODULE,
 		.name	= "m88ds3103",
 		.suppress_bind_attrs = true,
 	},

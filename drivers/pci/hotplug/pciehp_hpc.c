@@ -109,21 +109,23 @@ static int pcie_poll_cmd(struct controller *ctrl, int timeout)
 	struct pci_dev *pdev = ctrl_dev(ctrl);
 	u16 slot_status;
 
-	pcie_capability_read_word(pdev, PCI_EXP_SLTSTA, &slot_status);
-	if (slot_status & PCI_EXP_SLTSTA_CC) {
-		pcie_capability_write_word(pdev, PCI_EXP_SLTSTA,
-					   PCI_EXP_SLTSTA_CC);
-		return 1;
-	}
-	while (timeout > 0) {
-		msleep(10);
-		timeout -= 10;
+	while (true) {
 		pcie_capability_read_word(pdev, PCI_EXP_SLTSTA, &slot_status);
+		if (slot_status == (u16) ~0) {
+			ctrl_info(ctrl, "%s: no response from device\n",
+				  __func__);
+			return 0;
+		}
+
 		if (slot_status & PCI_EXP_SLTSTA_CC) {
 			pcie_capability_write_word(pdev, PCI_EXP_SLTSTA,
 						   PCI_EXP_SLTSTA_CC);
 			return 1;
 		}
+		if (timeout < 0)
+			break;
+		msleep(10);
+		timeout -= 10;
 	}
 	return 0;	/* timeout */
 }
@@ -190,6 +192,11 @@ static void pcie_do_write_cmd(struct controller *ctrl, u16 cmd,
 	pcie_wait_cmd(ctrl);
 
 	pcie_capability_read_word(pdev, PCI_EXP_SLTCTL, &slot_ctrl);
+	if (slot_ctrl == (u16) ~0) {
+		ctrl_info(ctrl, "%s: no response from device\n", __func__);
+		goto out;
+	}
+
 	slot_ctrl &= ~mask;
 	slot_ctrl |= (cmd & mask);
 	ctrl->cmd_busy = 1;
@@ -205,6 +212,7 @@ static void pcie_do_write_cmd(struct controller *ctrl, u16 cmd,
 	if (wait)
 		pcie_wait_cmd(ctrl);
 
+out:
 	mutex_unlock(&ctrl->ctrl_lock);
 }
 
@@ -535,7 +543,7 @@ static irqreturn_t pcie_isr(int irq, void *dev_id)
 	struct pci_dev *dev;
 	struct slot *slot = ctrl->slot;
 	u16 detected, intr_loc;
-	u8 open, present;
+	u8 present;
 	bool link;
 
 	/*
@@ -546,9 +554,14 @@ static irqreturn_t pcie_isr(int irq, void *dev_id)
 	intr_loc = 0;
 	do {
 		pcie_capability_read_word(pdev, PCI_EXP_SLTSTA, &detected);
+		if (detected == (u16) ~0) {
+			ctrl_info(ctrl, "%s: no response from device\n",
+				  __func__);
+			return IRQ_HANDLED;
+		}
 
 		detected &= (PCI_EXP_SLTSTA_ABP | PCI_EXP_SLTSTA_PFD |
-			     PCI_EXP_SLTSTA_MRLSC | PCI_EXP_SLTSTA_PDC |
+			     PCI_EXP_SLTSTA_PDC |
 			     PCI_EXP_SLTSTA_CC | PCI_EXP_SLTSTA_DLLSC);
 		detected &= ~intr_loc;
 		intr_loc |= detected;
@@ -580,15 +593,6 @@ static irqreturn_t pcie_isr(int irq, void *dev_id)
 
 	if (!(intr_loc & ~PCI_EXP_SLTSTA_CC))
 		return IRQ_HANDLED;
-
-	/* Check MRL Sensor Changed */
-	if (intr_loc & PCI_EXP_SLTSTA_MRLSC) {
-		pciehp_get_latch_status(slot, &open);
-		ctrl_info(ctrl, "Latch %s on Slot(%s)\n",
-			  open ? "open" : "close", slot_name(slot));
-		pciehp_queue_interrupt_event(slot, open ? INT_SWITCH_OPEN :
-					     INT_SWITCH_CLOSE);
-	}
 
 	/* Check Attention Button Pressed */
 	if (intr_loc & PCI_EXP_SLTSTA_ABP) {
@@ -624,7 +628,7 @@ static irqreturn_t pcie_isr(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-void pcie_enable_notification(struct controller *ctrl)
+static void pcie_enable_notification(struct controller *ctrl)
 {
 	u16 cmd, mask;
 
@@ -649,19 +653,28 @@ void pcie_enable_notification(struct controller *ctrl)
 		cmd |= PCI_EXP_SLTCTL_ABPE;
 	else
 		cmd |= PCI_EXP_SLTCTL_PDCE;
-	if (MRL_SENS(ctrl))
-		cmd |= PCI_EXP_SLTCTL_MRLSCE;
 	if (!pciehp_poll_mode)
 		cmd |= PCI_EXP_SLTCTL_HPIE | PCI_EXP_SLTCTL_CCIE;
 
 	mask = (PCI_EXP_SLTCTL_PDCE | PCI_EXP_SLTCTL_ABPE |
-		PCI_EXP_SLTCTL_MRLSCE | PCI_EXP_SLTCTL_PFDE |
+		PCI_EXP_SLTCTL_PFDE |
 		PCI_EXP_SLTCTL_HPIE | PCI_EXP_SLTCTL_CCIE |
 		PCI_EXP_SLTCTL_DLLSCE);
 
 	pcie_write_cmd_nowait(ctrl, cmd, mask);
 	ctrl_dbg(ctrl, "%s: SLOTCTRL %x write cmd %x\n", __func__,
 		 pci_pcie_cap(ctrl->pcie->port) + PCI_EXP_SLTCTL, cmd);
+}
+
+void pcie_reenable_notification(struct controller *ctrl)
+{
+	/*
+	 * Clear both Presence and Data Link Layer Changed to make sure
+	 * those events still fire after we have re-enabled them.
+	 */
+	pcie_capability_write_word(ctrl->pcie->port, PCI_EXP_SLTSTA,
+				   PCI_EXP_SLTSTA_PDC | PCI_EXP_SLTSTA_DLLSC);
+	pcie_enable_notification(ctrl);
 }
 
 static void pcie_disable_notification(struct controller *ctrl)
@@ -728,7 +741,7 @@ int pcie_init_notification(struct controller *ctrl)
 	return 0;
 }
 
-static void pcie_shutdown_notification(struct controller *ctrl)
+void pcie_shutdown_notification(struct controller *ctrl)
 {
 	if (ctrl->notification_enabled) {
 		pcie_disable_notification(ctrl);
@@ -763,7 +776,7 @@ abort:
 static void pcie_cleanup_slot(struct controller *ctrl)
 {
 	struct slot *slot = ctrl->slot;
-	cancel_delayed_work(&slot->work);
+
 	destroy_workqueue(slot->wq);
 	kfree(slot);
 }
@@ -840,7 +853,6 @@ abort:
 
 void pciehp_release_ctrl(struct controller *ctrl)
 {
-	pcie_shutdown_notification(ctrl);
 	pcie_cleanup_slot(ctrl);
 	kfree(ctrl);
 }

@@ -286,6 +286,7 @@ static int samsung_dt_node_to_map(struct pinctrl_dev *pctldev,
 						&reserved_maps, num_maps);
 		if (ret < 0) {
 			samsung_dt_free_map(pctldev, *map, *num_maps);
+			of_node_put(np);
 			return ret;
 		}
 	}
@@ -753,8 +754,10 @@ static struct samsung_pmx_func *samsung_pinctrl_create_functions(
 		if (!of_get_child_count(cfg_np)) {
 			ret = samsung_pinctrl_create_function(dev, drvdata,
 							cfg_np, func);
-			if (ret < 0)
+			if (ret < 0) {
+				of_node_put(cfg_np);
 				return ERR_PTR(ret);
+			}
 			if (ret > 0) {
 				++func;
 				++func_cnt;
@@ -765,8 +768,11 @@ static struct samsung_pmx_func *samsung_pinctrl_create_functions(
 		for_each_child_of_node(cfg_np, func_np) {
 			ret = samsung_pinctrl_create_function(dev, drvdata,
 						func_np, func);
-			if (ret < 0)
+			if (ret < 0) {
+				of_node_put(func_np);
+				of_node_put(cfg_np);
 				return ERR_PTR(ret);
+			}
 			if (ret > 0) {
 				++func;
 				++func_cnt;
@@ -888,19 +894,9 @@ static int samsung_pinctrl_register(struct platform_device *pdev,
 	return 0;
 }
 
-static int samsung_gpio_request(struct gpio_chip *chip, unsigned offset)
-{
-	return pinctrl_request_gpio(chip->base + offset);
-}
-
-static void samsung_gpio_free(struct gpio_chip *chip, unsigned offset)
-{
-	pinctrl_free_gpio(chip->base + offset);
-}
-
 static const struct gpio_chip samsung_gpiolib_chip = {
-	.request = samsung_gpio_request,
-	.free = samsung_gpio_free,
+	.request = gpiochip_generic_request,
+	.free = gpiochip_generic_free,
 	.set = samsung_gpio_set,
 	.get = samsung_gpio_get,
 	.direction_input = samsung_gpio_direction_input,

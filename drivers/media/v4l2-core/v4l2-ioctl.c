@@ -26,9 +26,8 @@
 #include <media/v4l2-fh.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-device.h>
-#include <media/videobuf2-core.h>
+#include <media/videobuf2-v4l2.h>
 
-#define CREATE_TRACE_POINTS
 #include <trace/events/v4l2.h>
 
 /* Zero out the end of the struct pointed to by p.  Everything after, but
@@ -154,6 +153,7 @@ const char *v4l2_type_names[] = {
 	[V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE] = "vid-cap-mplane",
 	[V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE] = "vid-out-mplane",
 	[V4L2_BUF_TYPE_SDR_CAPTURE]        = "sdr-cap",
+	[V4L2_BUF_TYPE_SDR_OUTPUT]         = "sdr-out",
 };
 EXPORT_SYMBOL(v4l2_type_names);
 
@@ -327,6 +327,7 @@ static void v4l_print_format(const void *arg, bool write_only)
 				sliced->service_lines[1][i]);
 		break;
 	case V4L2_BUF_TYPE_SDR_CAPTURE:
+	case V4L2_BUF_TYPE_SDR_OUTPUT:
 		sdr = &p->fmt.sdr;
 		pr_cont(", pixelformat=%c%c%c%c\n",
 			(sdr->pixelformat >>  0) & 0xff,
@@ -975,6 +976,10 @@ static int check_fmt(struct file *file, enum v4l2_buf_type type)
 		if (is_sdr && is_rx && ops->vidioc_g_fmt_sdr_cap)
 			return 0;
 		break;
+	case V4L2_BUF_TYPE_SDR_OUTPUT:
+		if (is_sdr && is_tx && ops->vidioc_g_fmt_sdr_out)
+			return 0;
+		break;
 	default:
 		break;
 	}
@@ -1025,8 +1030,9 @@ static int v4l_querycap(const struct v4l2_ioctl_ops *ops,
 	 * Drivers MUST fill in device_caps, so check for this and
 	 * warn if it was forgotten.
 	 */
-	WARN_ON(!(cap->capabilities & V4L2_CAP_DEVICE_CAPS) ||
-		!cap->device_caps);
+	WARN(!(cap->capabilities & V4L2_CAP_DEVICE_CAPS) ||
+		!cap->device_caps, "Bad caps for driver %s, %x %x",
+		cap->driver, cap->capabilities, cap->device_caps);
 	cap->device_caps |= V4L2_CAP_EXT_PIX_FORMAT;
 
 	return ret;
@@ -1324,6 +1330,11 @@ static int v4l_enum_fmt(const struct v4l2_ioctl_ops *ops,
 			break;
 		ret = ops->vidioc_enum_fmt_sdr_cap(file, fh, arg);
 		break;
+	case V4L2_BUF_TYPE_SDR_OUTPUT:
+		if (unlikely(!is_tx || !is_sdr || !ops->vidioc_enum_fmt_sdr_out))
+			break;
+		ret = ops->vidioc_enum_fmt_sdr_out(file, fh, arg);
+		break;
 	}
 	if (ret == 0)
 		v4l_fill_fmtdesc(p);
@@ -1418,6 +1429,10 @@ static int v4l_g_fmt(const struct v4l2_ioctl_ops *ops,
 		if (unlikely(!is_rx || !is_sdr || !ops->vidioc_g_fmt_sdr_cap))
 			break;
 		return ops->vidioc_g_fmt_sdr_cap(file, fh, arg);
+	case V4L2_BUF_TYPE_SDR_OUTPUT:
+		if (unlikely(!is_tx || !is_sdr || !ops->vidioc_g_fmt_sdr_out))
+			break;
+		return ops->vidioc_g_fmt_sdr_out(file, fh, arg);
 	}
 	return -EINVAL;
 }
@@ -1497,6 +1512,11 @@ static int v4l_s_fmt(const struct v4l2_ioctl_ops *ops,
 			break;
 		CLEAR_AFTER_FIELD(p, fmt.sdr);
 		return ops->vidioc_s_fmt_sdr_cap(file, fh, arg);
+	case V4L2_BUF_TYPE_SDR_OUTPUT:
+		if (unlikely(!is_tx || !is_sdr || !ops->vidioc_s_fmt_sdr_out))
+			break;
+		CLEAR_AFTER_FIELD(p, fmt.sdr);
+		return ops->vidioc_s_fmt_sdr_out(file, fh, arg);
 	}
 	return -EINVAL;
 }
@@ -1576,6 +1596,11 @@ static int v4l_try_fmt(const struct v4l2_ioctl_ops *ops,
 			break;
 		CLEAR_AFTER_FIELD(p, fmt.sdr);
 		return ops->vidioc_try_fmt_sdr_cap(file, fh, arg);
+	case V4L2_BUF_TYPE_SDR_OUTPUT:
+		if (unlikely(!is_tx || !is_sdr || !ops->vidioc_try_fmt_sdr_out))
+			break;
+		CLEAR_AFTER_FIELD(p, fmt.sdr);
+		return ops->vidioc_try_fmt_sdr_out(file, fh, arg);
 	}
 	return -EINVAL;
 }
@@ -1621,13 +1646,29 @@ static int v4l_s_tuner(const struct v4l2_ioctl_ops *ops,
 static int v4l_g_modulator(const struct v4l2_ioctl_ops *ops,
 				struct file *file, void *fh, void *arg)
 {
+	struct video_device *vfd = video_devdata(file);
 	struct v4l2_modulator *p = arg;
 	int err;
+
+	if (vfd->vfl_type == VFL_TYPE_RADIO)
+		p->type = V4L2_TUNER_RADIO;
 
 	err = ops->vidioc_g_modulator(file, fh, p);
 	if (!err)
 		p->capability |= V4L2_TUNER_CAP_FREQ_BANDS;
 	return err;
+}
+
+static int v4l_s_modulator(const struct v4l2_ioctl_ops *ops,
+				struct file *file, void *fh, void *arg)
+{
+	struct video_device *vfd = video_devdata(file);
+	struct v4l2_modulator *p = arg;
+
+	if (vfd->vfl_type == VFL_TYPE_RADIO)
+		p->type = V4L2_TUNER_RADIO;
+
+	return ops->vidioc_s_modulator(file, fh, p);
 }
 
 static int v4l_g_frequency(const struct v4l2_ioctl_ops *ops,
@@ -1637,7 +1678,7 @@ static int v4l_g_frequency(const struct v4l2_ioctl_ops *ops,
 	struct v4l2_frequency *p = arg;
 
 	if (vfd->vfl_type == VFL_TYPE_SDR)
-		p->type = V4L2_TUNER_ADC;
+		p->type = V4L2_TUNER_SDR;
 	else
 		p->type = (vfd->vfl_type == VFL_TYPE_RADIO) ?
 				V4L2_TUNER_RADIO : V4L2_TUNER_ANALOG_TV;
@@ -1652,7 +1693,7 @@ static int v4l_s_frequency(const struct v4l2_ioctl_ops *ops,
 	enum v4l2_tuner_type type;
 
 	if (vfd->vfl_type == VFL_TYPE_SDR) {
-		if (p->type != V4L2_TUNER_ADC && p->type != V4L2_TUNER_RF)
+		if (p->type != V4L2_TUNER_SDR && p->type != V4L2_TUNER_RF)
 			return -EINVAL;
 	} else {
 		type = (vfd->vfl_type == VFL_TYPE_RADIO) ?
@@ -2277,7 +2318,7 @@ static int v4l_enum_freq_bands(const struct v4l2_ioctl_ops *ops,
 	int err;
 
 	if (vfd->vfl_type == VFL_TYPE_SDR) {
-		if (p->type != V4L2_TUNER_ADC && p->type != V4L2_TUNER_RF)
+		if (p->type != V4L2_TUNER_SDR && p->type != V4L2_TUNER_RF)
 			return -EINVAL;
 		type = p->type;
 	} else {
@@ -2416,7 +2457,7 @@ static struct v4l2_ioctl_info v4l2_ioctls[] = {
 	IOCTL_INFO_STD(VIDIOC_G_AUDOUT, vidioc_g_audout, v4l_print_audioout, 0),
 	IOCTL_INFO_STD(VIDIOC_S_AUDOUT, vidioc_s_audout, v4l_print_audioout, INFO_FL_PRIO),
 	IOCTL_INFO_FNC(VIDIOC_G_MODULATOR, v4l_g_modulator, v4l_print_modulator, INFO_FL_CLEAR(v4l2_modulator, index)),
-	IOCTL_INFO_STD(VIDIOC_S_MODULATOR, vidioc_s_modulator, v4l_print_modulator, INFO_FL_PRIO),
+	IOCTL_INFO_FNC(VIDIOC_S_MODULATOR, v4l_s_modulator, v4l_print_modulator, INFO_FL_PRIO),
 	IOCTL_INFO_FNC(VIDIOC_G_FREQUENCY, v4l_g_frequency, v4l_print_frequency, INFO_FL_CLEAR(v4l2_frequency, tuner)),
 	IOCTL_INFO_FNC(VIDIOC_S_FREQUENCY, v4l_s_frequency, v4l_print_frequency, INFO_FL_PRIO),
 	IOCTL_INFO_FNC(VIDIOC_CROPCAP, v4l_cropcap, v4l_print_cropcap, INFO_FL_CLEAR(v4l2_cropcap, type)),
@@ -2669,7 +2710,7 @@ video_usercopy(struct file *file, unsigned int cmd, unsigned long arg,
 	       v4l2_kioctl func)
 {
 	char	sbuf[128];
-	void    *mbuf = NULL;
+	void    *mbuf = NULL, *array_buf = NULL;
 	void	*parg = (void *)arg;
 	long	err  = -EINVAL;
 	bool	has_array_args;
@@ -2724,26 +2765,23 @@ video_usercopy(struct file *file, unsigned int cmd, unsigned long arg,
 	has_array_args = err;
 
 	if (has_array_args) {
-		/*
-		 * When adding new types of array args, make sure that the
-		 * parent argument to ioctl (which contains the pointer to the
-		 * array) fits into sbuf (so that mbuf will still remain
-		 * unused up to here).
-		 */
-		mbuf = kmalloc(array_size, GFP_KERNEL);
+		array_buf = kmalloc(array_size, GFP_KERNEL);
 		err = -ENOMEM;
-		if (NULL == mbuf)
+		if (array_buf == NULL)
 			goto out_array_args;
 		err = -EFAULT;
-		if (copy_from_user(mbuf, user_ptr, array_size))
+		if (copy_from_user(array_buf, user_ptr, array_size))
 			goto out_array_args;
-		*kernel_ptr = mbuf;
+		*kernel_ptr = array_buf;
 	}
 
 	/* Handles IOCTL */
 	err = func(file, cmd, parg);
-	if (err == -ENOIOCTLCMD)
+	if (err == -ENOTTY || err == -ENOIOCTLCMD) {
 		err = -ENOTTY;
+		goto out;
+	}
+
 	if (err == 0) {
 		if (cmd == VIDIOC_DQBUF)
 			trace_v4l2_dqbuf(video_devdata(file)->minor, parg);
@@ -2753,7 +2791,7 @@ video_usercopy(struct file *file, unsigned int cmd, unsigned long arg,
 
 	if (has_array_args) {
 		*kernel_ptr = (void __force *)user_ptr;
-		if (copy_to_user(user_ptr, mbuf, array_size))
+		if (copy_to_user(user_ptr, array_buf, array_size))
 			err = -EFAULT;
 		goto out_array_args;
 	}
@@ -2773,6 +2811,7 @@ out_array_args:
 	}
 
 out:
+	kfree(array_buf);
 	kfree(mbuf);
 	return err;
 }

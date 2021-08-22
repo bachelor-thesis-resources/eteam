@@ -27,6 +27,8 @@
 #define ETP_DISABLE_POWER	0x0001
 #define ETP_PRESSURE_OFFSET	25
 
+#define ETP_CALIBRATE_MAX_LEN	3
+
 /* IAP Firmware handling */
 #define ETP_PRODUCT_ID_FORMAT_STRING	"%d.0"
 #define ETP_FW_NAME		"elan_i2c_" ETP_PRODUCT_ID_FORMAT_STRING ".bin"
@@ -60,7 +62,7 @@ struct elan_transport_ops {
 	int (*get_sm_version)(struct i2c_client *client,
 			      u8* ic_type, u8 *version);
 	int (*get_checksum)(struct i2c_client *client, bool iap, u16 *csum);
-	int (*get_product_id)(struct i2c_client *client, u8 *id);
+	int (*get_product_id)(struct i2c_client *client, u16 *id);
 
 	int (*get_max)(struct i2c_client *client,
 		       unsigned int *max_x, unsigned int *max_y);

@@ -14,6 +14,7 @@
 #include <linux/kernel.h>
 #include <linux/platform_device.h>
 #include <linux/acpi.h>
+#include <linux/property.h>
 #include <linux/mfd/core.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
@@ -31,6 +32,11 @@ int mfd_cell_enable(struct platform_device *pdev)
 	const struct mfd_cell *cell = mfd_get_cell(pdev);
 	int err = 0;
 
+	if (!cell->enable) {
+		dev_dbg(&pdev->dev, "No .enable() call-back registered\n");
+		return 0;
+	}
+
 	/* only call enable hook if the cell wasn't previously enabled */
 	if (atomic_inc_return(cell->usage_count) == 1)
 		err = cell->enable(pdev);
@@ -47,6 +53,11 @@ int mfd_cell_disable(struct platform_device *pdev)
 {
 	const struct mfd_cell *cell = mfd_get_cell(pdev);
 	int err = 0;
+
+	if (!cell->disable) {
+		dev_dbg(&pdev->dev, "No .disable() call-back registered\n");
+		return 0;
+	}
 
 	/* only disable if no other clients are using it */
 	if (atomic_dec_return(cell->usage_count) == 0)
@@ -82,29 +93,49 @@ static int mfd_platform_add_cell(struct platform_device *pdev,
 static void mfd_acpi_add_device(const struct mfd_cell *cell,
 				struct platform_device *pdev)
 {
-	struct acpi_device *parent_adev;
+	const struct mfd_cell_acpi_match *match = cell->acpi_match;
+	struct acpi_device *parent, *child;
 	struct acpi_device *adev;
 
-	parent_adev = ACPI_COMPANION(pdev->dev.parent);
-	if (!parent_adev)
+	parent = ACPI_COMPANION(pdev->dev.parent);
+	if (!parent)
 		return;
 
 	/*
-	 * MFD child device gets its ACPI handle either from the ACPI
-	 * device directly under the parent that matches the acpi_pnpid or
-	 * it will use the parent handle if is no acpi_pnpid is given.
+	 * MFD child device gets its ACPI handle either from the ACPI device
+	 * directly under the parent that matches the either _HID or _CID, or
+	 * _ADR or it will use the parent handle if is no ID is given.
+	 *
+	 * Note that use of _ADR is a grey area in the ACPI specification,
+	 * though Intel Galileo Gen2 is using it to distinguish the children
+	 * devices.
 	 */
-	adev = parent_adev;
-	if (cell->acpi_pnpid) {
-		struct acpi_device_id ids[2] = {};
-		struct acpi_device *child_adev;
+	adev = parent;
+	if (match) {
+		if (match->pnpid) {
+			struct acpi_device_id ids[2] = {};
 
-		strlcpy(ids[0].id, cell->acpi_pnpid, sizeof(ids[0].id));
-		list_for_each_entry(child_adev, &parent_adev->children, node)
-			if (acpi_match_device_ids(child_adev, ids)) {
-				adev = child_adev;
-				break;
+			strlcpy(ids[0].id, match->pnpid, sizeof(ids[0].id));
+			list_for_each_entry(child, &parent->children, node) {
+				if (acpi_match_device_ids(child, ids)) {
+					adev = child;
+					break;
+				}
 			}
+		} else {
+			unsigned long long adr;
+			acpi_status status;
+
+			list_for_each_entry(child, &parent->children, node) {
+				status = acpi_evaluate_integer(child->handle,
+							       "_ADR", NULL,
+							       &adr);
+				if (ACPI_SUCCESS(status) && match->adr == adr) {
+					adev = child;
+					break;
+				}
+			}
+		}
 	}
 
 	ACPI_COMPANION_SET(&pdev->dev, adev);
@@ -158,6 +189,7 @@ static int mfd_add_device(struct device *parent, int id,
 		for_each_child_of_node(parent->of_node, np) {
 			if (of_device_is_compatible(np, cell->of_compatible)) {
 				pdev->dev.of_node = np;
+				pdev->dev.fwnode = &np->fwnode;
 				break;
 			}
 		}
@@ -168,6 +200,12 @@ static int mfd_add_device(struct device *parent, int id,
 	if (cell->pdata_size) {
 		ret = platform_device_add_data(pdev,
 					cell->platform_data, cell->pdata_size);
+		if (ret)
+			goto fail_alias;
+	}
+
+	if (cell->pset) {
+		ret = platform_device_add_properties(pdev, cell->pset);
 		if (ret)
 			goto fail_alias;
 	}
@@ -302,7 +340,7 @@ void mfd_remove_devices(struct device *parent)
 {
 	atomic_t *cnts = NULL;
 
-	device_for_each_child(parent, &cnts, mfd_remove_devices_fn);
+	device_for_each_child_reverse(parent, &cnts, mfd_remove_devices_fn);
 	kfree(cnts);
 }
 EXPORT_SYMBOL(mfd_remove_devices);
@@ -333,6 +371,8 @@ int mfd_clone_cell(const char *cell, const char **clones, size_t n_clones)
 			dev_err(dev, "failed to create platform device '%s'\n",
 					clones[i]);
 	}
+
+	put_device(dev);
 
 	return 0;
 }

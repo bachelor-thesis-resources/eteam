@@ -46,6 +46,7 @@ config OMAP_MBOX_KFIFO_SIZE
 config PCC
 	bool "Platform Communication Channel Driver"
 	depends on ACPI
+	default n
 	help
 	  ACPI 5.0+ spec defines a generic mode of communication
 	  between the OS and a platform such as the BMC. This medium
@@ -70,4 +71,27 @@ config BCM2835_MBOX
 	  the services of the Videocore. Say Y here if you want to use the
 	  BCM2835 Mailbox.
 
+config STI_MBOX
+	tristate "STI Mailbox framework support"
+	depends on ARCH_STI && OF
+	help
+	  Mailbox implementation for STMicroelectonics family chips with
+	  hardware for interprocessor communication.
+
+config MAILBOX_TEST
+	tristate "Mailbox Test Client"
+	depends on OF
+	help
+	  Test client to help with testing new Controller driver
+	  implementations.
+
+config XGENE_SLIMPRO_MBOX
+	tristate "APM SoC X-Gene SLIMpro Mailbox Controller"
+	depends on ARCH_XGENE
+	help
+	  An implementation of the APM X-Gene Interprocessor Communication
+	  Mailbox (IPCM) between the ARM 64-bit cores and SLIMpro controller.
+	  It is used to send short messages between ARM64-bit cores and
+	  the SLIMpro Management Engine, primarily for PM. Say Y here if you
+	  want to use the APM X-Gene SLIMpro IPCM support.
 endif

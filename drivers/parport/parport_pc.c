@@ -1377,7 +1377,7 @@ static struct superio_struct *find_superio(struct parport *p)
 {
 	int i;
 	for (i = 0; i < NR_SUPERIOS; i++)
-		if (superios[i].io != p->base)
+		if (superios[i].io == p->base)
 			return &superios[i];
 	return NULL;
 }
@@ -2646,6 +2646,7 @@ enum parport_pc_pci_cards {
 	netmos_9901,
 	netmos_9865,
 	quatech_sppxp100,
+	wch_ch382l,
 };
 
 
@@ -2708,6 +2709,7 @@ static struct parport_pc_pci {
 	/* netmos_9901 */               { 1, { { 0, -1 }, } },
 	/* netmos_9865 */               { 1, { { 0, -1 }, } },
 	/* quatech_sppxp100 */		{ 1, { { 0, 1 }, } },
+	/* wch_ch382l */		{ 1, { { 2, -1 }, } },
 };
 
 static const struct pci_device_id parport_pc_pci_tbl[] = {
@@ -2797,6 +2799,8 @@ static const struct pci_device_id parport_pc_pci_tbl[] = {
 	/* Quatech SPPXP-100 Parallel port PCI ExpressCard */
 	{ PCI_VENDOR_ID_QUATECH, PCI_DEVICE_ID_QUATECH_SPPXP_100,
 	  PCI_ANY_ID, PCI_ANY_ID, 0, 0, quatech_sppxp100 },
+	/* WCH CH382L PCI-E single parallel port card */
+	{ 0x1c00, 0x3050, 0x1c00, 0x3050, 0, 0, wch_ch382l },
 	{ 0, } /* terminate list */
 };
 MODULE_DEVICE_TABLE(pci, parport_pc_pci_tbl);
@@ -3150,13 +3154,13 @@ static char *irq[PARPORT_PC_MAX_PORTS];
 static char *dma[PARPORT_PC_MAX_PORTS];
 
 MODULE_PARM_DESC(io, "Base I/O address (SPP regs)");
-module_param_array(io, int, NULL, 0);
+module_param_hw_array(io, int, ioport, NULL, 0);
 MODULE_PARM_DESC(io_hi, "Base I/O address (ECR)");
-module_param_array(io_hi, int, NULL, 0);
+module_param_hw_array(io_hi, int, ioport, NULL, 0);
 MODULE_PARM_DESC(irq, "IRQ line");
-module_param_array(irq, charp, NULL, 0);
+module_param_hw_array(irq, charp, irq, NULL, 0);
 MODULE_PARM_DESC(dma, "DMA channel");
-module_param_array(dma, charp, NULL, 0);
+module_param_hw_array(dma, charp, dma, NULL, 0);
 #if defined(CONFIG_PARPORT_PC_SUPERIO) || \
        (defined(CONFIG_PARPORT_1284) && defined(CONFIG_PARPORT_PC_FIFO))
 MODULE_PARM_DESC(verbose_probing, "Log chit-chat during initialisation");

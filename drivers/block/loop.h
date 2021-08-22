@@ -14,7 +14,7 @@
 #include <linux/blk-mq.h>
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
-#include <linux/workqueue.h>
+#include <linux/kthread.h>
 #include <uapi/linux/loop.h>
 
 /* Possible states of device */
@@ -46,7 +46,7 @@ struct loop_device {
 	int		(*ioctl)(struct loop_device *, int cmd, 
 				 unsigned long arg); 
 
-	struct file *	lo_backing_file;
+	struct file *	lo_backing_file, *lo_backing_virt_file;
 	struct block_device *lo_device;
 	unsigned	lo_blocksize;
 	void		*key_data; 
@@ -54,12 +54,12 @@ struct loop_device {
 	gfp_t		old_gfp_mask;
 
 	spinlock_t		lo_lock;
-	struct workqueue_struct *wq;
-	struct list_head	write_cmd_head;
-	struct work_struct	write_work;
-	bool			write_started;
 	int			lo_state;
 	struct mutex		lo_ctl_mutex;
+	struct kthread_worker	worker;
+	struct task_struct	*worker_task;
+	bool			use_dio;
+	bool			sysfs_inited;
 
 	struct request_queue	*lo_queue;
 	struct blk_mq_tag_set	tag_set;
@@ -67,9 +67,11 @@ struct loop_device {
 };
 
 struct loop_cmd {
-	struct work_struct read_work;
+	struct kthread_work work;
 	struct request *rq;
 	struct list_head list;
+	bool use_aio;           /* use AIO interface to handle I/O */
+	struct kiocb iocb;
 };
 
 /* Support for loadable transfer modules */

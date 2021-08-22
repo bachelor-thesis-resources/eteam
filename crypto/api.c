@@ -172,7 +172,7 @@ static struct crypto_alg *crypto_larval_wait(struct crypto_alg *alg)
 	struct crypto_larval *larval = (void *)alg;
 	long timeout;
 
-	timeout = wait_for_completion_interruptible_timeout(
+	timeout = wait_for_completion_killable_timeout(
 		&larval->completion, 60 * HZ);
 
 	alg = larval->adult;
@@ -355,13 +355,12 @@ static unsigned int crypto_ctxsize(struct crypto_alg *alg, u32 type, u32 mask)
 	return len;
 }
 
-void crypto_shoot_alg(struct crypto_alg *alg)
+static void crypto_shoot_alg(struct crypto_alg *alg)
 {
 	down_write(&crypto_alg_sem);
 	alg->cra_flags |= CRYPTO_ALG_DYING;
 	up_write(&crypto_alg_sem);
 }
-EXPORT_SYMBOL_GPL(crypto_shoot_alg);
 
 struct crypto_tfm *__crypto_alloc_tfm(struct crypto_alg *alg, u32 type,
 				      u32 mask)
@@ -445,7 +444,7 @@ struct crypto_tfm *crypto_alloc_base(const char *alg_name, u32 type, u32 mask)
 err:
 		if (err != -EAGAIN)
 			break;
-		if (signal_pending(current)) {
+		if (fatal_signal_pending(current)) {
 			err = -EINTR;
 			break;
 		}
@@ -562,7 +561,7 @@ void *crypto_alloc_tfm(const char *alg_name,
 err:
 		if (err != -EAGAIN)
 			break;
-		if (signal_pending(current)) {
+		if (fatal_signal_pending(current)) {
 			err = -EINTR;
 			break;
 		}

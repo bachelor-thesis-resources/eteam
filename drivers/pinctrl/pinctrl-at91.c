@@ -1122,8 +1122,10 @@ static int at91_pinctrl_parse_functions(struct device_node *np,
 		func->groups[i] = child->name;
 		grp = &info->groups[grp_index++];
 		ret = at91_pinctrl_parse_groups(child, grp, info, i++);
-		if (ret)
+		if (ret) {
+			of_node_put(child);
 			return ret;
+		}
 	}
 
 	return 0;
@@ -1196,6 +1198,7 @@ static int at91_pinctrl_probe_dt(struct platform_device *pdev,
 		ret = at91_pinctrl_parse_functions(child, info, i++);
 		if (ret) {
 			dev_err(&pdev->dev, "failed to parse function\n");
+			of_node_put(child);
 			return ret;
 		}
 	}
@@ -1275,28 +1278,6 @@ static int at91_pinctrl_remove(struct platform_device *pdev)
 	pinctrl_unregister(info->pctl);
 
 	return 0;
-}
-
-static int at91_gpio_request(struct gpio_chip *chip, unsigned offset)
-{
-	/*
-	 * Map back to global GPIO space and request muxing, the direction
-	 * parameter does not matter for this controller.
-	 */
-	int gpio = chip->base + offset;
-	int bank = chip->base / chip->ngpio;
-
-	dev_dbg(chip->dev, "%s:%d pio%c%d(%d)\n", __func__, __LINE__,
-		 'A' + bank, offset, gpio);
-
-	return pinctrl_request_gpio(gpio);
-}
-
-static void at91_gpio_free(struct gpio_chip *chip, unsigned offset)
-{
-	int gpio = chip->base + offset;
-
-	pinctrl_free_gpio(gpio);
 }
 
 static int at91_gpio_get_direction(struct gpio_chip *chip, unsigned offset)
@@ -1459,22 +1440,22 @@ static int alt_gpio_irq_type(struct irq_data *d, unsigned type)
 
 	switch (type) {
 	case IRQ_TYPE_EDGE_RISING:
-		__irq_set_handler_locked(d->irq, handle_simple_irq);
+		irq_set_handler_locked(d, handle_simple_irq);
 		writel_relaxed(mask, pio + PIO_ESR);
 		writel_relaxed(mask, pio + PIO_REHLSR);
 		break;
 	case IRQ_TYPE_EDGE_FALLING:
-		__irq_set_handler_locked(d->irq, handle_simple_irq);
+		irq_set_handler_locked(d, handle_simple_irq);
 		writel_relaxed(mask, pio + PIO_ESR);
 		writel_relaxed(mask, pio + PIO_FELLSR);
 		break;
 	case IRQ_TYPE_LEVEL_LOW:
-		__irq_set_handler_locked(d->irq, handle_level_irq);
+		irq_set_handler_locked(d, handle_level_irq);
 		writel_relaxed(mask, pio + PIO_LSR);
 		writel_relaxed(mask, pio + PIO_FELLSR);
 		break;
 	case IRQ_TYPE_LEVEL_HIGH:
-		__irq_set_handler_locked(d->irq, handle_level_irq);
+		irq_set_handler_locked(d, handle_level_irq);
 		writel_relaxed(mask, pio + PIO_LSR);
 		writel_relaxed(mask, pio + PIO_REHLSR);
 		break;
@@ -1483,7 +1464,7 @@ static int alt_gpio_irq_type(struct irq_data *d, unsigned type)
 		 * disable additional interrupt modes:
 		 * fall back to default behavior
 		 */
-		__irq_set_handler_locked(d->irq, handle_simple_irq);
+		irq_set_handler_locked(d, handle_simple_irq);
 		writel_relaxed(mask, pio + PIO_AIMDR);
 		return 0;
 	case IRQ_TYPE_NONE:
@@ -1501,28 +1482,6 @@ static int alt_gpio_irq_type(struct irq_data *d, unsigned type)
 static void gpio_irq_ack(struct irq_data *d)
 {
 	/* the interrupt is already cleared before by reading ISR */
-}
-
-static int gpio_irq_request_res(struct irq_data *d)
-{
-	struct at91_gpio_chip *at91_gpio = irq_data_get_irq_chip_data(d);
-	unsigned	pin = d->hwirq;
-	int ret;
-
-	ret = gpiochip_lock_as_irq(&at91_gpio->chip, pin);
-	if (ret)
-		dev_err(at91_gpio->chip.dev, "unable to lock pind %lu IRQ\n",
-			d->hwirq);
-
-	return ret;
-}
-
-static void gpio_irq_release_res(struct irq_data *d)
-{
-	struct at91_gpio_chip *at91_gpio = irq_data_get_irq_chip_data(d);
-	unsigned	pin = d->hwirq;
-
-	gpiochip_unlock_as_irq(&at91_gpio->chip, pin);
 }
 
 #ifdef CONFIG_PM
@@ -1597,21 +1556,9 @@ void at91_pinctrl_gpio_resume(void)
 #define gpio_irq_set_wake	NULL
 #endif /* CONFIG_PM */
 
-static struct irq_chip gpio_irqchip = {
-	.name		= "GPIO",
-	.irq_ack	= gpio_irq_ack,
-	.irq_request_resources = gpio_irq_request_res,
-	.irq_release_resources = gpio_irq_release_res,
-	.irq_disable	= gpio_irq_mask,
-	.irq_mask	= gpio_irq_mask,
-	.irq_unmask	= gpio_irq_unmask,
-	/* .irq_set_type is set dynamically */
-	.irq_set_wake	= gpio_irq_set_wake,
-};
-
-static void gpio_irq_handler(unsigned irq, struct irq_desc *desc)
+static void gpio_irq_handler(struct irq_desc *desc)
 {
-	struct irq_chip *chip = irq_get_chip(irq);
+	struct irq_chip *chip = irq_desc_get_chip(desc);
 	struct gpio_chip *gpio_chip = irq_desc_get_handler_data(desc);
 	struct at91_gpio_chip *at91_gpio = container_of(gpio_chip,
 					   struct at91_gpio_chip, chip);
@@ -1651,12 +1598,22 @@ static int at91_gpio_of_irq_setup(struct platform_device *pdev,
 	struct gpio_chip	*gpiochip_prev = NULL;
 	struct at91_gpio_chip   *prev = NULL;
 	struct irq_data		*d = irq_get_irq_data(at91_gpio->pioc_virq);
+	struct irq_chip		*gpio_irqchip;
 	int ret, i;
+
+	gpio_irqchip = devm_kzalloc(&pdev->dev, sizeof(*gpio_irqchip), GFP_KERNEL);
+	if (!gpio_irqchip)
+		return -ENOMEM;
 
 	at91_gpio->pioc_hwirq = irqd_to_hwirq(d);
 
-	/* Setup proper .irq_set_type function */
-	gpio_irqchip.irq_set_type = at91_gpio->ops->irq_type;
+	gpio_irqchip->name = "GPIO";
+	gpio_irqchip->irq_ack = gpio_irq_ack;
+	gpio_irqchip->irq_disable = gpio_irq_mask;
+	gpio_irqchip->irq_mask = gpio_irq_mask;
+	gpio_irqchip->irq_unmask = gpio_irq_unmask;
+	gpio_irqchip->irq_set_wake = gpio_irq_set_wake,
+	gpio_irqchip->irq_set_type = at91_gpio->ops->irq_type;
 
 	/* Disable irqs of this PIO controller */
 	writel_relaxed(~0, at91_gpio->regbase + PIO_IDR);
@@ -1667,7 +1624,7 @@ static int at91_gpio_of_irq_setup(struct platform_device *pdev,
 	 * interrupt.
 	 */
 	ret = gpiochip_irqchip_add(&at91_gpio->chip,
-				   &gpio_irqchip,
+				   gpio_irqchip,
 				   0,
 				   handle_edge_irq,
 				   IRQ_TYPE_EDGE_BOTH);
@@ -1685,7 +1642,7 @@ static int at91_gpio_of_irq_setup(struct platform_device *pdev,
 	if (!gpiochip_prev) {
 		/* Then register the chain on the parent IRQ */
 		gpiochip_set_chained_irqchip(&at91_gpio->chip,
-					     &gpio_irqchip,
+					     gpio_irqchip,
 					     at91_gpio->pioc_virq,
 					     gpio_irq_handler);
 		return 0;
@@ -1708,8 +1665,8 @@ static int at91_gpio_of_irq_setup(struct platform_device *pdev,
 
 /* This structure is replicated for each GPIO block allocated at probe time */
 static struct gpio_chip at91_gpio_template = {
-	.request		= at91_gpio_request,
-	.free			= at91_gpio_free,
+	.request		= gpiochip_generic_request,
+	.free			= gpiochip_generic_free,
 	.get_direction		= at91_gpio_get_direction,
 	.direction_input	= at91_gpio_direction_input,
 	.get			= at91_gpio_get,

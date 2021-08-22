@@ -203,6 +203,7 @@ static int st1232_ts_probe(struct i2c_client *client,
 	input_dev->id.bustype = BUS_I2C;
 	input_dev->dev.parent = &client->dev;
 
+	__set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
 	__set_bit(EV_SYN, input_dev->evbit);
 	__set_bit(EV_KEY, input_dev->evbit);
 	__set_bit(EV_ABS, input_dev->evbit);
@@ -296,7 +297,6 @@ static struct i2c_driver st1232_ts_driver = {
 	.id_table	= st1232_ts_id,
 	.driver = {
 		.name	= ST1232_TS_NAME,
-		.owner	= THIS_MODULE,
 		.of_match_table = of_match_ptr(st1232_ts_dt_ids),
 		.pm	= &st1232_ts_pm_ops,
 	},

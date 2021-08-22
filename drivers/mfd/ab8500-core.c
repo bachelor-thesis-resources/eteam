@@ -259,7 +259,7 @@ static int get_register_interruptible(struct ab8500 *ab8500, u8 bank,
 	mutex_unlock(&ab8500->lock);
 	dev_vdbg(ab8500->dev, "rd: addr %#x => data %#x\n", addr, ret);
 
-	return ret;
+	return (ret < 0) ? ret : 0;
 }
 
 static int ab8500_get_register(struct device *dev, u8 bank,
@@ -565,11 +565,7 @@ static int ab8500_irq_map(struct irq_domain *d, unsigned int virq,
 	irq_set_chip_and_handler(virq, &ab8500_irq_chip,
 				handle_simple_irq);
 	irq_set_nested_thread(virq, 1);
-#ifdef CONFIG_ARM
-	set_irq_flags(virq, IRQF_VALID);
-#else
 	irq_set_noprobe(virq);
-#endif
 
 	return 0;
 }

@@ -28,6 +28,7 @@
 #include <linux/interrupt.h>
 #include <linux/spinlock.h>
 #include <linux/reboot.h>
+#include <linux/pm.h>
 
 #include "../core.h"
 #include "../pinconf.h"
@@ -457,18 +458,6 @@ static void msm_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
 	spin_unlock_irqrestore(&pctrl->lock, flags);
 }
 
-static int msm_gpio_request(struct gpio_chip *chip, unsigned offset)
-{
-	int gpio = chip->base + offset;
-	return pinctrl_request_gpio(gpio);
-}
-
-static void msm_gpio_free(struct gpio_chip *chip, unsigned offset)
-{
-	int gpio = chip->base + offset;
-	return pinctrl_free_gpio(gpio);
-}
-
 #ifdef CONFIG_DEBUG_FS
 #include <linux/seq_file.h>
 
@@ -526,8 +515,8 @@ static struct gpio_chip msm_gpio_template = {
 	.direction_output = msm_gpio_direction_output,
 	.get              = msm_gpio_get,
 	.set              = msm_gpio_set,
-	.request          = msm_gpio_request,
-	.free             = msm_gpio_free,
+	.request          = gpiochip_generic_request,
+	.free             = gpiochip_generic_free,
 	.dbg_show         = msm_gpio_dbg_show,
 };
 
@@ -607,10 +596,6 @@ static void msm_gpio_irq_unmask(struct irq_data *d)
 	g = &pctrl->soc->groups[d->hwirq];
 
 	spin_lock_irqsave(&pctrl->lock, flags);
-
-	val = readl(pctrl->regs + g->intr_status_reg);
-	val &= ~BIT(g->intr_status_bit);
-	writel(val, pctrl->regs + g->intr_status_reg);
 
 	val = readl(pctrl->regs + g->intr_cfg_reg);
 	val |= BIT(g->intr_enable_bit);
@@ -733,9 +718,9 @@ static int msm_gpio_irq_set_type(struct irq_data *d, unsigned int type)
 	spin_unlock_irqrestore(&pctrl->lock, flags);
 
 	if (type & (IRQ_TYPE_LEVEL_LOW | IRQ_TYPE_LEVEL_HIGH))
-		__irq_set_handler_locked(d->irq, handle_level_irq);
+		irq_set_handler_locked(d, handle_level_irq);
 	else if (type & (IRQ_TYPE_EDGE_FALLING | IRQ_TYPE_EDGE_RISING))
-		__irq_set_handler_locked(d->irq, handle_edge_irq);
+		irq_set_handler_locked(d, handle_edge_irq);
 
 	return 0;
 }
@@ -764,12 +749,12 @@ static struct irq_chip msm_gpio_irq_chip = {
 	.irq_set_wake   = msm_gpio_irq_set_wake,
 };
 
-static void msm_gpio_irq_handler(unsigned int irq, struct irq_desc *desc)
+static void msm_gpio_irq_handler(struct irq_desc *desc)
 {
 	struct gpio_chip *gc = irq_desc_get_handler_data(desc);
 	const struct msm_pingroup *g;
 	struct msm_pinctrl *pctrl = to_msm_pinctrl(gc);
-	struct irq_chip *chip = irq_get_chip(irq);
+	struct irq_chip *chip = irq_desc_get_chip(desc);
 	int irq_pin;
 	int handled = 0;
 	u32 val;
@@ -793,7 +778,7 @@ static void msm_gpio_irq_handler(unsigned int irq, struct irq_desc *desc)
 
 	/* No interrupts were flagged */
 	if (handled == 0)
-		handle_bad_irq(irq, desc);
+		handle_bad_irq(desc);
 
 	chained_irq_exit(chip, desc);
 }
@@ -821,11 +806,24 @@ static int msm_gpio_init(struct msm_pinctrl *pctrl)
 		return ret;
 	}
 
-	ret = gpiochip_add_pin_range(&pctrl->chip, dev_name(pctrl->dev), 0, 0, chip->ngpio);
-	if (ret) {
-		dev_err(pctrl->dev, "Failed to add pin range\n");
-		gpiochip_remove(&pctrl->chip);
-		return ret;
+	/*
+	 * For DeviceTree-supported systems, the gpio core checks the
+	 * pinctrl's device node for the "gpio-ranges" property.
+	 * If it is present, it takes care of adding the pin ranges
+	 * for the driver. In this case the driver can skip ahead.
+	 *
+	 * In order to remain compatible with older, existing DeviceTree
+	 * files which don't set the "gpio-ranges" property or systems that
+	 * utilize ACPI the driver has to call gpiochip_add_pin_range().
+	 */
+	if (!of_property_read_bool(pctrl->dev->of_node, "gpio-ranges")) {
+		ret = gpiochip_add_pin_range(&pctrl->chip,
+			dev_name(pctrl->dev), 0, 0, chip->ngpio);
+		if (ret) {
+			dev_err(pctrl->dev, "Failed to add pin range\n");
+			gpiochip_remove(&pctrl->chip);
+			return ret;
+		}
 	}
 
 	ret = gpiochip_irqchip_add(chip,
@@ -855,6 +853,13 @@ static int msm_ps_hold_restart(struct notifier_block *nb, unsigned long action,
 	return NOTIFY_DONE;
 }
 
+static struct msm_pinctrl *poweroff_pctrl;
+
+static void msm_ps_hold_poweroff(void)
+{
+	msm_ps_hold_restart(&poweroff_pctrl->restart_nb, 0, NULL);
+}
+
 static void msm_pinctrl_setup_pm_reset(struct msm_pinctrl *pctrl)
 {
 	int i;
@@ -867,6 +872,8 @@ static void msm_pinctrl_setup_pm_reset(struct msm_pinctrl *pctrl)
 			if (register_restart_handler(&pctrl->restart_nb))
 				dev_err(pctrl->dev,
 					"failed to setup restart handler.\n");
+			poweroff_pctrl = pctrl;
+			pm_power_off = msm_ps_hold_poweroff;
 			break;
 		}
 }

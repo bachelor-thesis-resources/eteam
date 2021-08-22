@@ -394,7 +394,7 @@ static void gpmc_cs_bool_timings(int cs, const struct gpmc_bool_timings *p)
 	gpmc_cs_modify_reg(cs, GPMC_CS_CONFIG4,
 			   GPMC_CONFIG4_OEEXTRADELAY, p->oe_extra_delay);
 	gpmc_cs_modify_reg(cs, GPMC_CS_CONFIG4,
-			   GPMC_CONFIG4_OEEXTRADELAY, p->we_extra_delay);
+			   GPMC_CONFIG4_WEEXTRADELAY, p->we_extra_delay);
 	gpmc_cs_modify_reg(cs, GPMC_CS_CONFIG6,
 			   GPMC_CONFIG6_CYCLE2CYCLESAMECSEN,
 			   p->cycle2cyclesamecsen);
@@ -696,7 +696,6 @@ int gpmc_cs_set_timings(int cs, const struct gpmc_timings *t,
 	int div;
 	u32 l;
 
-	gpmc_cs_show_timings(cs, "before gpmc_cs_set_timings");
 	div = gpmc_calc_divider(t->sync_clk);
 	if (div < 0)
 		return div;
@@ -929,7 +928,7 @@ static int gpmc_cs_remap(int cs, u32 base)
 	int ret;
 	u32 old_base, size;
 
-	if (cs > gpmc_cs_num) {
+	if (cs >= gpmc_cs_num) {
 		pr_err("%s: requested chip-select is disabled\n", __func__);
 		return -ENODEV;
 	}
@@ -964,7 +963,7 @@ int gpmc_cs_request(int cs, unsigned long size, unsigned long *base)
 	struct resource *res = &gpmc->mem;
 	int r = -1;
 
-	if (cs > gpmc_cs_num) {
+	if (cs >= gpmc_cs_num) {
 		pr_err("%s: requested chip-select is disabled\n", __func__);
 		return -ENODEV;
 	}
@@ -1176,8 +1175,8 @@ static int gpmc_setup_irq(void)
 		gpmc_client_irq[i].irq = gpmc_irq_start + i;
 		irq_set_chip_and_handler(gpmc_client_irq[i].irq,
 					&gpmc_irq_chip, handle_simple_irq);
-		set_irq_flags(gpmc_client_irq[i].irq,
-				IRQF_VALID | IRQF_NOAUTOEN);
+		irq_modify_status(gpmc_client_irq[i].irq, IRQ_NOREQUEST,
+				  IRQ_NOAUTOEN);
 	}
 
 	/* Disable interrupts */
@@ -1200,7 +1199,6 @@ static int gpmc_free_irq(void)
 	for (i = 0; i < GPMC_NR_IRQ; i++) {
 		irq_set_handler(gpmc_client_irq[i].irq, NULL);
 		irq_set_chip(gpmc_client_irq[i].irq, &no_irq_chip);
-		irq_modify_status(gpmc_client_irq[i].irq, 0, 0);
 	}
 
 	irq_free_descs(gpmc_irq_start, GPMC_NR_IRQ);
@@ -1892,9 +1890,7 @@ static int gpmc_probe_onenand_child(struct platform_device *pdev,
 	if (!of_property_read_u32(child, "dma-channel", &val))
 		gpmc_onenand_data->dma_channel = val;
 
-	gpmc_onenand_init(gpmc_onenand_data);
-
-	return 0;
+	return gpmc_onenand_init(gpmc_onenand_data);
 }
 #else
 static int gpmc_probe_onenand_child(struct platform_device *pdev,
@@ -1989,6 +1985,7 @@ static int gpmc_probe_generic_child(struct platform_device *pdev,
 	if (ret < 0)
 		goto err;
 
+	gpmc_cs_show_timings(cs, "before gpmc_cs_program_settings");
 	ret = gpmc_cs_program_settings(cs, &gpmc_s);
 	if (ret < 0)
 		goto err;

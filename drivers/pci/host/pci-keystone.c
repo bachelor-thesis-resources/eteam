@@ -42,6 +42,7 @@
 #define PCIE_RC_K2HK		0xb008
 #define PCIE_RC_K2E		0xb009
 #define PCIE_RC_K2L		0xb00a
+#define PCIE_RC_K2G		0xb00b
 
 #define to_keystone_pcie(x)	container_of(x, struct keystone_pcie, pp)
 
@@ -55,6 +56,8 @@ static void quirk_limit_mrrs(struct pci_dev *dev)
 		{ PCI_DEVICE(PCI_VENDOR_ID_TI, PCIE_RC_K2E),
 		 .class = PCI_CLASS_BRIDGE_PCI << 8, .class_mask = ~0, },
 		{ PCI_DEVICE(PCI_VENDOR_ID_TI, PCIE_RC_K2L),
+		 .class = PCI_CLASS_BRIDGE_PCI << 8, .class_mask = ~0, },
+		{ PCI_DEVICE(PCI_VENDOR_ID_TI, PCIE_RC_K2G),
 		 .class = PCI_CLASS_BRIDGE_PCI << 8, .class_mask = ~0, },
 		{ 0, },
 	};
@@ -110,8 +113,9 @@ static int ks_pcie_establish_link(struct keystone_pcie *ks_pcie)
 	return -EINVAL;
 }
 
-static void ks_pcie_msi_irq_handler(unsigned int irq, struct irq_desc *desc)
+static void ks_pcie_msi_irq_handler(struct irq_desc *desc)
 {
+	unsigned int irq = irq_desc_get_irq(desc);
 	struct keystone_pcie *ks_pcie = irq_desc_get_handler_data(desc);
 	u32 offset = irq - ks_pcie->msi_host_irqs[0];
 	struct pcie_port *pp = &ks_pcie->pp;
@@ -137,8 +141,9 @@ static void ks_pcie_msi_irq_handler(unsigned int irq, struct irq_desc *desc)
  * Traverse through pending legacy interrupts and invoke handler for each. Also
  * takes care of interrupt controller level mask/ack operation.
  */
-static void ks_pcie_legacy_irq_handler(unsigned int irq, struct irq_desc *desc)
+static void ks_pcie_legacy_irq_handler(struct irq_desc *desc)
 {
+	unsigned int irq = irq_desc_get_irq(desc);
 	struct keystone_pcie *ks_pcie = irq_desc_get_handler_data(desc);
 	struct pcie_port *pp = &ks_pcie->pp;
 	u32 irq_offset = irq - ks_pcie->legacy_host_irqs[0];
@@ -177,14 +182,16 @@ static int ks_pcie_get_irq_controller_info(struct keystone_pcie *ks_pcie,
 	}
 
 	/* interrupt controller is in a child node */
-	*np_temp = of_find_node_by_name(np_pcie, controller);
+	*np_temp = of_get_child_by_name(np_pcie, controller);
 	if (!(*np_temp)) {
 		dev_err(dev, "Node for %s is absent\n", controller);
 		goto out;
 	}
 	temp = of_irq_count(*np_temp);
-	if (!temp)
+	if (!temp) {
+		of_node_put(*np_temp);
 		goto out;
+	}
 	if (temp > max_host_irqs)
 		dev_warn(dev, "Too many %s interrupts defined %u\n",
 			(legacy ? "legacy" : "MSI"), temp);
@@ -198,6 +205,9 @@ static int ks_pcie_get_irq_controller_info(struct keystone_pcie *ks_pcie,
 		if (!host_irqs[temp])
 			break;
 	}
+
+	of_node_put(*np_temp);
+
 	if (temp) {
 		*num_irqs = temp;
 		ret = 0;
@@ -212,9 +222,9 @@ static void ks_pcie_setup_interrupts(struct keystone_pcie *ks_pcie)
 
 	/* Legacy IRQ */
 	for (i = 0; i < ks_pcie->num_legacy_host_irqs; i++) {
-		irq_set_handler_data(ks_pcie->legacy_host_irqs[i], ks_pcie);
-		irq_set_chained_handler(ks_pcie->legacy_host_irqs[i],
-					ks_pcie_legacy_irq_handler);
+		irq_set_chained_handler_and_data(ks_pcie->legacy_host_irqs[i],
+						 ks_pcie_legacy_irq_handler,
+						 ks_pcie);
 	}
 	ks_dw_pcie_enable_legacy_irqs(ks_pcie);
 

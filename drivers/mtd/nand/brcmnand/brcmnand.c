@@ -309,6 +309,36 @@ static const u16 brcmnand_regs_v60[] = {
 	[BRCMNAND_FC_BASE]		= 0x400,
 };
 
+/* BRCMNAND v7.1 */
+static const u16 brcmnand_regs_v71[] = {
+	[BRCMNAND_CMD_START]		=  0x04,
+	[BRCMNAND_CMD_EXT_ADDRESS]	=  0x08,
+	[BRCMNAND_CMD_ADDRESS]		=  0x0c,
+	[BRCMNAND_INTFC_STATUS]		=  0x14,
+	[BRCMNAND_CS_SELECT]		=  0x18,
+	[BRCMNAND_CS_XOR]		=  0x1c,
+	[BRCMNAND_LL_OP]		=  0x20,
+	[BRCMNAND_CS0_BASE]		=  0x50,
+	[BRCMNAND_CS1_BASE]		=     0,
+	[BRCMNAND_CORR_THRESHOLD]	=  0xdc,
+	[BRCMNAND_CORR_THRESHOLD_EXT]	=  0xe0,
+	[BRCMNAND_UNCORR_COUNT]		=  0xfc,
+	[BRCMNAND_CORR_COUNT]		= 0x100,
+	[BRCMNAND_CORR_EXT_ADDR]	= 0x10c,
+	[BRCMNAND_CORR_ADDR]		= 0x110,
+	[BRCMNAND_UNCORR_EXT_ADDR]	= 0x114,
+	[BRCMNAND_UNCORR_ADDR]		= 0x118,
+	[BRCMNAND_SEMAPHORE]		= 0x150,
+	[BRCMNAND_ID]			= 0x194,
+	[BRCMNAND_ID_EXT]		= 0x198,
+	[BRCMNAND_LL_RDATA]		= 0x19c,
+	[BRCMNAND_OOB_READ_BASE]	= 0x200,
+	[BRCMNAND_OOB_READ_10_BASE]	=     0,
+	[BRCMNAND_OOB_WRITE_BASE]	= 0x280,
+	[BRCMNAND_OOB_WRITE_10_BASE]	=     0,
+	[BRCMNAND_FC_BASE]		= 0x400,
+};
+
 enum brcmnand_cs_reg {
 	BRCMNAND_CS_CFG_EXT = 0,
 	BRCMNAND_CS_CFG,
@@ -342,6 +372,28 @@ static const u8 brcmnand_cs_offsets_cs0[] = {
 	[BRCMNAND_CS_CFG]		= 0x08,
 	[BRCMNAND_CS_TIMING1]		= 0x10,
 	[BRCMNAND_CS_TIMING2]		= 0x14,
+};
+
+/*
+ * Bitfields for the CFG and CFG_EXT registers. Pre-v7.1 controllers only had
+ * one config register, but once the bitfields overflowed, newer controllers
+ * (v7.1 and newer) added a CFG_EXT register and shuffled a few fields around.
+ */
+enum {
+	CFG_BLK_ADR_BYTES_SHIFT		= 8,
+	CFG_COL_ADR_BYTES_SHIFT		= 12,
+	CFG_FUL_ADR_BYTES_SHIFT		= 16,
+	CFG_BUS_WIDTH_SHIFT		= 23,
+	CFG_BUS_WIDTH			= BIT(CFG_BUS_WIDTH_SHIFT),
+	CFG_DEVICE_SIZE_SHIFT		= 24,
+
+	/* Only for pre-v7.1 (with no CFG_EXT register) */
+	CFG_PAGE_SIZE_SHIFT		= 20,
+	CFG_BLK_SIZE_SHIFT		= 28,
+
+	/* Only for v7.1+ (with CFG_EXT register) */
+	CFG_EXT_PAGE_SIZE_SHIFT		= 0,
+	CFG_EXT_BLK_SIZE_SHIFT		= 4,
 };
 
 /* BRCMNAND_INTFC_STATUS */
@@ -382,7 +434,9 @@ static int brcmnand_revision_init(struct brcmnand_controller *ctrl)
 	}
 
 	/* Register offsets */
-	if (ctrl->nand_version >= 0x0600)
+	if (ctrl->nand_version >= 0x0701)
+		ctrl->reg_offsets = brcmnand_regs_v71;
+	else if (ctrl->nand_version >= 0x0600)
 		ctrl->reg_offsets = brcmnand_regs_v60;
 	else if (ctrl->nand_version >= 0x0500)
 		ctrl->reg_offsets = brcmnand_regs_v50;
@@ -401,8 +455,9 @@ static int brcmnand_revision_init(struct brcmnand_controller *ctrl)
 	} else {
 		ctrl->cs_offsets = brcmnand_cs_offsets;
 
-		/* v5.0 and earlier has a different CS0 offset layout */
-		if (ctrl->nand_version <= 0x0500)
+		/* v3.3-5.0 have a different CS0 offset layout */
+		if (ctrl->nand_version >= 0x0303 &&
+		    ctrl->nand_version <= 0x0500)
 			ctrl->cs0_offsets = brcmnand_cs_offsets_cs0;
 	}
 
@@ -1544,9 +1599,9 @@ static int brcmnand_write(struct mtd_info *mtd, struct nand_chip *chip,
 
 	dev_dbg(ctrl->dev, "write %llx <- %p\n", (unsigned long long)addr, buf);
 
-	if (unlikely((u32)buf & 0x03)) {
+	if (unlikely((unsigned long)buf & 0x03)) {
 		dev_warn(ctrl->dev, "unaligned buffer: %p\n", buf);
-		buf = (u32 *)((u32)buf & ~0x03);
+		buf = (u32 *)((unsigned long)buf & ~0x03);
 	}
 
 	brcmnand_wp(mtd, 0);
@@ -1606,7 +1661,7 @@ out:
 }
 
 static int brcmnand_write_page(struct mtd_info *mtd, struct nand_chip *chip,
-			       const uint8_t *buf, int oob_required)
+			       const uint8_t *buf, int oob_required, int page)
 {
 	struct brcmnand_host *host = chip->priv;
 	void *oob = oob_required ? chip->oob_poi : NULL;
@@ -1617,7 +1672,7 @@ static int brcmnand_write_page(struct mtd_info *mtd, struct nand_chip *chip,
 
 static int brcmnand_write_page_raw(struct mtd_info *mtd,
 				   struct nand_chip *chip, const uint8_t *buf,
-				   int oob_required)
+				   int oob_required, int page)
 {
 	struct brcmnand_host *host = chip->priv;
 	void *oob = oob_required ? chip->oob_poi : NULL;
@@ -1720,17 +1775,19 @@ static int brcmnand_set_cfg(struct brcmnand_host *host,
 	}
 	device_size = fls64(cfg->device_size) - fls64(BRCMNAND_MIN_DEVSIZE);
 
-	tmp = (cfg->blk_adr_bytes << 8) |
-		(cfg->col_adr_bytes << 12) |
-		(cfg->ful_adr_bytes << 16) |
-		(!!(cfg->device_width == 16) << 23) |
-		(device_size << 24);
+	tmp = (cfg->blk_adr_bytes << CFG_BLK_ADR_BYTES_SHIFT) |
+		(cfg->col_adr_bytes << CFG_COL_ADR_BYTES_SHIFT) |
+		(cfg->ful_adr_bytes << CFG_FUL_ADR_BYTES_SHIFT) |
+		(!!(cfg->device_width == 16) << CFG_BUS_WIDTH_SHIFT) |
+		(device_size << CFG_DEVICE_SIZE_SHIFT);
 	if (cfg_offs == cfg_ext_offs) {
-		tmp |= (page_size << 20) | (block_size << 28);
+		tmp |= (page_size << CFG_PAGE_SIZE_SHIFT) |
+		       (block_size << CFG_BLK_SIZE_SHIFT);
 		nand_writereg(ctrl, cfg_offs, tmp);
 	} else {
 		nand_writereg(ctrl, cfg_offs, tmp);
-		tmp = page_size | (block_size << 4);
+		tmp = (page_size << CFG_EXT_PAGE_SIZE_SHIFT) |
+		      (block_size << CFG_EXT_BLK_SIZE_SHIFT);
 		nand_writereg(ctrl, cfg_ext_offs, tmp);
 	}
 
@@ -1792,7 +1849,8 @@ static int brcmnand_setup_dev(struct brcmnand_host *host)
 
 	memset(cfg, 0, sizeof(*cfg));
 
-	ret = of_property_read_u32(chip->dn, "brcm,nand-oob-sector-size",
+	ret = of_property_read_u32(chip->flash_node,
+				   "brcm,nand-oob-sector-size",
 				   &oob_sector);
 	if (ret) {
 		/* Use detected size */
@@ -1865,16 +1923,9 @@ static int brcmnand_setup_dev(struct brcmnand_host *host)
 	tmp &= ~ACC_CONTROL_PARTIAL_PAGE;
 	tmp &= ~ACC_CONTROL_RD_ERASED;
 	tmp &= ~ACC_CONTROL_FAST_PGM_RDIN;
-	if (ctrl->features & BRCMNAND_HAS_PREFETCH) {
-		/*
-		 * FIXME: Flash DMA + prefetch may see spurious erased-page ECC
-		 * errors
-		 */
-		if (has_flash_dma(ctrl))
-			tmp &= ~ACC_CONTROL_PREFETCH;
-		else
-			tmp |= ACC_CONTROL_PREFETCH;
-	}
+	if (ctrl->features & BRCMNAND_HAS_PREFETCH)
+		tmp &= ~ACC_CONTROL_PREFETCH;
+
 	nand_writereg(ctrl, offs, tmp);
 
 	return 0;
@@ -1888,6 +1939,7 @@ static int brcmnand_init_cs(struct brcmnand_host *host)
 	struct mtd_info *mtd;
 	struct nand_chip *chip;
 	int ret;
+	u16 cfg_offs;
 	struct mtd_part_parser_data ppdata = { .of_node = dn };
 
 	ret = of_property_read_u32(dn, "reg", &host->cs);
@@ -1899,7 +1951,7 @@ static int brcmnand_init_cs(struct brcmnand_host *host)
 	mtd = &host->mtd;
 	chip = &host->chip;
 
-	chip->dn = dn;
+	chip->flash_node = dn;
 	chip->priv = host;
 	mtd->priv = chip;
 	mtd->name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "brcmnand.%d",
@@ -1929,6 +1981,15 @@ static int brcmnand_init_cs(struct brcmnand_host *host)
 	chip->ecc.write_oob = brcmnand_write_oob;
 
 	chip->controller = &ctrl->controller;
+
+	/*
+	 * The bootloader might have configured 16bit mode but
+	 * NAND READID command only works in 8bit mode. We force
+	 * 8bit mode here to ensure that NAND READID commands works.
+	 */
+	cfg_offs = brcmnand_cs_offset(ctrl, host->cs, BRCMNAND_CS_CFG);
+	nand_writereg(ctrl, cfg_offs,
+		      nand_readreg(ctrl, cfg_offs) & ~CFG_BUS_WIDTH);
 
 	if (nand_scan_ident(mtd, 1, NULL))
 		return -ENXIO;
