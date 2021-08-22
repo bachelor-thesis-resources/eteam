@@ -743,6 +743,7 @@ static const struct regmap_config wm8940_regmap = {
 	.max_register = WM8940_MONOMIX,
 	.reg_defaults = wm8940_reg_defaults,
 	.num_reg_defaults = ARRAY_SIZE(wm8940_reg_defaults),
+	.cache_type = REGCACHE_RBTREE,
 
 	.readable_reg = wm8940_readable_register,
 	.volatile_reg = wm8940_volatile_register,
@@ -787,7 +788,6 @@ MODULE_DEVICE_TABLE(i2c, wm8940_i2c_id);
 static struct i2c_driver wm8940_i2c_driver = {
 	.driver = {
 		.name = "wm8940",
-		.owner = THIS_MODULE,
 	},
 	.probe =    wm8940_i2c_probe,
 	.remove =   wm8940_i2c_remove,

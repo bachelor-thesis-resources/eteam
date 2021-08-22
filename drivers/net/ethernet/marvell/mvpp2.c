@@ -29,6 +29,7 @@
 #include <linux/clk.h>
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
+#include <linux/if_vlan.h>
 #include <uapi/linux/ppp_defs.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
@@ -772,6 +773,17 @@ struct mvpp2_rx_desc {
 	u32 reserved8;
 };
 
+struct mvpp2_txq_pcpu_buf {
+	/* Transmitted SKB */
+	struct sk_buff *skb;
+
+	/* Physical address of transmitted buffer */
+	dma_addr_t phys;
+
+	/* Size transmitted */
+	size_t size;
+};
+
 /* Per-CPU Tx queue control */
 struct mvpp2_txq_pcpu {
 	int cpu;
@@ -787,11 +799,8 @@ struct mvpp2_txq_pcpu {
 	/* Number of Tx DMA descriptors reserved for each CPU */
 	int reserved_num;
 
-	/* Array of transmitted skb */
-	struct sk_buff **tx_skb;
-
-	/* Array of transmitted buffers' physical addresses */
-	dma_addr_t *tx_buffs;
+	/* Infos about transmitted buffers */
+	struct mvpp2_txq_pcpu_buf *buffs;
 
 	/* Index of last TX DMA descriptor that was inserted */
 	int txq_put_index;
@@ -981,10 +990,11 @@ static void mvpp2_txq_inc_put(struct mvpp2_txq_pcpu *txq_pcpu,
 			      struct sk_buff *skb,
 			      struct mvpp2_tx_desc *tx_desc)
 {
-	txq_pcpu->tx_skb[txq_pcpu->txq_put_index] = skb;
-	if (skb)
-		txq_pcpu->tx_buffs[txq_pcpu->txq_put_index] =
-							 tx_desc->buf_phys_addr;
+	struct mvpp2_txq_pcpu_buf *tx_buf =
+		txq_pcpu->buffs + txq_pcpu->txq_put_index;
+	tx_buf->skb = skb;
+	tx_buf->size = tx_desc->data_size;
+	tx_buf->phys = tx_desc->buf_phys_addr + tx_desc->packet_offset;
 	txq_pcpu->txq_put_index++;
 	if (txq_pcpu->txq_put_index == txq_pcpu->size)
 		txq_pcpu->txq_put_index = 0;
@@ -3295,7 +3305,7 @@ static void mvpp2_cls_init(struct mvpp2 *priv)
 	mvpp2_write(priv, MVPP2_CLS_MODE_REG, MVPP2_CLS_MODE_ACTIVE_MASK);
 
 	/* Clear classifier flow table */
-	memset(&fe.data, 0, MVPP2_CLS_FLOWS_TBL_DATA_WORDS);
+	memset(&fe.data, 0, sizeof(fe.data));
 	for (index = 0; index < MVPP2_CLS_FLOWS_TBL_SIZE; index++) {
 		fe.index = index;
 		mvpp2_cls_flow_write(priv, &fe);
@@ -3413,16 +3423,23 @@ static void mvpp2_bm_pool_bufsize_set(struct mvpp2 *priv,
 }
 
 /* Free all buffers from the pool */
-static void mvpp2_bm_bufs_free(struct mvpp2 *priv, struct mvpp2_bm_pool *bm_pool)
+static void mvpp2_bm_bufs_free(struct device *dev, struct mvpp2 *priv,
+			       struct mvpp2_bm_pool *bm_pool)
 {
 	int i;
 
 	for (i = 0; i < bm_pool->buf_num; i++) {
+		dma_addr_t buf_phys_addr;
 		u32 vaddr;
 
 		/* Get buffer virtual address (indirect access) */
-		mvpp2_read(priv, MVPP2_BM_PHY_ALLOC_REG(bm_pool->id));
+		buf_phys_addr = mvpp2_read(priv,
+					   MVPP2_BM_PHY_ALLOC_REG(bm_pool->id));
 		vaddr = mvpp2_read(priv, MVPP2_BM_VIRT_ALLOC_REG);
+
+		dma_unmap_single(dev, buf_phys_addr,
+				 bm_pool->buf_size, DMA_FROM_DEVICE);
+
 		if (!vaddr)
 			break;
 		dev_kfree_skb_any((struct sk_buff *)vaddr);
@@ -3439,7 +3456,7 @@ static int mvpp2_bm_pool_destroy(struct platform_device *pdev,
 {
 	u32 val;
 
-	mvpp2_bm_bufs_free(priv, bm_pool);
+	mvpp2_bm_bufs_free(&pdev->dev, priv, bm_pool);
 	if (bm_pool->buf_num) {
 		WARN(1, "cannot free all buffers in pool %d\n", bm_pool->id);
 		return 0;
@@ -3692,7 +3709,8 @@ mvpp2_bm_pool_use(struct mvpp2_port *port, int pool, enum mvpp2_bm_type type,
 				   MVPP2_BM_LONG_BUF_NUM :
 				   MVPP2_BM_SHORT_BUF_NUM;
 		else
-			mvpp2_bm_bufs_free(port->priv, new_pool);
+			mvpp2_bm_bufs_free(port->dev->dev.parent,
+					   port->priv, new_pool);
 
 		new_pool->pkt_size = pkt_size;
 
@@ -3756,7 +3774,7 @@ static int mvpp2_bm_update_mtu(struct net_device *dev, int mtu)
 	int pkt_size = MVPP2_RX_PKT_SIZE(mtu);
 
 	/* Update BM pool with new buffer size */
-	mvpp2_bm_bufs_free(port->priv, port_pool);
+	mvpp2_bm_bufs_free(dev->dev.parent, port->priv, port_pool);
 	if (port_pool->buf_num) {
 		WARN(1, "cannot free all buffers in pool %d\n", port_pool->id);
 		return -EIO;
@@ -3922,7 +3940,7 @@ static inline void mvpp2_gmac_max_rx_size_set(struct mvpp2_port *port)
 /* Set defaults to the MVPP2 port */
 static void mvpp2_defaults_set(struct mvpp2_port *port)
 {
-	int tx_port_num, val, queue, ptxq, lrxq;
+	int tx_port_num, val, queue, lrxq;
 
 	/* Configure port to loopback if needed */
 	if (port->flags & MVPP2_F_LOOPBACK)
@@ -3942,11 +3960,9 @@ static void mvpp2_defaults_set(struct mvpp2_port *port)
 	mvpp2_write(port->priv, MVPP2_TXP_SCHED_CMD_1_REG, 0);
 
 	/* Close bandwidth for all queues */
-	for (queue = 0; queue < MVPP2_MAX_TXQ; queue++) {
-		ptxq = mvpp2_txq_phys(port->id, queue);
+	for (queue = 0; queue < MVPP2_MAX_TXQ; queue++)
 		mvpp2_write(port->priv,
-			    MVPP2_TXQ_SCHED_TOKEN_CNTR_REG(ptxq), 0);
-	}
+			    MVPP2_TXQ_SCHED_TOKEN_CNTR_REG(queue), 0);
 
 	/* Set refill period to 1 usec, refill tokens
 	 * and bucket size to maximum
@@ -4251,7 +4267,7 @@ static void mvpp2_txq_desc_put(struct mvpp2_tx_queue *txq)
 }
 
 /* Set Tx descriptors fields relevant for CSUM calculation */
-static u32 mvpp2_txq_desc_csum(int l3_offs, int l3_proto,
+static u32 mvpp2_txq_desc_csum(int l3_offs, __be16 l3_proto,
 			       int ip_hdr_len, int l4_proto)
 {
 	u32 command;
@@ -4395,18 +4411,15 @@ static void mvpp2_txq_bufs_free(struct mvpp2_port *port,
 	int i;
 
 	for (i = 0; i < num; i++) {
-		dma_addr_t buf_phys_addr =
-				    txq_pcpu->tx_buffs[txq_pcpu->txq_get_index];
-		struct sk_buff *skb = txq_pcpu->tx_skb[txq_pcpu->txq_get_index];
+		struct mvpp2_txq_pcpu_buf *tx_buf =
+			txq_pcpu->buffs + txq_pcpu->txq_get_index;
+
+		dma_unmap_single(port->dev->dev.parent, tx_buf->phys,
+				 tx_buf->size, DMA_TO_DEVICE);
+		if (tx_buf->skb)
+			dev_kfree_skb_any(tx_buf->skb);
 
 		mvpp2_txq_inc_get(txq_pcpu);
-
-		if (!skb)
-			continue;
-
-		dma_unmap_single(port->dev->dev.parent, buf_phys_addr,
-				 skb_headlen(skb), DMA_TO_DEVICE);
-		dev_kfree_skb_any(skb);
 	}
 }
 
@@ -4657,15 +4670,10 @@ static int mvpp2_txq_init(struct mvpp2_port *port,
 	for_each_present_cpu(cpu) {
 		txq_pcpu = per_cpu_ptr(txq->pcpu, cpu);
 		txq_pcpu->size = txq->size;
-		txq_pcpu->tx_skb = kmalloc(txq_pcpu->size *
-					   sizeof(*txq_pcpu->tx_skb),
-					   GFP_KERNEL);
-		if (!txq_pcpu->tx_skb)
-			goto error;
-
-		txq_pcpu->tx_buffs = kmalloc(txq_pcpu->size *
-					     sizeof(dma_addr_t), GFP_KERNEL);
-		if (!txq_pcpu->tx_buffs)
+		txq_pcpu->buffs = kmalloc(txq_pcpu->size *
+					  sizeof(struct mvpp2_txq_pcpu_buf),
+					  GFP_KERNEL);
+		if (!txq_pcpu->buffs)
 			goto error;
 
 		txq_pcpu->count = 0;
@@ -4679,8 +4687,7 @@ static int mvpp2_txq_init(struct mvpp2_port *port,
 error:
 	for_each_present_cpu(cpu) {
 		txq_pcpu = per_cpu_ptr(txq->pcpu, cpu);
-		kfree(txq_pcpu->tx_skb);
-		kfree(txq_pcpu->tx_buffs);
+		kfree(txq_pcpu->buffs);
 	}
 
 	dma_free_coherent(port->dev->dev.parent,
@@ -4699,8 +4706,7 @@ static void mvpp2_txq_deinit(struct mvpp2_port *port,
 
 	for_each_present_cpu(cpu) {
 		txq_pcpu = per_cpu_ptr(txq->pcpu, cpu);
-		kfree(txq_pcpu->tx_skb);
-		kfree(txq_pcpu->tx_buffs);
+		kfree(txq_pcpu->buffs);
 	}
 
 	if (txq->descs)
@@ -4714,7 +4720,7 @@ static void mvpp2_txq_deinit(struct mvpp2_port *port,
 	txq->descs_phys        = 0;
 
 	/* Set minimum bandwidth for disabled TXQs */
-	mvpp2_write(port->priv, MVPP2_TXQ_SCHED_TOKEN_CNTR_REG(txq->id), 0);
+	mvpp2_write(port->priv, MVPP2_TXQ_SCHED_TOKEN_CNTR_REG(txq->log_id), 0);
 
 	/* Set Tx descriptors queue starting address and size */
 	mvpp2_write(port->priv, MVPP2_TXQ_NUM_REG, txq->id);
@@ -5025,14 +5031,15 @@ static u32 mvpp2_skb_tx_csum(struct mvpp2_port *port, struct sk_buff *skb)
 	if (skb->ip_summed == CHECKSUM_PARTIAL) {
 		int ip_hdr_len = 0;
 		u8 l4_proto;
+		__be16 l3_proto = vlan_get_protocol(skb);
 
-		if (skb->protocol == htons(ETH_P_IP)) {
+		if (l3_proto == htons(ETH_P_IP)) {
 			struct iphdr *ip4h = ip_hdr(skb);
 
 			/* Calculate IPv4 checksum and L4 checksum */
 			ip_hdr_len = ip4h->ihl;
 			l4_proto = ip4h->protocol;
-		} else if (skb->protocol == htons(ETH_P_IPV6)) {
+		} else if (l3_proto == htons(ETH_P_IPV6)) {
 			struct ipv6hdr *ip6h = ipv6_hdr(skb);
 
 			/* Read l4_protocol from one of IPv6 extra headers */
@@ -5044,7 +5051,7 @@ static u32 mvpp2_skb_tx_csum(struct mvpp2_port *port, struct sk_buff *skb)
 		}
 
 		return mvpp2_txq_desc_csum(skb_network_offset(skb),
-				skb->protocol, ip_hdr_len, l4_proto);
+					   l3_proto, ip_hdr_len, l4_proto);
 	}
 
 	return MVPP2_TXD_L4_CSUM_NOT | MVPP2_TXD_IP_CSUM_DISABLE;
@@ -5092,7 +5099,8 @@ static int mvpp2_rx(struct mvpp2_port *port, int rx_todo,
 		    struct mvpp2_rx_queue *rxq)
 {
 	struct net_device *dev = port->dev;
-	int rx_received, rx_filled, i;
+	int rx_received;
+	int rx_done = 0;
 	u32 rcvd_pkts = 0;
 	u32 rcvd_bytes = 0;
 
@@ -5101,17 +5109,18 @@ static int mvpp2_rx(struct mvpp2_port *port, int rx_todo,
 	if (rx_todo > rx_received)
 		rx_todo = rx_received;
 
-	rx_filled = 0;
-	for (i = 0; i < rx_todo; i++) {
+	while (rx_done < rx_todo) {
 		struct mvpp2_rx_desc *rx_desc = mvpp2_rxq_next_desc_get(rxq);
 		struct mvpp2_bm_pool *bm_pool;
 		struct sk_buff *skb;
+		dma_addr_t phys_addr;
 		u32 bm, rx_status;
 		int pool, rx_bytes, err;
 
-		rx_filled++;
+		rx_done++;
 		rx_status = rx_desc->status;
 		rx_bytes = rx_desc->data_size - MVPP2_MH_SIZE;
+		phys_addr = rx_desc->buf_phys_addr;
 
 		bm = mvpp2_bm_cookie_build(rx_desc);
 		pool = mvpp2_bm_cookie_pool_get(bm);
@@ -5128,14 +5137,25 @@ static int mvpp2_rx(struct mvpp2_port *port, int rx_todo,
 		 * comprised by the RX descriptor.
 		 */
 		if (rx_status & MVPP2_RXD_ERR_SUMMARY) {
+		err_drop_frame:
 			dev->stats.rx_errors++;
 			mvpp2_rx_error(port, rx_desc);
+			/* Return the buffer to the pool */
 			mvpp2_pool_refill(port, bm, rx_desc->buf_phys_addr,
 					  rx_desc->buf_cookie);
 			continue;
 		}
 
 		skb = (struct sk_buff *)rx_desc->buf_cookie;
+
+		err = mvpp2_rx_refill(port, bm_pool, bm, 0);
+		if (err) {
+			netdev_err(port->dev, "failed to refill BM pools\n");
+			goto err_drop_frame;
+		}
+
+		dma_unmap_single(dev->dev.parent, phys_addr,
+				 bm_pool->buf_size, DMA_FROM_DEVICE);
 
 		rcvd_pkts++;
 		rcvd_bytes += rx_bytes;
@@ -5147,12 +5167,6 @@ static int mvpp2_rx(struct mvpp2_port *port, int rx_todo,
 		mvpp2_rx_csum(port, rx_status, skb);
 
 		napi_gro_receive(&port->napi, skb);
-
-		err = mvpp2_rx_refill(port, bm_pool, bm, 0);
-		if (err) {
-			netdev_err(port->dev, "failed to refill BM pools\n");
-			rx_filled--;
-		}
 	}
 
 	if (rcvd_pkts) {
@@ -5166,7 +5180,7 @@ static int mvpp2_rx(struct mvpp2_port *port, int rx_todo,
 
 	/* Update Rx queue management counters */
 	wmb();
-	mvpp2_rxq_status_update(port, rxq->id, rx_todo, rx_filled);
+	mvpp2_rxq_status_update(port, rxq->id, rx_done, rx_done);
 
 	return rx_todo;
 }
@@ -5652,6 +5666,7 @@ static void mvpp2_set_rx_mode(struct net_device *dev)
 	int id = port->id;
 	bool allmulti = dev->flags & IFF_ALLMULTI;
 
+retry:
 	mvpp2_prs_mac_promisc_set(priv, id, dev->flags & IFF_PROMISC);
 	mvpp2_prs_mac_multi_set(priv, id, MVPP2_PE_MAC_MC_ALL, allmulti);
 	mvpp2_prs_mac_multi_set(priv, id, MVPP2_PE_MAC_MC_IP6, allmulti);
@@ -5659,9 +5674,13 @@ static void mvpp2_set_rx_mode(struct net_device *dev)
 	/* Remove all port->id's mcast enries */
 	mvpp2_prs_mcast_del_all(priv, id);
 
-	if (allmulti && !netdev_mc_empty(dev)) {
-		netdev_for_each_mc_addr(ha, dev)
-			mvpp2_prs_mac_da_accept(priv, id, ha->addr, true);
+	if (!allmulti) {
+		netdev_for_each_mc_addr(ha, dev) {
+			if (mvpp2_prs_mac_da_accept(priv, id, ha->addr, true)) {
+				allmulti = true;
+				goto retry;
+			}
+		}
 	}
 }
 

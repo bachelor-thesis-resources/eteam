@@ -30,7 +30,7 @@
 #define BRCMF_ARP_OL_PEER_AUTO_REPLY	0x00000008
 
 #define	BRCMF_BSS_INFO_VERSION	109 /* curr ver of brcmf_bss_info_le struct */
-#define BRCMF_BSS_RSSI_ON_CHANNEL	0x0002
+#define BRCMF_BSS_RSSI_ON_CHANNEL	0x0004
 
 #define BRCMF_STA_WME              0x00000002      /* WMM association */
 #define BRCMF_STA_AUTHE            0x00000008      /* Authenticated */
@@ -44,6 +44,11 @@
 /* masks for channel and ssid count */
 #define BRCMF_SCAN_PARAMS_COUNT_MASK	0x0000ffff
 #define BRCMF_SCAN_PARAMS_NSSID_SHIFT	16
+
+/* scan type definitions */
+#define BRCMF_SCANTYPE_DEFAULT		0xFF
+#define BRCMF_SCANTYPE_ACTIVE		0
+#define BRCMF_SCANTYPE_PASSIVE		1
 
 /* primary (ie tx) key */
 #define BRCMF_PRIMARY_KEY		(1 << 1)
@@ -118,6 +123,8 @@
 
 #define BRCMF_COUNTRY_BUF_SZ		4
 #define BRCMF_ANT_MAX			4
+
+#define BRCMF_MAX_ASSOCLIST		128
 
 /* join preference types for join_pref iovar */
 enum brcmf_join_pref_types {
@@ -619,6 +626,17 @@ struct brcmf_rev_info_le {
 	__le32 anarev;
 	__le32 chippkg;
 	__le32 nvramrev;
+};
+
+/**
+ * struct brcmf_assoclist_le - request assoc list.
+ *
+ * @count: indicates number of stations.
+ * @mac: MAC addresses of stations.
+ */
+struct brcmf_assoclist_le {
+	__le32 count;
+	u8 mac[BRCMF_MAX_ASSOCLIST][ETH_ALEN];
 };
 
 #endif /* FWIL_TYPES_H_ */

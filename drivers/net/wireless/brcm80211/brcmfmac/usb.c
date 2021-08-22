@@ -144,6 +144,7 @@ struct brcmf_usbdev_info {
 
 	struct usb_device *usbdev;
 	struct device *dev;
+	struct completion dev_init_done;
 
 	int ctl_in_pipe, ctl_out_pipe;
 	struct urb *ctl_urb; /* URB for control endpoint */
@@ -425,6 +426,7 @@ fail:
 			usb_free_urb(req->urb);
 		list_del(q->next);
 	}
+	kfree(reqs);
 	return NULL;
 
 }
@@ -501,7 +503,7 @@ static void brcmf_usb_rx_complete(struct urb *urb)
 
 	if (devinfo->bus_pub.state == BRCMFMAC_USB_STATE_UP) {
 		skb_put(skb, urb->actual_length);
-		brcmf_rx_frame(devinfo->dev, skb);
+		brcmf_rx_frame(devinfo->dev, skb, true);
 		brcmf_usb_rx_refill(devinfo, req);
 	} else {
 		brcmu_pkt_buf_free_skb(skb);
@@ -668,12 +670,18 @@ static int brcmf_usb_up(struct device *dev)
 
 static void brcmf_cancel_all_urbs(struct brcmf_usbdev_info *devinfo)
 {
+	int i;
+
 	if (devinfo->ctl_urb)
 		usb_kill_urb(devinfo->ctl_urb);
 	if (devinfo->bulk_urb)
 		usb_kill_urb(devinfo->bulk_urb);
-	brcmf_usb_free_q(&devinfo->tx_postq, true);
-	brcmf_usb_free_q(&devinfo->rx_postq, true);
+	if (devinfo->tx_reqs)
+		for (i = 0; i < devinfo->bus_pub.ntxq; i++)
+			usb_kill_urb(devinfo->tx_reqs[i].urb);
+	if (devinfo->rx_reqs)
+		for (i = 0; i < devinfo->bus_pub.nrxq; i++)
+			usb_kill_urb(devinfo->rx_reqs[i].urb);
 }
 
 static void brcmf_usb_down(struct device *dev)
@@ -1204,6 +1212,8 @@ static void brcmf_usb_probe_phase2(struct device *dev,
 	int ret;
 
 	brcmf_dbg(USB, "Start fw downloading\n");
+
+	devinfo = bus->bus_priv.usb->devinfo;
 	ret = check_file(fw->data);
 	if (ret < 0) {
 		brcmf_err("invalid firmware\n");
@@ -1211,7 +1221,6 @@ static void brcmf_usb_probe_phase2(struct device *dev,
 		goto error;
 	}
 
-	devinfo = bus->bus_priv.usb->devinfo;
 	devinfo->image = fw->data;
 	devinfo->image_len = fw->size;
 
@@ -1224,9 +1233,11 @@ static void brcmf_usb_probe_phase2(struct device *dev,
 	if (ret)
 		goto error;
 
+	complete(&devinfo->dev_init_done);
 	return;
 error:
 	brcmf_dbg(TRACE, "failed: dev=%s, err=%d\n", dev_name(dev), ret);
+	complete(&devinfo->dev_init_done);
 	device_release_driver(dev);
 }
 
@@ -1264,6 +1275,7 @@ static int brcmf_usb_probe_cb(struct brcmf_usbdev_info *devinfo)
 		if (ret)
 			goto fail;
 		/* we are done */
+		complete(&devinfo->dev_init_done);
 		return 0;
 	}
 	bus->chip = bus_pub->devid;
@@ -1317,6 +1329,11 @@ brcmf_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
 
 	devinfo->usbdev = usb;
 	devinfo->dev = &usb->dev;
+	/* Init completion, to protect for disconnect while still loading.
+	 * Necessary because of the asynchronous firmware load construction
+	 */
+	init_completion(&devinfo->dev_init_done);
+
 	usb_set_intfdata(intf, devinfo);
 
 	/* Check that the device supports only one configuration */
@@ -1336,7 +1353,7 @@ brcmf_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
 		goto fail;
 	}
 
-	desc = &intf->altsetting[0].desc;
+	desc = &intf->cur_altsetting->desc;
 	if ((desc->bInterfaceClass != USB_CLASS_VENDOR_SPEC) ||
 	    (desc->bInterfaceSubClass != 2) ||
 	    (desc->bInterfaceProtocol != 0xff)) {
@@ -1349,7 +1366,7 @@ brcmf_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
 
 	num_of_eps = desc->bNumEndpoints;
 	for (ep = 0; ep < num_of_eps; ep++) {
-		endpoint = &intf->altsetting[0].endpoint[ep].desc;
+		endpoint = &intf->cur_altsetting->endpoint[ep].desc;
 		endpoint_num = usb_endpoint_num(endpoint);
 		if (!usb_endpoint_xfer_bulk(endpoint))
 			continue;
@@ -1391,6 +1408,7 @@ brcmf_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	return 0;
 
 fail:
+	complete(&devinfo->dev_init_done);
 	kfree(devinfo);
 	usb_set_intfdata(intf, NULL);
 	return ret;
@@ -1403,8 +1421,19 @@ brcmf_usb_disconnect(struct usb_interface *intf)
 
 	brcmf_dbg(USB, "Enter\n");
 	devinfo = (struct brcmf_usbdev_info *)usb_get_intfdata(intf);
-	brcmf_usb_disconnect_cb(devinfo);
-	kfree(devinfo);
+
+	if (devinfo) {
+		wait_for_completion(&devinfo->dev_init_done);
+		/* Make sure that devinfo still exists. Firmware probe routines
+		 * may have released the device and cleared the intfdata.
+		 */
+		if (!usb_get_intfdata(intf))
+			goto done;
+
+		brcmf_usb_disconnect_cb(devinfo);
+		kfree(devinfo);
+	}
+done:
 	brcmf_dbg(USB, "Exit\n");
 }
 

@@ -155,6 +155,7 @@ static void process_unsol_events(struct work_struct *work)
 	struct hdac_driver *drv;
 	unsigned int rp, caddr, res;
 
+	spin_lock_irq(&bus->reg_lock);
 	while (bus->unsol_rp != bus->unsol_wp) {
 		rp = (bus->unsol_rp + 1) % HDA_UNSOL_QUEUE_SIZE;
 		bus->unsol_rp = rp;
@@ -166,12 +167,24 @@ static void process_unsol_events(struct work_struct *work)
 		codec = bus->caddr_tbl[caddr & 0x0f];
 		if (!codec || !codec->dev.driver)
 			continue;
+		spin_unlock_irq(&bus->reg_lock);
 		drv = drv_to_hdac_driver(codec->dev.driver);
 		if (drv->unsol_event)
 			drv->unsol_event(codec, res);
+		spin_lock_irq(&bus->reg_lock);
 	}
+	spin_unlock_irq(&bus->reg_lock);
 }
 
+/**
+ * snd_hdac_bus_add_device - Add a codec to bus
+ * @bus: HDA core bus
+ * @codec: HDA core device to add
+ *
+ * Adds the given codec to the list in the bus.  The caddr_tbl array
+ * and codec_powered bits are updated, as well.
+ * Returns zero if success, or a negative error code.
+ */
 int snd_hdac_bus_add_device(struct hdac_bus *bus, struct hdac_device *codec)
 {
 	if (bus->caddr_tbl[codec->addr]) {
@@ -188,6 +201,11 @@ int snd_hdac_bus_add_device(struct hdac_bus *bus, struct hdac_device *codec)
 }
 EXPORT_SYMBOL_GPL(snd_hdac_bus_add_device);
 
+/**
+ * snd_hdac_bus_remove_device - Remove a codec from bus
+ * @bus: HDA core bus
+ * @codec: HDA core device to remove
+ */
 void snd_hdac_bus_remove_device(struct hdac_bus *bus,
 				struct hdac_device *codec)
 {

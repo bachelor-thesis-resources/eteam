@@ -111,6 +111,7 @@ static const struct nla_policy bond_policy[IFLA_BOND_MAX + 1] = {
 	[IFLA_BOND_AD_USER_PORT_KEY]	= { .type = NLA_U16 },
 	[IFLA_BOND_AD_ACTOR_SYSTEM]	= { .type = NLA_BINARY,
 					    .len  = ETH_ALEN },
+	[IFLA_BOND_TLB_DYNAMIC_LB]	= { .type = NLA_U8 },
 };
 
 static const struct nla_policy bond_slave_policy[IFLA_BOND_SLAVE_MAX + 1] = {
@@ -405,7 +406,6 @@ static int bond_changelink(struct net_device *bond_dev,
 		if (err)
 			return err;
 	}
-
 	if (data[IFLA_BOND_AD_USER_PORT_KEY]) {
 		int port_key =
 			nla_get_u16(data[IFLA_BOND_AD_USER_PORT_KEY]);
@@ -415,7 +415,6 @@ static int bond_changelink(struct net_device *bond_dev,
 		if (err)
 			return err;
 	}
-
 	if (data[IFLA_BOND_AD_ACTOR_SYSTEM]) {
 		if (nla_len(data[IFLA_BOND_AD_ACTOR_SYSTEM]) != ETH_ALEN)
 			return -EINVAL;
@@ -426,6 +425,15 @@ static int bond_changelink(struct net_device *bond_dev,
 		if (err)
 			return err;
 	}
+	if (data[IFLA_BOND_TLB_DYNAMIC_LB]) {
+		int dynamic_lb = nla_get_u8(data[IFLA_BOND_TLB_DYNAMIC_LB]);
+
+		bond_opt_initval(&newval, dynamic_lb);
+		err = __bond_opt_set(bond, BOND_OPT_TLB_DYNAMIC_LB, &newval);
+		if (err)
+			return err;
+	}
+
 	return 0;
 }
 
@@ -438,7 +446,11 @@ static int bond_newlink(struct net *src_net, struct net_device *bond_dev,
 	if (err < 0)
 		return err;
 
-	return register_netdevice(bond_dev);
+	err = register_netdevice(bond_dev);
+
+	netif_carrier_off(bond_dev);
+
+	return err;
 }
 
 static size_t bond_get_size(const struct net_device *bond_dev)
@@ -476,6 +488,7 @@ static size_t bond_get_size(const struct net_device *bond_dev)
 		nla_total_size(sizeof(u16)) + /* IFLA_BOND_AD_ACTOR_SYS_PRIO */
 		nla_total_size(sizeof(u16)) + /* IFLA_BOND_AD_USER_PORT_KEY */
 		nla_total_size(ETH_ALEN) + /* IFLA_BOND_AD_ACTOR_SYSTEM */
+		nla_total_size(sizeof(u8)) + /* IFLA_BOND_TLB_DYNAMIC_LB */
 		0;
 }
 
@@ -598,6 +611,10 @@ static int bond_fill_info(struct sk_buff *skb,
 		       bond->params.ad_select))
 		goto nla_put_failure;
 
+	if (nla_put_u8(skb, IFLA_BOND_TLB_DYNAMIC_LB,
+		       bond->params.tlb_dynamic_lb))
+		goto nla_put_failure;
+
 	if (BOND_MODE(bond) == BOND_MODE_8023AD) {
 		struct ad_info info;
 
@@ -611,8 +628,7 @@ static int bond_fill_info(struct sk_buff *skb,
 				goto nla_put_failure;
 
 			if (nla_put(skb, IFLA_BOND_AD_ACTOR_SYSTEM,
-				    sizeof(bond->params.ad_actor_system),
-				    &bond->params.ad_actor_system))
+				    ETH_ALEN, &bond->params.ad_actor_system))
 				goto nla_put_failure;
 		}
 		if (!bond_3ad_get_active_agg_info(bond, &info)) {

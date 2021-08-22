@@ -53,76 +53,6 @@
 #define codec_has_clkstop(codec) \
 	((codec)->core.power_caps & AC_PWRST_CLKSTOP)
 
-/**
- * snd_hda_get_jack_location - Give a location string of the jack
- * @cfg: pin default config value
- *
- * Parse the pin default config value and returns the string of the
- * jack location, e.g. "Rear", "Front", etc.
- */
-const char *snd_hda_get_jack_location(u32 cfg)
-{
-	static char *bases[7] = {
-		"N/A", "Rear", "Front", "Left", "Right", "Top", "Bottom",
-	};
-	static unsigned char specials_idx[] = {
-		0x07, 0x08,
-		0x17, 0x18, 0x19,
-		0x37, 0x38
-	};
-	static char *specials[] = {
-		"Rear Panel", "Drive Bar",
-		"Riser", "HDMI", "ATAPI",
-		"Mobile-In", "Mobile-Out"
-	};
-	int i;
-	cfg = (cfg & AC_DEFCFG_LOCATION) >> AC_DEFCFG_LOCATION_SHIFT;
-	if ((cfg & 0x0f) < 7)
-		return bases[cfg & 0x0f];
-	for (i = 0; i < ARRAY_SIZE(specials_idx); i++) {
-		if (cfg == specials_idx[i])
-			return specials[i];
-	}
-	return "UNKNOWN";
-}
-EXPORT_SYMBOL_GPL(snd_hda_get_jack_location);
-
-/**
- * snd_hda_get_jack_connectivity - Give a connectivity string of the jack
- * @cfg: pin default config value
- *
- * Parse the pin default config value and returns the string of the
- * jack connectivity, i.e. external or internal connection.
- */
-const char *snd_hda_get_jack_connectivity(u32 cfg)
-{
-	static char *jack_locations[4] = { "Ext", "Int", "Sep", "Oth" };
-
-	return jack_locations[(cfg >> (AC_DEFCFG_LOCATION_SHIFT + 4)) & 3];
-}
-EXPORT_SYMBOL_GPL(snd_hda_get_jack_connectivity);
-
-/**
- * snd_hda_get_jack_type - Give a type string of the jack
- * @cfg: pin default config value
- *
- * Parse the pin default config value and returns the string of the
- * jack type, i.e. the purpose of the jack, such as Line-Out or CD.
- */
-const char *snd_hda_get_jack_type(u32 cfg)
-{
-	static char *jack_types[16] = {
-		"Line Out", "Speaker", "HP Out", "CD",
-		"SPDIF Out", "Digital Out", "Modem Line", "Modem Hand",
-		"Line In", "Aux", "Mic", "Telephony",
-		"SPDIF In", "Digital In", "Reserved", "Other"
-	};
-
-	return jack_types[(cfg & AC_DEFCFG_DEVICE)
-				>> AC_DEFCFG_DEVICE_SHIFT];
-}
-EXPORT_SYMBOL_GPL(snd_hda_get_jack_type);
-
 /*
  * Send and receive a verb - passed to exec_verb override for hdac_device
  */
@@ -159,50 +89,6 @@ static int codec_exec_verb(struct hdac_device *dev, unsigned int cmd,
 		bus->response_reset = 0;
 	return err;
 }
-
-/**
- * snd_hda_codec_read - send a command and get the response
- * @codec: the HDA codec
- * @nid: NID to send the command
- * @flags: optional bit flags
- * @verb: the verb to send
- * @parm: the parameter for the verb
- *
- * Send a single command and read the corresponding response.
- *
- * Returns the obtained response value, or -1 for an error.
- */
-unsigned int snd_hda_codec_read(struct hda_codec *codec, hda_nid_t nid,
-				int flags,
-				unsigned int verb, unsigned int parm)
-{
-	unsigned int cmd = snd_hdac_make_cmd(&codec->core, nid, verb, parm);
-	unsigned int res;
-	if (snd_hdac_exec_verb(&codec->core, cmd, flags, &res))
-		return -1;
-	return res;
-}
-EXPORT_SYMBOL_GPL(snd_hda_codec_read);
-
-/**
- * snd_hda_codec_write - send a single command without waiting for response
- * @codec: the HDA codec
- * @nid: NID to send the command
- * @flags: optional bit flags
- * @verb: the verb to send
- * @parm: the parameter for the verb
- *
- * Send a single command without waiting for response.
- *
- * Returns 0 if successful, or a negative error code.
- */
-int snd_hda_codec_write(struct hda_codec *codec, hda_nid_t nid, int flags,
-			unsigned int verb, unsigned int parm)
-{
-	unsigned int cmd = snd_hdac_make_cmd(&codec->core, nid, verb, parm);
-	return snd_hdac_exec_verb(&codec->core, cmd, flags, NULL);
-}
-EXPORT_SYMBOL_GPL(snd_hda_codec_write);
 
 /**
  * snd_hda_sequence_write - sequence writes
@@ -975,7 +861,7 @@ int snd_hda_codec_new(struct hda_bus *bus, struct snd_card *card,
 	if (codec->bus->modelname) {
 		codec->modelname = kstrdup(codec->bus->modelname, GFP_KERNEL);
 		if (!codec->modelname) {
-			err = -ENODEV;
+			err = -ENOMEM;
 			goto error;
 		}
 	}
@@ -990,6 +876,7 @@ int snd_hda_codec_new(struct hda_bus *bus, struct snd_card *card,
 
 	/* power-up all before initialization */
 	hda_set_power_state(codec, AC_PWRST_D0);
+	codec->core.dev.power.power_state = PMSG_ON;
 
 	snd_hda_codec_proc_new(codec);
 
@@ -1025,7 +912,7 @@ int snd_hda_codec_update_widgets(struct hda_codec *codec)
 	hda_nid_t fg;
 	int err;
 
-	err = snd_hdac_refresh_widgets(&codec->core);
+	err = snd_hdac_refresh_widget_sysfs(&codec->core);
 	if (err < 0)
 		return err;
 
@@ -1869,7 +1756,7 @@ static int get_kctl_0dB_offset(struct hda_codec *codec,
 			return -1;
 		if (*step_to_check && *step_to_check != step) {
 			codec_err(codec, "Mismatching dB step for vmaster slave (%d!=%d)\n",
--				   *step_to_check, step);
+				   *step_to_check, step);
 			return -1;
 		}
 		*step_to_check = step;
@@ -3118,6 +3005,7 @@ static void hda_call_codec_resume(struct hda_codec *codec)
 		hda_jackpoll_work(&codec->jackpoll_work.work);
 	else
 		snd_hda_jack_report_sync(codec);
+	codec->core.dev.power.power_state = PMSG_ON;
 	atomic_dec(&codec->core.in_pm);
 }
 
@@ -3150,10 +3038,62 @@ static int hda_codec_runtime_resume(struct device *dev)
 }
 #endif /* CONFIG_PM */
 
+#ifdef CONFIG_PM_SLEEP
+static int hda_codec_force_resume(struct device *dev)
+{
+	int ret;
+
+	/* The get/put pair below enforces the runtime resume even if the
+	 * device hasn't been used at suspend time.  This trick is needed to
+	 * update the jack state change during the sleep.
+	 */
+	pm_runtime_get_noresume(dev);
+	ret = pm_runtime_force_resume(dev);
+	pm_runtime_put(dev);
+	return ret;
+}
+
+static int hda_codec_pm_suspend(struct device *dev)
+{
+	dev->power.power_state = PMSG_SUSPEND;
+	return pm_runtime_force_suspend(dev);
+}
+
+static int hda_codec_pm_resume(struct device *dev)
+{
+	dev->power.power_state = PMSG_RESUME;
+	return hda_codec_force_resume(dev);
+}
+
+static int hda_codec_pm_freeze(struct device *dev)
+{
+	dev->power.power_state = PMSG_FREEZE;
+	return pm_runtime_force_suspend(dev);
+}
+
+static int hda_codec_pm_thaw(struct device *dev)
+{
+	dev->power.power_state = PMSG_THAW;
+	return hda_codec_force_resume(dev);
+}
+
+static int hda_codec_pm_restore(struct device *dev)
+{
+	dev->power.power_state = PMSG_RESTORE;
+	return hda_codec_force_resume(dev);
+}
+#endif /* CONFIG_PM_SLEEP */
+
 /* referred in hda_bind.c */
 const struct dev_pm_ops hda_codec_driver_pm = {
-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
-				pm_runtime_force_resume)
+#ifdef CONFIG_PM_SLEEP
+	.suspend = hda_codec_pm_suspend,
+	.resume = hda_codec_pm_resume,
+	.freeze = hda_codec_pm_freeze,
+	.thaw = hda_codec_pm_thaw,
+	.poweroff = hda_codec_pm_suspend,
+	.restore = hda_codec_pm_restore,
+#endif /* CONFIG_PM_SLEEP */
 	SET_RUNTIME_PM_OPS(hda_codec_runtime_suspend, hda_codec_runtime_resume,
 			   NULL)
 };
@@ -3172,8 +3112,7 @@ static int add_std_chmaps(struct hda_codec *codec)
 			struct snd_pcm_chmap *chmap;
 			const struct snd_pcm_chmap_elem *elem;
 
-			if (!pcm || !pcm->pcm || pcm->own_chmap ||
-			    !hinfo->substreams)
+			if (!pcm->pcm || pcm->own_chmap || !hinfo->substreams)
 				continue;
 			elem = hinfo->chmap ? hinfo->chmap : snd_pcm_std_chmaps;
 			err = snd_pcm_add_chmap_ctls(pcm->pcm, str, elem,
@@ -3438,10 +3377,8 @@ int snd_hda_codec_build_pcms(struct hda_codec *codec)
 	int dev, err;
 
 	err = snd_hda_codec_parse_pcms(codec);
-	if (err < 0) {
-		snd_hda_codec_reset(codec);
+	if (err < 0)
 		return err;
-	}
 
 	/* attach a new PCM streams */
 	list_for_each_entry(cpcm, &codec->pcm_list_head, list) {
@@ -3559,7 +3496,7 @@ EXPORT_SYMBOL_GPL(snd_hda_set_power_save);
  * @nid: NID to check / update
  *
  * Check whether the given NID is in the amp list.  If it's in the list,
- * check the current AMP status, and update the the power-status according
+ * check the current AMP status, and update the power-status according
  * to the mute status.
  *
  * This function is supposed to be set or called from the check_power_status
@@ -4136,7 +4073,8 @@ void snd_hda_bus_reset_codecs(struct hda_bus *bus)
 
 	list_for_each_codec(codec, bus) {
 		/* FIXME: maybe a better way needed for forced reset */
-		cancel_delayed_work_sync(&codec->jackpoll_work);
+		if (current_work() != &codec->jackpoll_work.work)
+			cancel_delayed_work_sync(&codec->jackpoll_work);
 #ifdef CONFIG_PM
 		if (hda_codec_is_power_on(codec)) {
 			hda_call_codec_suspend(codec);
@@ -4161,7 +4099,7 @@ void snd_print_pcm_bits(int pcm, char *buf, int buflen)
 
 	for (i = 0, j = 0; i < ARRAY_SIZE(bits); i++)
 		if (pcm & (AC_SUPPCM_BITS_8 << i))
-			j += snprintf(buf + j, buflen - j,  " %d", bits[i]);
+			j += scnprintf(buf + j, buflen - j,  " %d", bits[i]);
 
 	buf[j] = '\0'; /* necessary when j == 0 */
 }

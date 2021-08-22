@@ -155,7 +155,6 @@ static void rsi_reset_card(struct sdio_func *pfunction)
 	int err;
 	struct mmc_card *card = pfunction->card;
 	struct mmc_host *host = card->host;
-	s32 bit = (fls(host->ocr_avail) - 1);
 	u8 cmd52_resp;
 	u32 clock, resp, i;
 	u16 rca;
@@ -175,7 +174,6 @@ static void rsi_reset_card(struct sdio_func *pfunction)
 	msleep(20);
 
 	/* Initialize the SDIO card */
-	host->ios.vdd = bit;
 	host->ios.chip_select = MMC_CS_DONTCARE;
 	host->ios.bus_mode = MMC_BUSMODE_OPENDRAIN;
 	host->ios.power_mode = MMC_POWER_UP;
@@ -796,7 +794,7 @@ static const struct sdio_device_id rsi_dev_table[] =  {
 	{ SDIO_DEVICE(0x303, 0x100) },
 	{ SDIO_DEVICE(0x041B, 0x0301) },
 	{ SDIO_DEVICE(0x041B, 0x0201) },
-	{ SDIO_DEVICE(0x041B, 0x9330) },
+	/* { SDIO_DEVICE(0x041B, 0x9330) }, LP:#1657682 replaced by ubuntu/rsi/ */
 	{ /* Blank */},
 };
 

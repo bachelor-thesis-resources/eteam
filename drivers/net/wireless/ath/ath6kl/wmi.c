@@ -154,7 +154,7 @@ struct ath6kl_vif *ath6kl_get_vif_by_index(struct ath6kl *ar, u8 if_idx)
 }
 
 /*  Performs DIX to 802.3 encapsulation for transmit packets.
- *  Assumes the entire DIX header is contigous and that there is
+ *  Assumes the entire DIX header is contiguous and that there is
  *  enough room in the buffer for a 802.3 mac header and LLC+SNAP headers.
  */
 int ath6kl_wmi_dix_2_dot3(struct wmi *wmi, struct sk_buff *skb)
@@ -449,7 +449,7 @@ int ath6kl_wmi_dot11_hdr_remove(struct wmi *wmi, struct sk_buff *skb)
 
 /*
  * Performs 802.3 to DIX encapsulation for received packets.
- * Assumes the entire 802.3 header is contigous.
+ * Assumes the entire 802.3 header is contiguous.
  */
 int ath6kl_wmi_dot3_2_dix(struct sk_buff *skb)
 {
@@ -1178,6 +1178,10 @@ static int ath6kl_wmi_pstream_timeout_event_rx(struct wmi *wmi, u8 *datap,
 		return -EINVAL;
 
 	ev = (struct wmi_pstream_timeout_event *) datap;
+	if (ev->traffic_class >= WMM_NUM_AC) {
+		ath6kl_err("invalid traffic class: %d\n", ev->traffic_class);
+		return -EINVAL;
+	}
 
 	/*
 	 * When the pstream (fat pipe == AC) timesout, it means there were
@@ -1519,6 +1523,10 @@ static int ath6kl_wmi_cac_event_rx(struct wmi *wmi, u8 *datap, int len,
 		return -EINVAL;
 
 	reply = (struct wmi_cac_event *) datap;
+	if (reply->ac >= WMM_NUM_AC) {
+		ath6kl_err("invalid AC: %d\n", reply->ac);
+		return -EINVAL;
+	}
 
 	if ((reply->cac_indication == CAC_INDICATION_ADMISSION_RESP) &&
 	    (reply->status_code != IEEE80211_TSPEC_STATUS_ADMISS_ACCEPTED)) {
@@ -2631,8 +2639,13 @@ int ath6kl_wmi_delete_pstream_cmd(struct wmi *wmi, u8 if_idx, u8 traffic_class,
 	u16 active_tsids = 0;
 	int ret;
 
-	if (traffic_class > 3) {
+	if (traffic_class >= WMM_NUM_AC) {
 		ath6kl_err("invalid traffic class: %d\n", traffic_class);
+		return -EINVAL;
+	}
+
+	if (tsid >= 16) {
+		ath6kl_err("invalid tsid: %d\n", tsid);
 		return -EINVAL;
 	}
 

@@ -1015,7 +1015,7 @@ static int     compact_infoblock(struct net_device *dev, u_char count, u_char *p
 
 static int io=0x0;/* EDIT THIS LINE FOR YOUR CONFIGURATION IF NEEDED        */
 
-module_param(io, int, 0);
+module_param_hw(io, int, ioport, 0);
 module_param(de4x5_debug, int, 0);
 module_param(dec_only, int, 0);
 module_param(args, charp, 0);
@@ -1990,7 +1990,7 @@ SetMulticastFilter(struct net_device *dev)
 
 static u_char de4x5_irq[] = EISA_ALLOWED_IRQ_LIST;
 
-static int __init de4x5_eisa_probe (struct device *gendev)
+static int de4x5_eisa_probe(struct device *gendev)
 {
 	struct eisa_device *edev;
 	u_long iobase;
@@ -2106,7 +2106,6 @@ static struct eisa_driver de4x5_eisa_driver = {
 		.remove  = de4x5_eisa_remove,
         }
 };
-MODULE_DEVICE_TABLE(eisa, de4x5_eisa_ids);
 #endif
 
 #ifdef CONFIG_PCI

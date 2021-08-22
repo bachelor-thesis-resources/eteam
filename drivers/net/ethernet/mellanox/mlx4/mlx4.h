@@ -143,9 +143,10 @@ enum mlx4_resource {
 	RES_MTT,
 	RES_MAC,
 	RES_VLAN,
-	RES_EQ,
+	RES_NPORT_ID,
 	RES_COUNTER,
 	RES_FS_RULE,
+	RES_EQ,
 	MLX4_NUM_OF_RESOURCE_TYPE
 };
 
@@ -537,8 +538,8 @@ struct slave_list {
 struct resource_allocator {
 	spinlock_t alloc_lock; /* protect quotas */
 	union {
-		int res_reserved;
-		int res_port_rsvd[MLX4_MAX_PORTS];
+		unsigned int res_reserved;
+		unsigned int res_port_rsvd[MLX4_MAX_PORTS];
 	};
 	union {
 		int res_free;
@@ -787,6 +788,9 @@ struct mlx4_set_port_general_context {
 	u8 pprx;
 	u8 pfcrx;
 	u16 reserved4;
+	u32 reserved5;
+	u8 phv_en;
+	u8 reserved6[3];
 };
 
 struct mlx4_set_port_rqp_calc_context {
@@ -1202,6 +1206,7 @@ void mlx4_qp_event(struct mlx4_dev *dev, u32 qpn, int event_type);
 void mlx4_srq_event(struct mlx4_dev *dev, u32 srqn, int event_type);
 
 void mlx4_enter_error_state(struct mlx4_dev_persistent *persist);
+int mlx4_comm_internal_err(u32 slave_read);
 
 int mlx4_SENSE_PORT(struct mlx4_dev *dev, int port,
 		    enum mlx4_port_type *type);
@@ -1308,8 +1313,6 @@ int mlx4_SET_VLAN_FLTR_wrapper(struct mlx4_dev *dev, int slave,
 			       struct mlx4_cmd_info *cmd);
 int mlx4_common_set_vlan_fltr(struct mlx4_dev *dev, int function,
 				     int port, void *buf);
-int mlx4_common_dump_eth_stats(struct mlx4_dev *dev, int slave, u32 in_mod,
-				struct mlx4_cmd_mailbox *outbox);
 int mlx4_DUMP_ETH_STATS_wrapper(struct mlx4_dev *dev, int slave,
 				   struct mlx4_vhcr *vhcr,
 				   struct mlx4_cmd_mailbox *inbox,
@@ -1375,6 +1378,8 @@ void mlx4_vf_immed_vlan_work_handler(struct work_struct *_work);
 
 void mlx4_init_quotas(struct mlx4_dev *dev);
 
+/* for VFs, replace zero MACs with randomly-generated MACs at driver start */
+void mlx4_replace_zero_macs(struct mlx4_dev *dev);
 int mlx4_get_slave_num_gids(struct mlx4_dev *dev, int slave, int port);
 /* Returns the VF index of slave */
 int mlx4_get_vf_indx(struct mlx4_dev *dev, int slave);

@@ -193,6 +193,8 @@
 /* enable link status from external LINK_0 and LINK_1 pins */
 #define E1000_CTRL_SWDPIN0  0x00040000  /* SWDPIN 0 value */
 #define E1000_CTRL_SWDPIN1  0x00080000  /* SWDPIN 1 value */
+#define E1000_CTRL_ADVD3WUC 0x00100000  /* D3 WUC */
+#define E1000_CTRL_EN_PHY_PWR_MGMT 0x00200000 /* PHY PM enable */
 #define E1000_CTRL_SDP0_DIR 0x00400000  /* SDP0 Data direction */
 #define E1000_CTRL_SDP1_DIR 0x00800000  /* SDP1 Data direction */
 #define E1000_CTRL_RST      0x04000000  /* Global reset */
@@ -356,7 +358,8 @@
 /* Ethertype field values */
 #define ETHERNET_IEEE_VLAN_TYPE 0x8100  /* 802.3ac packet */
 
-#define MAX_JUMBO_FRAME_SIZE    0x3F00
+/* As per the EAS the maximum supported size is 9.5KB (9728 bytes) */
+#define MAX_JUMBO_FRAME_SIZE	0x2600
 
 /* PBA constants */
 #define E1000_PBA_34K 0x0022
@@ -604,6 +607,10 @@
 #define E1000_M88E1112_MAC_CTRL_1_MODE_SHIFT	7
 #define E1000_M88E1112_PAGE_ADDR		0x16
 #define E1000_M88E1112_STATUS			0x01
+#define E1000_M88E1512_CFG_REG_1		0x0010
+#define E1000_M88E1512_CFG_REG_2		0x0011
+#define E1000_M88E1512_CFG_REG_3		0x0007
+#define E1000_M88E1512_MODE			0x0014
 
 /* PCI Express Control */
 #define E1000_GCR_CMPL_TMOUT_MASK       0x0000F000
@@ -861,6 +868,8 @@
 #define M88_VENDOR           0x0141
 #define I210_I_PHY_ID        0x01410C00
 #define M88E1543_E_PHY_ID    0x01410EA0
+#define M88E1512_E_PHY_ID    0x01410DD0
+#define BCM54616_E_PHY_ID    0x03625D10
 
 /* M88E1000 Specific Registers */
 #define M88E1000_PHY_SPEC_CTRL     0x10  /* PHY Specific Control Register */
@@ -922,7 +931,10 @@
 
 /* Intel i347-AT4 Registers */
 
-#define I347AT4_PCDL                   0x10 /* PHY Cable Diagnostics Length */
+#define I347AT4_PCDL0                  0x10 /* Pair 0 PHY Cable Diagnostics Length */
+#define I347AT4_PCDL1                  0x11 /* Pair 1 PHY Cable Diagnostics Length */
+#define I347AT4_PCDL2                  0x12 /* Pair 2 PHY Cable Diagnostics Length */
+#define I347AT4_PCDL3                  0x13 /* Pair 3 PHY Cable Diagnostics Length */
 #define I347AT4_PCDC                   0x15 /* PHY Cable Diagnostics Control */
 #define I347AT4_PAGE_SELECT            0x16
 
@@ -985,6 +997,7 @@
 #define E1000_M88E1543_PAGE_ADDR	0x16       /* Page Offset Register */
 #define E1000_M88E1543_EEE_CTRL_1	0x0
 #define E1000_M88E1543_EEE_CTRL_1_MS	0x0001     /* EEE Master/Slave */
+#define E1000_M88E1543_FIBER_CTRL	0x0
 #define E1000_EEE_ADV_DEV_I354		7
 #define E1000_EEE_ADV_ADDR_I354		60
 #define E1000_EEE_ADV_100_SUPPORTED	(1 << 1)   /* 100BaseTx EEE Supported */

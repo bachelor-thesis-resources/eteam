@@ -562,7 +562,7 @@ static void el3_common_remove (struct net_device *dev)
 }
 
 #ifdef CONFIG_EISA
-static int __init el3_eisa_probe (struct device *device)
+static int el3_eisa_probe(struct device *device)
 {
 	short i;
 	int ioaddr, irq, if_port;
@@ -1369,7 +1369,7 @@ el3_resume(struct device *pdev)
 #endif /* CONFIG_PM */
 
 module_param(debug,int, 0);
-module_param_array(irq, int, NULL, 0);
+module_param_hw_array(irq, int, irq, NULL, 0);
 module_param(max_interrupt_work, int, 0);
 MODULE_PARM_DESC(debug, "debug level (0-6)");
 MODULE_PARM_DESC(irq, "IRQ number(s) (assigned)");

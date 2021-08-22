@@ -258,7 +258,6 @@ static void dm9601_get_drvinfo(struct net_device *net,
 {
 	/* Inherit standard device info */
 	usbnet_get_drvinfo(net, info);
-	info->eedump_len = DM_EEPROM_LEN;
 }
 
 static u32 dm9601_get_link(struct net_device *net)
@@ -623,6 +622,10 @@ static const struct usb_device_id products[] = {
 	},
 	{
 	 USB_DEVICE(0x0a46, 0x1269),	/* DM9621A USB to Fast Ethernet Adapter */
+	 .driver_info = (unsigned long)&dm9601_info,
+	},
+	{
+	 USB_DEVICE(0x0586, 0x3427),	/* ZyXEL Keenetic Plus DSL xDSL modem */
 	 .driver_info = (unsigned long)&dm9601_info,
 	},
 	{},			// END

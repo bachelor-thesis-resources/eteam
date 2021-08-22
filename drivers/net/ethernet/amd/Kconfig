@@ -44,7 +44,7 @@ config AMD8111_ETH
 
 config LANCE
 	tristate "AMD LANCE and PCnet (AT1500 and NE2100) support"
-	depends on ISA && ISA_DMA_API && !ARM
+	depends on ISA && ISA_DMA_API && !ARM && !PPC32
 	---help---
 	  If you have a network (Ethernet) card of this type, say Y here.
 	  Some LinkSys cards are of this type.
@@ -100,7 +100,7 @@ config DECLANCE
 	  DEPCA series.  (This chipset is better known via the NE2100 cards.)
 
 config HPLANCE
-	bool "HP on-board LANCE support"
+	tristate "HP on-board LANCE support"
 	depends on DIO
 	select CRC32
 	---help---
@@ -138,7 +138,7 @@ config PCMCIA_NMCLAN
 
 config NI65
 	tristate "NI6510 support"
-	depends on ISA && ISA_DMA_API && !ARM
+	depends on ISA && ISA_DMA_API && !ARM && !PPC32
 	---help---
 	  If you have a network (Ethernet) card of this type, say Y here.
 

@@ -5,12 +5,12 @@
  * See LICENSE.qlcnic for copyright and licensing details.
  */
 
-#include "qlcnic.h"
-#include "qlcnic_hdr.h"
-
 #include <linux/slab.h>
 #include <net/ip.h>
 #include <linux/bitops.h>
+
+#include "qlcnic.h"
+#include "qlcnic_hdr.h"
 
 #define MASK(n) ((1ULL<<(n))-1)
 #define OCM_WIN_P3P(addr) (addr & 0xffc0000)
@@ -341,7 +341,7 @@ qlcnic_pcie_sem_lock(struct qlcnic_adapter *adapter, int sem, u32 id_reg)
 			}
 			return -EIO;
 		}
-		usleep_range(1000, 1500);
+		udelay(1200);
 	}
 
 	if (id_reg)

@@ -26,7 +26,6 @@
 #include <linux/acpi.h>
 
 /* supported DMA engine drivers */
-#include <linux/platform_data/dma-dw.h>
 #include <linux/dma/dw.h>
 
 #include <asm/page.h>
@@ -169,12 +168,6 @@ err:
 	return ret;
 }
 
-static struct dw_dma_platform_data dw_pdata = {
-	.is_private = 1,
-	.chan_allocation_order = CHAN_ALLOCATION_ASCENDING,
-	.chan_priority = CHAN_PRIORITY_ASCENDING,
-};
-
 static struct dw_dma_chip *dw_probe(struct device *dev, struct resource *mem,
 	int irq)
 {
@@ -195,7 +188,8 @@ static struct dw_dma_chip *dw_probe(struct device *dev, struct resource *mem,
 		return ERR_PTR(err);
 
 	chip->dev = dev;
-	err = dw_dma_probe(chip, &dw_pdata);
+
+	err = dw_dma_probe(chip, NULL);
 	if (err)
 		return ERR_PTR(err);
 
@@ -266,7 +260,6 @@ int sst_dma_new(struct sst_dsp *sst)
 	struct sst_pdata *sst_pdata = sst->pdata;
 	struct sst_dma *dma;
 	struct resource mem;
-	const char *dma_dev_name;
 	int ret = 0;
 
 	if (sst->pdata->resindex_dma_base == -1)
@@ -277,7 +270,6 @@ int sst_dma_new(struct sst_dsp *sst)
 	* is attached to the ADSP IP. */
 	switch (sst->pdata->dma_engine) {
 	case SST_DMA_TYPE_DW:
-		dma_dev_name = "dw_dmac";
 		break;
 	default:
 		dev_err(sst->dev, "error: invalid DMA engine %d\n",

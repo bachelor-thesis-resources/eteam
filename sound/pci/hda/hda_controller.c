@@ -547,8 +547,10 @@ int snd_hda_attach_pcm_stream(struct hda_bus *_bus, struct hda_codec *codec,
 		return err;
 	strlcpy(pcm->name, cpcm->name, sizeof(pcm->name));
 	apcm = kzalloc(sizeof(*apcm), GFP_KERNEL);
-	if (apcm == NULL)
+	if (apcm == NULL) {
+		snd_device_free(chip->card, pcm);
 		return -ENOMEM;
+	}
 	apcm->chip = chip;
 	apcm->pcm = pcm;
 	apcm->codec = codec;
@@ -665,6 +667,9 @@ static int azx_rirb_get_response(struct hdac_bus *bus, unsigned int addr,
 	 */
 	if (hbus->allow_bus_reset && !hbus->response_reset && !hbus->in_reset) {
 		hbus->response_reset = 1;
+		dev_err(chip->card->dev,
+			"No response from codec, resetting bus: last cmd=0x%08x\n",
+			bus->last_cmd[addr]);
 		return -EAGAIN; /* give a chance to retry */
 	}
 
@@ -956,7 +961,7 @@ irqreturn_t azx_interrupt(int irq, void *dev_id)
 	status = azx_readb(chip, RIRBSTS);
 	if (status & RIRB_INT_MASK) {
 		if (status & RIRB_INT_RESPONSE) {
-			if (chip->driver_caps & AZX_DCAPS_RIRB_PRE_DELAY)
+			if (chip->driver_caps & AZX_DCAPS_CTX_WORKAROUND)
 				udelay(80);
 			snd_hdac_bus_update_rirb(bus);
 		}
@@ -1045,6 +1050,7 @@ int azx_bus_init(struct azx *chip, const char *model,
 	mutex_init(&bus->prepare_mutex);
 	bus->pci = chip->pci;
 	bus->modelname = model;
+	bus->mixer_assigned = -1;
 	bus->core.snoop = azx_snoop(chip);
 	if (chip->get_position[0] != azx_get_pos_lpib ||
 	    chip->get_position[1] != azx_get_pos_lpib)
@@ -1054,10 +1060,8 @@ int azx_bus_init(struct azx *chip, const char *model,
 	if (chip->driver_caps & AZX_DCAPS_CORBRP_SELF_CLEAR)
 		bus->core.corbrp_self_clear = true;
 
-	if (chip->driver_caps & AZX_DCAPS_RIRB_DELAY) {
-		dev_dbg(chip->card->dev, "Enable delay in RIRB handling\n");
-		bus->needs_damn_long_delay = 1;
-	}
+	if (chip->driver_caps & AZX_DCAPS_4K_BDLE_BOUNDARY)
+		bus->core.align_bdle_4k = true;
 
 	/* AMD chipsets often cause the communication stalls upon certain
 	 * sequence like the pin-detection.  It seems that forcing the synced
@@ -1129,8 +1133,12 @@ EXPORT_SYMBOL_GPL(azx_probe_codecs);
 /* configure each codec instance */
 int azx_codec_configure(struct azx *chip)
 {
-	struct hda_codec *codec;
-	list_for_each_codec(codec, &chip->bus) {
+	struct hda_codec *codec, *next;
+
+	/* use _safe version here since snd_hda_codec_configure() deregisters
+	 * the device upon error and deletes itself from the bus list.
+	 */
+	list_for_each_codec_safe(codec, next, &chip->bus) {
 		snd_hda_codec_configure(codec);
 	}
 	return 0;

@@ -234,6 +234,8 @@ static const struct snd_soc_dapm_widget aic32x4_dapm_widgets[] = {
 	SND_SOC_DAPM_INPUT("IN2_R"),
 	SND_SOC_DAPM_INPUT("IN3_L"),
 	SND_SOC_DAPM_INPUT("IN3_R"),
+	SND_SOC_DAPM_INPUT("CM_L"),
+	SND_SOC_DAPM_INPUT("CM_R"),
 };
 
 static const struct snd_soc_dapm_route aic32x4_dapm_routes[] = {
@@ -871,7 +873,6 @@ MODULE_DEVICE_TABLE(of, aic32x4_of_id);
 static struct i2c_driver aic32x4_i2c_driver = {
 	.driver = {
 		.name = "tlv320aic32x4",
-		.owner = THIS_MODULE,
 		.of_match_table = aic32x4_of_id,
 	},
 	.probe =    aic32x4_i2c_probe,

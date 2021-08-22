@@ -191,7 +191,7 @@ static struct snd_soc_dai_link broadwell_rt286_dais[] = {
 		.stream_name = "Loopback",
 		.cpu_dai_name = "Loopback Pin",
 		.platform_name = "haswell-pcm-audio",
-		.dynamic = 0,
+		.dynamic = 1,
 		.codec_name = "snd-soc-dummy",
 		.codec_dai_name = "snd-soc-dummy-dai",
 		.trigger = {SND_SOC_DPCM_TRIGGER_POST, SND_SOC_DPCM_TRIGGER_POST},
@@ -266,18 +266,11 @@ static int broadwell_audio_probe(struct platform_device *pdev)
 {
 	broadwell_rt286.dev = &pdev->dev;
 
-	return snd_soc_register_card(&broadwell_rt286);
-}
-
-static int broadwell_audio_remove(struct platform_device *pdev)
-{
-	snd_soc_unregister_card(&broadwell_rt286);
-	return 0;
+	return devm_snd_soc_register_card(&pdev->dev, &broadwell_rt286);
 }
 
 static struct platform_driver broadwell_audio = {
 	.probe = broadwell_audio_probe,
-	.remove = broadwell_audio_remove,
 	.driver = {
 		.name = "broadwell-audio",
 	},

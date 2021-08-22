@@ -65,6 +65,8 @@ struct brcmf_bus_dcmd {
  * @rxctl: receive a control response message from dongle.
  * @gettxq: obtain a reference of bus transmit queue (optional).
  * @wowl_config: specify if dongle is configured for wowl when going to suspend
+ * @get_ramsize: obtain size of device memory.
+ * @get_memdump: obtain device memory dump in provided buffer.
  *
  * This structure provides an abstract interface towards the
  * bus specific driver. For control messages to common driver
@@ -79,6 +81,8 @@ struct brcmf_bus_ops {
 	int (*rxctl)(struct device *dev, unsigned char *msg, uint len);
 	struct pktq * (*gettxq)(struct device *dev);
 	void (*wowl_config)(struct device *dev, bool enabled);
+	size_t (*get_ramsize)(struct device *dev);
+	int (*get_memdump)(struct device *dev, void *data, size_t len);
 };
 
 
@@ -185,6 +189,23 @@ void brcmf_bus_wowl_config(struct brcmf_bus *bus, bool enabled)
 		bus->ops->wowl_config(bus->dev, enabled);
 }
 
+static inline size_t brcmf_bus_get_ramsize(struct brcmf_bus *bus)
+{
+	if (!bus->ops->get_ramsize)
+		return 0;
+
+	return bus->ops->get_ramsize(bus->dev);
+}
+
+static inline
+int brcmf_bus_get_memdump(struct brcmf_bus *bus, void *data, size_t len)
+{
+	if (!bus->ops->get_memdump)
+		return -EOPNOTSUPP;
+
+	return bus->ops->get_memdump(bus->dev, data, len);
+}
+
 /*
  * interface functions from common layer
  */
@@ -193,7 +214,9 @@ bool brcmf_c_prec_enq(struct device *dev, struct pktq *q, struct sk_buff *pkt,
 		      int prec);
 
 /* Receive frame for delivery to OS.  Callee disposes of rxp. */
-void brcmf_rx_frame(struct device *dev, struct sk_buff *rxp);
+void brcmf_rx_frame(struct device *dev, struct sk_buff *rxp, bool handle_event);
+/* Receive async event packet from firmware. Callee disposes of rxp. */
+void brcmf_rx_event(struct device *dev, struct sk_buff *rxp);
 
 /* Indication from bus module regarding presence/insertion of dongle. */
 int brcmf_attach(struct device *dev);

@@ -47,7 +47,7 @@
 #define EN_ETHTOOL_SHORT_MASK cpu_to_be16(0xffff)
 #define EN_ETHTOOL_WORD_MASK  cpu_to_be32(0xffffffff)
 
-static int mlx4_en_moderation_update(struct mlx4_en_priv *priv)
+int mlx4_en_moderation_update(struct mlx4_en_priv *priv)
 {
 	int i;
 	int err = 0;
@@ -95,13 +95,11 @@ mlx4_en_get_drvinfo(struct net_device *dev, struct ethtool_drvinfo *drvinfo)
 		(u16) (mdev->dev->caps.fw_ver & 0xffff));
 	strlcpy(drvinfo->bus_info, pci_name(mdev->dev->persist->pdev),
 		sizeof(drvinfo->bus_info));
-	drvinfo->n_stats = 0;
-	drvinfo->regdump_len = 0;
-	drvinfo->eedump_len = 0;
 }
 
 static const char mlx4_en_priv_flags[][ETH_GSTRING_LEN] = {
 	"blueflame",
+	"phv-bit"
 };
 
 static const char main_strings[][ETH_GSTRING_LEN] = {
@@ -969,6 +967,22 @@ static int mlx4_en_set_coalesce(struct net_device *dev,
 	if (!coal->tx_max_coalesced_frames_irq)
 		return -EINVAL;
 
+	if (coal->tx_coalesce_usecs > MLX4_EN_MAX_COAL_TIME ||
+	    coal->rx_coalesce_usecs > MLX4_EN_MAX_COAL_TIME ||
+	    coal->rx_coalesce_usecs_low > MLX4_EN_MAX_COAL_TIME ||
+	    coal->rx_coalesce_usecs_high > MLX4_EN_MAX_COAL_TIME) {
+		netdev_info(dev, "%s: maximum coalesce time supported is %d usecs\n",
+			    __func__, MLX4_EN_MAX_COAL_TIME);
+		return -ERANGE;
+	}
+
+	if (coal->tx_max_coalesced_frames > MLX4_EN_MAX_COAL_PKTS ||
+	    coal->rx_max_coalesced_frames > MLX4_EN_MAX_COAL_PKTS) {
+		netdev_info(dev, "%s: maximum coalesced frames supported is %d\n",
+			    __func__, MLX4_EN_MAX_COAL_PKTS);
+		return -ERANGE;
+	}
+
 	priv->rx_frames = (coal->rx_max_coalesced_frames ==
 			   MLX4_EN_AUTO_CONF) ?
 				MLX4_EN_RX_COAL_TARGET :
@@ -1653,6 +1667,7 @@ static int mlx4_en_get_rxnfc(struct net_device *dev, struct ethtool_rxnfc *cmd,
 		err = mlx4_en_get_flow(dev, cmd, cmd->fs.location);
 		break;
 	case ETHTOOL_GRXCLSRLALL:
+		cmd->data = MAX_NUM_OF_FS_RULES;
 		while ((!err || err == -ENOENT) && priority < cmd->rule_cnt) {
 			err = mlx4_en_get_flow(dev, cmd, i);
 			if (!err)
@@ -1797,35 +1812,49 @@ static int mlx4_en_get_ts_info(struct net_device *dev,
 static int mlx4_en_set_priv_flags(struct net_device *dev, u32 flags)
 {
 	struct mlx4_en_priv *priv = netdev_priv(dev);
+	struct mlx4_en_dev *mdev = priv->mdev;
 	bool bf_enabled_new = !!(flags & MLX4_EN_PRIV_FLAGS_BLUEFLAME);
 	bool bf_enabled_old = !!(priv->pflags & MLX4_EN_PRIV_FLAGS_BLUEFLAME);
+	bool phv_enabled_new = !!(flags & MLX4_EN_PRIV_FLAGS_PHV);
+	bool phv_enabled_old = !!(priv->pflags & MLX4_EN_PRIV_FLAGS_PHV);
 	int i;
+	int ret = 0;
 
-	if (bf_enabled_new == bf_enabled_old)
-		return 0; /* Nothing to do */
+	if (bf_enabled_new != bf_enabled_old) {
+		if (bf_enabled_new) {
+			bool bf_supported = true;
 
-	if (bf_enabled_new) {
-		bool bf_supported = true;
+			for (i = 0; i < priv->tx_ring_num; i++)
+				bf_supported &= priv->tx_ring[i]->bf_alloced;
 
-		for (i = 0; i < priv->tx_ring_num; i++)
-			bf_supported &= priv->tx_ring[i]->bf_alloced;
+			if (!bf_supported) {
+				en_err(priv, "BlueFlame is not supported\n");
+				return -EINVAL;
+			}
 
-		if (!bf_supported) {
-			en_err(priv, "BlueFlame is not supported\n");
-			return -EINVAL;
+			priv->pflags |= MLX4_EN_PRIV_FLAGS_BLUEFLAME;
+		} else {
+			priv->pflags &= ~MLX4_EN_PRIV_FLAGS_BLUEFLAME;
 		}
 
-		priv->pflags |= MLX4_EN_PRIV_FLAGS_BLUEFLAME;
-	} else {
-		priv->pflags &= ~MLX4_EN_PRIV_FLAGS_BLUEFLAME;
+		for (i = 0; i < priv->tx_ring_num; i++)
+			priv->tx_ring[i]->bf_enabled = bf_enabled_new;
+
+		en_info(priv, "BlueFlame %s\n",
+			bf_enabled_new ?  "Enabled" : "Disabled");
 	}
 
-	for (i = 0; i < priv->tx_ring_num; i++)
-		priv->tx_ring[i]->bf_enabled = bf_enabled_new;
-
-	en_info(priv, "BlueFlame %s\n",
-		bf_enabled_new ?  "Enabled" : "Disabled");
-
+	if (phv_enabled_new != phv_enabled_old) {
+		ret = set_phv_bit(mdev->dev, priv->port, (int)phv_enabled_new);
+		if (ret)
+			return ret;
+		else if (phv_enabled_new)
+			priv->pflags |= MLX4_EN_PRIV_FLAGS_PHV;
+		else
+			priv->pflags &= ~MLX4_EN_PRIV_FLAGS_PHV;
+		en_info(priv, "PHV bit %s\n",
+			phv_enabled_new ?  "Enabled" : "Disabled");
+	}
 	return 0;
 }
 
@@ -1878,6 +1907,8 @@ static int mlx4_en_set_tunable(struct net_device *dev,
 	return ret;
 }
 
+#define MLX4_EEPROM_PAGE_LEN 256
+
 static int mlx4_en_get_module_info(struct net_device *dev,
 				   struct ethtool_modinfo *modinfo)
 {
@@ -1912,7 +1943,7 @@ static int mlx4_en_get_module_info(struct net_device *dev,
 		break;
 	case MLX4_MODULE_ID_SFP:
 		modinfo->type = ETH_MODULE_SFF_8472;
-		modinfo->eeprom_len = ETH_MODULE_SFF_8472_LEN;
+		modinfo->eeprom_len = MLX4_EEPROM_PAGE_LEN;
 		break;
 	default:
 		return -ENOSYS;

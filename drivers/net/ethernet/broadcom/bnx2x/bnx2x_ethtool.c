@@ -1,6 +1,8 @@
-/* bnx2x_ethtool.c: Broadcom Everest network driver.
+/* bnx2x_ethtool.c: QLogic Everest network driver.
  *
  * Copyright (c) 2007-2013 Broadcom Corporation
+ * Copyright (c) 2014 QLogic Corporation
+ * All rights reserved
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -182,7 +184,9 @@ static const struct {
 	{ STATS_OFFSET32(driver_filtered_tx_pkt),
 			4, STATS_FLAGS_FUNC, "driver_filtered_tx_pkt" },
 	{ STATS_OFFSET32(eee_tx_lpi),
-			4, STATS_FLAGS_PORT, "Tx LPI entry count"}
+			4, STATS_FLAGS_PORT, "Tx LPI entry count"},
+	{ STATS_OFFSET32(ptp_skip_tx_ts),
+			4, STATS_FLAGS_FUNC, "ptp_skipped_tx_tstamp" },
 };
 
 #define BNX2X_NUM_STATS		ARRAY_SIZE(bnx2x_stats_arr)
@@ -1088,10 +1092,6 @@ static void bnx2x_get_drvinfo(struct net_device *dev,
 	bnx2x_fill_fw_str(bp, info->fw_version, sizeof(info->fw_version));
 
 	strlcpy(info->bus_info, pci_name(bp->pdev), sizeof(info->bus_info));
-	info->n_stats = BNX2X_NUM_STATS;
-	info->testinfo_len = BNX2X_NUM_TESTS(bp);
-	info->eedump_len = bp->common.flash_size;
-	info->regdump_len = bnx2x_get_regs_len(dev);
 }
 
 static void bnx2x_get_wol(struct net_device *dev, struct ethtool_wolinfo *wol)
@@ -1128,6 +1128,9 @@ static int bnx2x_set_wol(struct net_device *dev, struct ethtool_wolinfo *wol)
 		bp->wol = 1;
 	} else
 		bp->wol = 0;
+
+	if (SHMEM2_HAS(bp, curr_cfg))
+		SHMEM2_WR(bp, curr_cfg, CURR_CFG_MET_OS);
 
 	return 0;
 }
@@ -1343,8 +1346,8 @@ static int bnx2x_nvram_read_dword(struct bnx2x *bp, u32 offset, __be32 *ret_val,
 	return rc;
 }
 
-static int bnx2x_nvram_read(struct bnx2x *bp, u32 offset, u8 *ret_buf,
-			    int buf_size)
+int bnx2x_nvram_read(struct bnx2x *bp, u32 offset, u8 *ret_buf,
+		     int buf_size)
 {
 	int rc;
 	u32 cmd_flags;
@@ -1558,7 +1561,8 @@ static int bnx2x_get_module_info(struct net_device *dev,
 	}
 
 	if (!sff8472_comp ||
-	    (diag_type & SFP_EEPROM_DIAG_ADDR_CHANGE_REQ)) {
+	    (diag_type & SFP_EEPROM_DIAG_ADDR_CHANGE_REQ) ||
+	    !(diag_type & SFP_EEPROM_DDM_IMPLEMENTED)) {
 		modinfo->type = ETH_MODULE_SFF_8079;
 		modinfo->eeprom_len = ETH_MODULE_SFF_8079_LEN;
 	} else {
@@ -3346,20 +3350,31 @@ static int bnx2x_set_rss_flags(struct bnx2x *bp, struct ethtool_rxnfc *info)
 			udp_rss_requested = 0;
 		else
 			return -EINVAL;
+
+		if (CHIP_IS_E1x(bp) && udp_rss_requested) {
+			DP(BNX2X_MSG_ETHTOOL,
+			   "57710, 57711 boards don't support RSS according to UDP 4-tuple\n");
+			return -EINVAL;
+		}
+
 		if ((info->flow_type == UDP_V4_FLOW) &&
 		    (bp->rss_conf_obj.udp_rss_v4 != udp_rss_requested)) {
 			bp->rss_conf_obj.udp_rss_v4 = udp_rss_requested;
 			DP(BNX2X_MSG_ETHTOOL,
 			   "rss re-configured, UDP 4-tupple %s\n",
 			   udp_rss_requested ? "enabled" : "disabled");
-			return bnx2x_rss(bp, &bp->rss_conf_obj, false, true);
+			if (bp->state == BNX2X_STATE_OPEN)
+				return bnx2x_rss(bp, &bp->rss_conf_obj, false,
+						 true);
 		} else if ((info->flow_type == UDP_V6_FLOW) &&
 			   (bp->rss_conf_obj.udp_rss_v6 != udp_rss_requested)) {
 			bp->rss_conf_obj.udp_rss_v6 = udp_rss_requested;
 			DP(BNX2X_MSG_ETHTOOL,
 			   "rss re-configured, UDP 4-tupple %s\n",
 			   udp_rss_requested ? "enabled" : "disabled");
-			return bnx2x_rss(bp, &bp->rss_conf_obj, false, true);
+			if (bp->state == BNX2X_STATE_OPEN)
+				return bnx2x_rss(bp, &bp->rss_conf_obj, false,
+						 true);
 		}
 		return 0;
 
@@ -3473,7 +3488,10 @@ static int bnx2x_set_rxfh(struct net_device *dev, const u32 *indir,
 		bp->rss_conf_obj.ind_table[i] = indir[i] + bp->fp->cl_id;
 	}
 
-	return bnx2x_config_rss_eth(bp, false);
+	if (bp->state == BNX2X_STATE_OPEN)
+		return bnx2x_config_rss_eth(bp, false);
+
+	return 0;
 }
 
 /**
@@ -3578,17 +3596,8 @@ static int bnx2x_get_ts_info(struct net_device *dev,
 
 		info->rx_filters = (1 << HWTSTAMP_FILTER_NONE) |
 				   (1 << HWTSTAMP_FILTER_PTP_V1_L4_EVENT) |
-				   (1 << HWTSTAMP_FILTER_PTP_V1_L4_SYNC) |
-				   (1 << HWTSTAMP_FILTER_PTP_V1_L4_DELAY_REQ) |
 				   (1 << HWTSTAMP_FILTER_PTP_V2_L4_EVENT) |
-				   (1 << HWTSTAMP_FILTER_PTP_V2_L4_SYNC) |
-				   (1 << HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ) |
-				   (1 << HWTSTAMP_FILTER_PTP_V2_L2_EVENT) |
-				   (1 << HWTSTAMP_FILTER_PTP_V2_L2_SYNC) |
-				   (1 << HWTSTAMP_FILTER_PTP_V2_L2_DELAY_REQ) |
-				   (1 << HWTSTAMP_FILTER_PTP_V2_EVENT) |
-				   (1 << HWTSTAMP_FILTER_PTP_V2_SYNC) |
-				   (1 << HWTSTAMP_FILTER_PTP_V2_DELAY_REQ);
+				   (1 << HWTSTAMP_FILTER_PTP_V2_EVENT);
 
 		info->tx_types = (1 << HWTSTAMP_TX_OFF)|(1 << HWTSTAMP_TX_ON);
 

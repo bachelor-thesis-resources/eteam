@@ -592,6 +592,11 @@ static int mwifiex_ret_802_11_key_material_v1(struct mwifiex_private *priv,
 {
 	struct host_cmd_ds_802_11_key_material *key =
 						&resp->params.key_material;
+	int len;
+
+	len = le16_to_cpu(key->key_param_set.key_len);
+	if (len > sizeof(key->key_param_set.key))
+		return -EINVAL;
 
 	if (le16_to_cpu(key->action) == HostCmd_ACT_GEN_SET) {
 		if ((le16_to_cpu(key->key_param_set.key_info) & KEY_MCAST)) {
@@ -599,14 +604,14 @@ static int mwifiex_ret_802_11_key_material_v1(struct mwifiex_private *priv,
 				    "info: key: GTK is set\n");
 			priv->wpa_is_gtk_set = true;
 			priv->scan_block = false;
+			priv->port_open = true;
 		}
 	}
 
 	memset(priv->aes_key.key_param_set.key, 0,
 	       sizeof(key->key_param_set.key));
-	priv->aes_key.key_param_set.key_len = key->key_param_set.key_len;
-	memcpy(priv->aes_key.key_param_set.key, key->key_param_set.key,
-	       le16_to_cpu(priv->aes_key.key_param_set.key_len));
+	priv->aes_key.key_param_set.key_len = cpu_to_le16(len);
+	memcpy(priv->aes_key.key_param_set.key, key->key_param_set.key, len);
 
 	return 0;
 }
@@ -621,14 +626,20 @@ static int mwifiex_ret_802_11_key_material_v2(struct mwifiex_private *priv,
 					      struct host_cmd_ds_command *resp)
 {
 	struct host_cmd_ds_802_11_key_material_v2 *key_v2;
-	__le16 len;
+	int len;
 
 	key_v2 = &resp->params.key_material_v2;
+
+	len = le16_to_cpu(key_v2->key_param_set.key_params.aes.key_len);
+	if (len > sizeof(key_v2->key_param_set.key_params.aes.key))
+		return -EINVAL;
+
 	if (le16_to_cpu(key_v2->action) == HostCmd_ACT_GEN_SET) {
 		if ((le16_to_cpu(key_v2->key_param_set.key_info) & KEY_MCAST)) {
 			mwifiex_dbg(priv->adapter, INFO, "info: key: GTK is set\n");
 			priv->wpa_is_gtk_set = true;
 			priv->scan_block = false;
+			priv->port_open = true;
 		}
 	}
 
@@ -636,12 +647,11 @@ static int mwifiex_ret_802_11_key_material_v2(struct mwifiex_private *priv,
 		return 0;
 
 	memset(priv->aes_key_v2.key_param_set.key_params.aes.key, 0,
-	       WLAN_KEY_LEN_CCMP);
+	       sizeof(key_v2->key_param_set.key_params.aes.key));
 	priv->aes_key_v2.key_param_set.key_params.aes.key_len =
-				key_v2->key_param_set.key_params.aes.key_len;
-	len = priv->aes_key_v2.key_param_set.key_params.aes.key_len;
+				cpu_to_le16(len);
 	memcpy(priv->aes_key_v2.key_param_set.key_params.aes.key,
-	       key_v2->key_param_set.key_params.aes.key, le16_to_cpu(len));
+	       key_v2->key_param_set.key_params.aes.key, len);
 
 	return 0;
 }
@@ -893,7 +903,7 @@ static int mwifiex_ret_tdls_oper(struct mwifiex_private *priv,
 	case ACT_TDLS_DELETE:
 		if (reason) {
 			if (!node || reason == TDLS_ERR_LINK_NONEXISTENT)
-				mwifiex_dbg(priv->adapter, ERROR,
+				mwifiex_dbg(priv->adapter, MSG,
 					    "TDLS link delete for %pM failed: reason %d\n",
 					    cmd_tdls_oper->peer_mac, reason);
 			else
@@ -1001,6 +1011,28 @@ static int mwifiex_ret_sdio_rx_aggr_cfg(struct mwifiex_private *priv,
 
 	adapter->sdio_rx_aggr_enable = cfg->enable;
 	adapter->sdio_rx_block_size = le16_to_cpu(cfg->block_size);
+
+	return 0;
+}
+
+static int mwifiex_ret_robust_coex(struct mwifiex_private *priv,
+				   struct host_cmd_ds_command *resp,
+				   bool *is_timeshare)
+{
+	struct host_cmd_ds_robust_coex *coex = &resp->params.coex;
+	struct mwifiex_ie_types_robust_coex *coex_tlv;
+	u16 action = le16_to_cpu(coex->action);
+	u32 mode;
+
+	coex_tlv = (struct mwifiex_ie_types_robust_coex
+		    *)((u8 *)coex + sizeof(struct host_cmd_ds_robust_coex));
+	if (action == HostCmd_ACT_GEN_GET) {
+		mode = le32_to_cpu(coex_tlv->mode);
+		if (mode == MWIFIEX_COEX_MODE_TIMESHARE)
+			*is_timeshare = true;
+		else
+			*is_timeshare = false;
+	}
 
 	return 0;
 }
@@ -1126,6 +1158,17 @@ int mwifiex_process_sta_cmdresp(struct mwifiex_private *priv, u16 cmdresp_no,
 		ret = mwifiex_ret_11n_addba_resp(priv, resp);
 		break;
 	case HostCmd_CMD_RECONFIGURE_TX_BUFF:
+		if (0xffff == (u16)le16_to_cpu(resp->params.tx_buf.buff_size)) {
+			if (adapter->iface_type == MWIFIEX_USB &&
+			    adapter->usb_mc_setup) {
+				if (adapter->if_ops.multi_port_resync)
+					adapter->if_ops.
+						multi_port_resync(adapter);
+				adapter->usb_mc_setup = false;
+				adapter->tx_lock_flag = false;
+			}
+			break;
+		}
 		adapter->tx_buf_size = (u16) le16_to_cpu(resp->params.
 							     tx_buf.buff_size);
 		adapter->tx_buf_size = (adapter->tx_buf_size
@@ -1191,11 +1234,19 @@ int mwifiex_process_sta_cmdresp(struct mwifiex_private *priv, u16 cmdresp_no,
 		break;
 	case HostCmd_CMD_TDLS_OPER:
 		ret = mwifiex_ret_tdls_oper(priv, resp);
+	case HostCmd_CMD_MC_POLICY:
 		break;
 	case HostCmd_CMD_CHAN_REPORT_REQUEST:
 		break;
 	case HostCmd_CMD_SDIO_SP_RX_AGGR_CFG:
 		ret = mwifiex_ret_sdio_rx_aggr_cfg(priv, resp);
+		break;
+	case HostCmd_CMD_TDLS_CONFIG:
+		break;
+	case HostCmd_CMD_ROBUST_COEX:
+		ret = mwifiex_ret_robust_coex(priv, resp, data_buf);
+		break;
+	case HostCmd_CMD_802_11_LED_CONTROL:
 		break;
 	default:
 		mwifiex_dbg(adapter, ERROR,

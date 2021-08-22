@@ -327,6 +327,14 @@ static int netback_probe(struct xenbus_device *dev,
 			goto abort_transaction;
 		}
 
+		/* We support multicast-control. */
+		err = xenbus_printf(xbt, dev->nodename,
+				    "feature-multicast-control", "%d", 1);
+		if (err) {
+			message = "writing feature-multicast-control";
+			goto abort_transaction;
+		}
+
 		err = xenbus_transaction_end(xbt, 0);
 	} while (err == -EAGAIN);
 
@@ -689,12 +697,14 @@ static int xen_register_watchers(struct xenbus_device *dev, struct xenvif *vif)
 		return -ENOMEM;
 	snprintf(node, maxlen, "%s/rate", dev->nodename);
 	vif->credit_watch.node = node;
+	vif->credit_watch.will_handle = NULL;
 	vif->credit_watch.callback = xen_net_rate_changed;
 	err = register_xenbus_watch(&vif->credit_watch);
 	if (err) {
 		pr_err("Failed to set watcher %s\n", vif->credit_watch.node);
 		kfree(node);
 		vif->credit_watch.node = NULL;
+		vif->credit_watch.will_handle = NULL;
 		vif->credit_watch.callback = NULL;
 	}
 	return err;
@@ -780,6 +790,12 @@ static void connect(struct backend_info *be)
 	/* Use the number of queues requested by the frontend */
 	be->vif->queues = vzalloc(requested_num_queues *
 				  sizeof(struct xenvif_queue));
+	if (!be->vif->queues) {
+		xenbus_dev_fatal(dev, -ENOMEM,
+				 "allocating queues");
+		return;
+	}
+
 	be->vif->num_queues = requested_num_queues;
 	be->vif->stalled_queues = requested_num_queues;
 
@@ -833,7 +849,7 @@ static void connect(struct backend_info *be)
 	xenvif_carrier_on(be->vif);
 
 	unregister_hotplug_status_watch(be);
-	err = xenbus_watch_pathfmt(dev, &be->hotplug_status_watch,
+	err = xenbus_watch_pathfmt(dev, &be->hotplug_status_watch, NULL,
 				   hotplug_status_changed,
 				   "%s/%s", dev->nodename, "hotplug-status");
 	if (!err)
@@ -1015,6 +1031,11 @@ static int read_xenbus_vif_flags(struct backend_info *be)
 			 "%d", &val) < 0)
 		val = 0;
 	vif->ipv6_csum = !!val;
+
+	if (xenbus_scanf(XBT_NIL, dev->otherend, "request-multicast-control",
+			 "%d", &val) < 0)
+		val = 0;
+	vif->multicast_control = !!val;
 
 	return 0;
 }

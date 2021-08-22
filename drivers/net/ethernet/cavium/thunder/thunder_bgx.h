@@ -41,6 +41,7 @@
 #define BGX_CMRX_RX_STAT10		0xC0
 #define BGX_CMRX_RX_BP_DROP		0xC8
 #define BGX_CMRX_RX_DMAC_CTL		0x0E8
+#define BGX_CMRX_RX_FIFO_LEN		0x108
 #define BGX_CMR_RX_DMACX_CAM		0x200
 #define  RX_DMACX_CAM_EN			BIT_ULL(48)
 #define  RX_DMACX_CAM_LMACID(x)			(x << 49)
@@ -50,6 +51,7 @@
 #define BGX_CMR_CHAN_MSK_AND		0x450
 #define BGX_CMR_BIST_STATUS		0x460
 #define BGX_CMR_RX_LMACS		0x468
+#define BGX_CMRX_TX_FIFO_LEN		0x518
 #define BGX_CMRX_TX_STAT0		0x600
 #define BGX_CMRX_TX_STAT1		0x608
 #define BGX_CMRX_TX_STAT2		0x610
@@ -72,6 +74,7 @@
 
 #define BGX_SPUX_CONTROL1		0x10000
 #define  SPU_CTL_LOW_POWER			BIT_ULL(11)
+#define  SPU_CTL_LOOPBACK			BIT_ULL(14)
 #define  SPU_CTL_RESET				BIT_ULL(15)
 #define BGX_SPUX_STATUS1		0x10008
 #define  SPU_STATUS1_RCV_LNK			BIT_ULL(2)
@@ -126,6 +129,7 @@
 #define	 PCS_MRX_CTL_RST_AN			BIT_ULL(9)
 #define	 PCS_MRX_CTL_PWR_DN			BIT_ULL(11)
 #define	 PCS_MRX_CTL_AN_EN			BIT_ULL(12)
+#define	 PCS_MRX_CTL_LOOPBACK1			BIT_ULL(14)
 #define	 PCS_MRX_CTL_RESET			BIT_ULL(15)
 #define BGX_GMP_PCS_MRX_STATUS		0x30008
 #define	 PCS_MRX_STATUS_AN_CPT			BIT_ULL(5)
@@ -180,12 +184,16 @@ enum MCAST_MODE {
 #define BCAST_ACCEPT	1
 #define CAM_ACCEPT	1
 
+void octeon_mdiobus_force_mod_depencency(void);
+void bgx_lmac_rx_tx_enable(int node, int bgx_idx, int lmacid, bool enable);
 void bgx_add_dmac_addr(u64 dmac, int node, int bgx_idx, int lmac);
 unsigned bgx_get_map(int node);
 int bgx_get_lmac_count(int node, int bgx);
 const u8 *bgx_get_lmac_mac(int node, int bgx_idx, int lmacid);
 void bgx_set_lmac_mac(int node, int bgx_idx, int lmacid, const u8 *mac);
 void bgx_get_lmac_link_state(int node, int bgx_idx, int lmacid, void *status);
+void bgx_lmac_internal_loopback(int node, int bgx_idx,
+				int lmac_idx, bool enable);
 u64 bgx_get_rx_stats(int node, int bgx_idx, int lmac, int idx);
 u64 bgx_get_tx_stats(int node, int bgx_idx, int lmac, int idx);
 #define BGX_RX_STATS_COUNT 11

@@ -115,7 +115,8 @@ mwifiex_info_read(struct file *file, char __user *ubuf,
 	if (GET_BSS_ROLE(priv) == MWIFIEX_BSS_ROLE_STA) {
 		p += sprintf(p, "multicast_count=\"%d\"\n",
 			     netdev_mc_count(netdev));
-		p += sprintf(p, "essid=\"%s\"\n", info.ssid.ssid);
+		p += sprintf(p, "essid=\"%.*s\"\n", info.ssid.ssid_len,
+			     info.ssid.ssid);
 		p += sprintf(p, "bssid=\"%pM\"\n", info.bssid);
 		p += sprintf(p, "channel=\"%d\"\n", (int) info.bss_chan);
 		p += sprintf(p, "country_code = \"%s\"\n", info.country_code);
@@ -294,15 +295,13 @@ mwifiex_histogram_read(struct file *file, char __user *ubuf,
 		     "total samples = %d\n",
 		     atomic_read(&phist_data->num_samples));
 
-	p += sprintf(p, "rx rates (in Mbps): 0=1M   1=2M");
-	p += sprintf(p, "2=5.5M  3=11M   4=6M   5=9M  6=12M\n");
-	p += sprintf(p, "7=18M  8=24M  9=36M  10=48M  11=54M");
-	p += sprintf(p, "12-27=MCS0-15(BW20) 28-43=MCS0-15(BW40)\n");
+	p += sprintf(p,
+		     "rx rates (in Mbps): 0=1M   1=2M 2=5.5M  3=11M   4=6M   5=9M  6=12M\n"
+		     "7=18M  8=24M  9=36M  10=48M  11=54M 12-27=MCS0-15(BW20) 28-43=MCS0-15(BW40)\n");
 
 	if (ISSUPP_11ACENABLED(priv->adapter->fw_cap_info)) {
-		p += sprintf(p, "44-53=MCS0-9(VHT:BW20)");
-		p += sprintf(p, "54-63=MCS0-9(VHT:BW40)");
-		p += sprintf(p, "64-73=MCS0-9(VHT:BW80)\n\n");
+		p += sprintf(p,
+			     "44-53=MCS0-9(VHT:BW20) 54-63=MCS0-9(VHT:BW40) 64-73=MCS0-9(VHT:BW80)\n\n");
 	} else {
 		p += sprintf(p, "\n");
 	}
@@ -331,7 +330,7 @@ mwifiex_histogram_read(struct file *file, char __user *ubuf,
 	for (i = 0; i < MWIFIEX_MAX_NOISE_FLR; i++) {
 		value = atomic_read(&phist_data->noise_flr[i]);
 		if (value)
-			p += sprintf(p, "noise_flr[-%02ddBm] = %d\n",
+			p += sprintf(p, "noise_flr[%02ddBm] = %d\n",
 				(int)(i-128), value);
 	}
 	for (i = 0; i < MWIFIEX_MAX_SIG_STRENGTH; i++) {
@@ -731,7 +730,7 @@ mwifiex_rdeeprom_read(struct file *file, char __user *ubuf,
 		(struct mwifiex_private *) file->private_data;
 	unsigned long addr = get_zeroed_page(GFP_KERNEL);
 	char *buf = (char *) addr;
-	int pos = 0, ret = 0, i;
+	int pos, ret, i;
 	u8 value[MAX_EEPROM_DATA];
 
 	if (!buf)
@@ -739,7 +738,7 @@ mwifiex_rdeeprom_read(struct file *file, char __user *ubuf,
 
 	if (saved_offset == -1) {
 		/* No command has been given */
-		pos += snprintf(buf, PAGE_SIZE, "0");
+		pos = snprintf(buf, PAGE_SIZE, "0");
 		goto done;
 	}
 
@@ -748,17 +747,17 @@ mwifiex_rdeeprom_read(struct file *file, char __user *ubuf,
 				  (u16) saved_bytes, value);
 	if (ret) {
 		ret = -EINVAL;
-		goto done;
+		goto out_free;
 	}
 
-	pos += snprintf(buf, PAGE_SIZE, "%d %d ", saved_offset, saved_bytes);
+	pos = snprintf(buf, PAGE_SIZE, "%d %d ", saved_offset, saved_bytes);
 
 	for (i = 0; i < saved_bytes; i++)
-		pos += snprintf(buf + strlen(buf), PAGE_SIZE, "%d ", value[i]);
-
-	ret = simple_read_from_buffer(ubuf, count, ppos, buf, pos);
+		pos += scnprintf(buf + pos, PAGE_SIZE - pos, "%d ", value[i]);
 
 done:
+	ret = simple_read_from_buffer(ubuf, count, ppos, buf, pos);
+out_free:
 	free_page(addr);
 	return ret;
 }
@@ -856,6 +855,56 @@ mwifiex_hscfg_read(struct file *file, char __user *ubuf,
 	return ret;
 }
 
+static ssize_t
+mwifiex_timeshare_coex_read(struct file *file, char __user *ubuf,
+			    size_t count, loff_t *ppos)
+{
+	struct mwifiex_private *priv = file->private_data;
+	char buf[3];
+	bool timeshare_coex;
+	int ret;
+	unsigned int len;
+
+	if (priv->adapter->fw_api_ver != MWIFIEX_FW_V15)
+		return -EOPNOTSUPP;
+
+	ret = mwifiex_send_cmd(priv, HostCmd_CMD_ROBUST_COEX,
+			       HostCmd_ACT_GEN_GET, 0, &timeshare_coex, true);
+	if (ret)
+		return ret;
+
+	len = sprintf(buf, "%d\n", timeshare_coex);
+	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
+}
+
+static ssize_t
+mwifiex_timeshare_coex_write(struct file *file, const char __user *ubuf,
+			     size_t count, loff_t *ppos)
+{
+	bool timeshare_coex;
+	struct mwifiex_private *priv = file->private_data;
+	char kbuf[16];
+	int ret;
+
+	if (priv->adapter->fw_api_ver != MWIFIEX_FW_V15)
+		return -EOPNOTSUPP;
+
+	memset(kbuf, 0, sizeof(kbuf));
+
+	if (copy_from_user(&kbuf, ubuf, min_t(size_t, sizeof(kbuf) - 1, count)))
+		return -EFAULT;
+
+	if (strtobool(kbuf, &timeshare_coex))
+		return -EINVAL;
+
+	ret = mwifiex_send_cmd(priv, HostCmd_CMD_ROBUST_COEX,
+			       HostCmd_ACT_GEN_SET, 0, &timeshare_coex, true);
+	if (ret)
+		return ret;
+	else
+		return count;
+}
+
 #define MWIFIEX_DFS_ADD_FILE(name) do {                                 \
 	if (!debugfs_create_file(#name, 0644, priv->dfs_dev_dir,        \
 			priv, &mwifiex_dfs_##name##_fops))              \
@@ -892,6 +941,7 @@ MWIFIEX_DFS_FILE_OPS(memrw);
 MWIFIEX_DFS_FILE_OPS(hscfg);
 MWIFIEX_DFS_FILE_OPS(histogram);
 MWIFIEX_DFS_FILE_OPS(debug_mask);
+MWIFIEX_DFS_FILE_OPS(timeshare_coex);
 
 /*
  * This function creates the debug FS directory structure and the files.
@@ -918,6 +968,7 @@ mwifiex_dev_debugfs_init(struct mwifiex_private *priv)
 	MWIFIEX_DFS_ADD_FILE(hscfg);
 	MWIFIEX_DFS_ADD_FILE(histogram);
 	MWIFIEX_DFS_ADD_FILE(debug_mask);
+	MWIFIEX_DFS_ADD_FILE(timeshare_coex);
 }
 
 /*
