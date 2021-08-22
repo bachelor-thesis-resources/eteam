@@ -30,6 +30,9 @@ static inline int gup_pte_range(pmd_t *pmdp, pmd_t pmd, unsigned long addr,
 	do {
 		pte = *ptep;
 		barrier();
+		/* Similar to the PMD case, NUMA hinting must take slow path */
+		if (pte_protnone(pte))
+			return 0;
 		if ((pte_val(pte) & mask) != 0)
 			return 0;
 		VM_BUG_ON(!pfn_valid(pte_pfn(pte)));
@@ -51,13 +54,12 @@ static inline int gup_pte_range(pmd_t *pmdp, pmd_t pmd, unsigned long addr,
 static inline int gup_huge_pmd(pmd_t *pmdp, pmd_t pmd, unsigned long addr,
 		unsigned long end, int write, struct page **pages, int *nr)
 {
-	unsigned long mask, result;
 	struct page *head, *page, *tail;
+	unsigned long mask;
 	int refs;
 
-	result = write ? 0 : _SEGMENT_ENTRY_PROTECT;
-	mask = result | _SEGMENT_ENTRY_INVALID;
-	if ((pmd_val(pmd) & mask) != result)
+	mask = (write ? _SEGMENT_ENTRY_PROTECT : 0) | _SEGMENT_ENTRY_INVALID;
+	if ((pmd_val(pmd) & mask) != 0)
 		return 0;
 	VM_BUG_ON(!pfn_valid(pmd_val(pmd) >> PAGE_SHIFT));
 
@@ -125,6 +127,13 @@ static inline int gup_pmd_range(pud_t *pudp, pud_t pud, unsigned long addr,
 		if (pmd_none(pmd) || pmd_trans_splitting(pmd))
 			return 0;
 		if (unlikely(pmd_large(pmd))) {
+			/*
+			 * NUMA hinting faults need to be handled in the GUP
+			 * slowpath for accounting purposes and so that they
+			 * can be serialised against THP migration.
+			 */
+			if (pmd_protnone(pmd))
+				return 0;
 			if (!gup_huge_pmd(pmdp, pmd, addr, next,
 					  write, pages, nr))
 				return 0;
@@ -223,8 +232,15 @@ int get_user_pages_fast(unsigned long start, int nr_pages, int write,
 	struct mm_struct *mm = current->mm;
 	int nr, ret;
 
+	/*
+	 * The FAST_GUP case requires FOLL_WRITE even for pure reads,
+	 * because get_user_pages() may need to cause an early COW in
+	 * order to avoid confusing the normal COW routines. So only
+	 * targets that are already writable are safe to do by just
+	 * looking at the page tables.
+	 */
 	start &= PAGE_MASK;
-	nr = __get_user_pages_fast(start, nr_pages, write, pages);
+	nr = __get_user_pages_fast(start, nr_pages, 1, pages);
 	if (nr == nr_pages)
 		return nr;
 
@@ -232,7 +248,7 @@ int get_user_pages_fast(unsigned long start, int nr_pages, int write,
 	start += nr << PAGE_SHIFT;
 	pages += nr;
 	ret = get_user_pages_unlocked(current, mm, start,
-			     nr_pages - nr, write, 0, pages);
+			     nr_pages - nr, pages, write ? FOLL_WRITE : 0);
 	/* Have to be a bit careful with return values */
 	if (nr > 0)
 		ret = (ret < 0) ? nr : ret + nr;

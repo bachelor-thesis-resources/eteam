@@ -39,6 +39,7 @@
 #include <linux/gfp.h>
 #include <linux/kprobes.h>
 #include <asm/uaccess.h>
+#include <asm/facility.h>
 #include <asm/delay.h>
 #include <asm/div64.h>
 #include <asm/vdso.h>
@@ -57,6 +58,28 @@ u64 sched_clock_base_cc = -1;	/* Force to data section. */
 EXPORT_SYMBOL_GPL(sched_clock_base_cc);
 
 static DEFINE_PER_CPU(struct clock_event_device, comparators);
+
+ATOMIC_NOTIFIER_HEAD(s390_epoch_delta_notifier);
+EXPORT_SYMBOL(s390_epoch_delta_notifier);
+
+unsigned char ptff_function_mask[16];
+unsigned long lpar_offset;
+
+/*
+ * Get time offsets with PTFF
+ */
+void __init ptff_init(void)
+{
+	struct ptff_qto qto;
+
+	if (!test_facility(28))
+		return;
+	ptff(&ptff_function_mask, sizeof(ptff_function_mask), PTFF_QAF);
+
+	/* get LPAR offset */
+	if (ptff_query(PTFF_QTO) && ptff(&qto, sizeof(qto), PTFF_QTO) == 0)
+		lpar_offset = qto.tod_epoch_difference;
+}
 
 /*
  * Scheduler clock - returns current time in nanosec units.
@@ -117,11 +140,6 @@ static int s390_next_event(unsigned long delta,
 	return 0;
 }
 
-static void s390_set_mode(enum clock_event_mode mode,
-			  struct clock_event_device *evt)
-{
-}
-
 /*
  * Set up lowcore and control register of the current cpu to
  * enable TOD clock and clock comparator interrupts.
@@ -145,7 +163,6 @@ void init_cpu_timer(void)
 	cd->rating		= 400;
 	cd->cpumask		= cpumask_of(cpu);
 	cd->set_next_event	= s390_next_event;
-	cd->set_mode		= s390_set_mode;
 
 	clockevents_register_device(cd);
 
@@ -340,20 +357,20 @@ static unsigned long clock_sync_flags;
 #define CLOCK_SYNC_STP		3
 
 /*
- * The synchronous get_clock function. It will write the current clock
- * value to the clock pointer and return 0 if the clock is in sync with
- * the external time source. If the clock mode is local it will return
- * -EOPNOTSUPP and -EAGAIN if the clock is not in sync with the external
- * reference.
+ * The get_clock function for the physical clock. It will get the current
+ * TOD clock, subtract the LPAR offset and write the result to *clock.
+ * The function returns 0 if the clock is in sync with the external time
+ * source. If the clock mode is local it will return -EOPNOTSUPP and
+ * -EAGAIN if the clock is not in sync with the external reference.
  */
-int get_sync_clock(unsigned long long *clock)
+int get_phys_clock(unsigned long long *clock)
 {
 	atomic_t *sw_ptr;
 	unsigned int sw0, sw1;
 
 	sw_ptr = &get_cpu_var(clock_sync_word);
 	sw0 = atomic_read(sw_ptr);
-	*clock = get_tod_clock();
+	*clock = get_tod_clock() - lpar_offset;
 	sw1 = atomic_read(sw_ptr);
 	put_cpu_var(clock_sync_word);
 	if (sw0 == sw1 && (sw0 & 0x80000000U))
@@ -367,7 +384,7 @@ int get_sync_clock(unsigned long long *clock)
 		return -EACCES;
 	return -EAGAIN;
 }
-EXPORT_SYMBOL(get_sync_clock);
+EXPORT_SYMBOL(get_phys_clock);
 
 /*
  * Make get_sync_clock return -EAGAIN.
@@ -381,7 +398,7 @@ static void disable_sync_clock(void *dummy)
 	 * increase the "sequence" counter to avoid the race of an
 	 * etr event and the complete recovery against get_sync_clock.
 	 */
-	atomic_clear_mask(0x80000000, sw_ptr);
+	atomic_andnot(0x80000000, sw_ptr);
 	atomic_inc(sw_ptr);
 }
 
@@ -392,7 +409,7 @@ static void disable_sync_clock(void *dummy)
 static void enable_sync_clock(void)
 {
 	atomic_t *sw_ptr = this_cpu_ptr(&clock_sync_word);
-	atomic_set_mask(0x80000000, sw_ptr);
+	atomic_or(0x80000000, sw_ptr);
 }
 
 /*
@@ -545,16 +562,17 @@ arch_initcall(etr_init);
  * Switch to local machine check. This is called when the last usable
  * ETR port goes inactive. After switch to local the clock is not in sync.
  */
-void etr_switch_to_local(void)
+int etr_switch_to_local(void)
 {
 	if (!etr_eacr.sl)
-		return;
+		return 0;
 	disable_sync_clock(NULL);
 	if (!test_and_set_bit(ETR_EVENT_SWITCH_LOCAL, &etr_events)) {
 		etr_eacr.es = etr_eacr.sl = 0;
 		etr_setr(&etr_eacr);
-		queue_work(time_sync_wq, &etr_work);
+		return 1;
 	}
+	return 0;
 }
 
 /*
@@ -563,16 +581,22 @@ void etr_switch_to_local(void)
  * After a ETR sync check the clock is not in sync. The machine check
  * is broadcasted to all cpus at the same time.
  */
-void etr_sync_check(void)
+int etr_sync_check(void)
 {
 	if (!etr_eacr.es)
-		return;
+		return 0;
 	disable_sync_clock(NULL);
 	if (!test_and_set_bit(ETR_EVENT_SYNC_CHECK, &etr_events)) {
 		etr_eacr.es = 0;
 		etr_setr(&etr_eacr);
-		queue_work(time_sync_wq, &etr_work);
+		return 1;
 	}
+	return 0;
+}
+
+void etr_queue_work(void)
+{
+	queue_work(time_sync_wq, &etr_work);
 }
 
 /*
@@ -752,9 +776,10 @@ static void clock_sync_cpu(struct clock_sync_data *sync)
 static int etr_sync_clock(void *data)
 {
 	static int first;
-	unsigned long long clock, old_clock, delay, delta;
+	unsigned long long clock, old_clock, clock_delta, delay, delta;
 	struct clock_sync_data *etr_sync;
 	struct etr_aib *sync_port, *aib;
+	struct ptff_qto qto;
 	int port;
 	int rc;
 
@@ -789,6 +814,9 @@ static int etr_sync_clock(void *data)
 		delay = (unsigned long long)
 			(aib->edf2.etv - sync_port->edf2.etv) << 32;
 		delta = adjust_time(old_clock, clock, delay);
+		clock_delta = clock - old_clock;
+		atomic_notifier_call_chain(&s390_epoch_delta_notifier, 0,
+					   &clock_delta);
 		etr_sync->fixup_cc = delta;
 		fixup_clock_comparator(delta);
 		/* Verify that the clock is properly set. */
@@ -798,6 +826,10 @@ static int etr_sync_clock(void *data)
 			etr_sync->in_sync = -EAGAIN;
 			rc = -EAGAIN;
 		} else {
+			if (ptff_query(PTFF_QTO) &&
+			    ptff(&qto, sizeof(qto), PTFF_QTO) == 0)
+				/* Update LPAR offset */
+				lpar_offset = qto.tod_epoch_difference;
 			etr_sync->in_sync = 1;
 			rc = 0;
 		}
@@ -1453,7 +1485,7 @@ static void __init stp_reset(void)
 	int rc;
 
 	stp_page = (void *) get_zeroed_page(GFP_ATOMIC);
-	rc = chsc_sstpc(stp_page, STP_OP_CTRL, 0x0000);
+	rc = chsc_sstpc(stp_page, STP_OP_CTRL, 0x0000, NULL);
 	if (rc == 0)
 		set_bit(CLOCK_SYNC_HAS_STP, &clock_sync_flags);
 	else if (stp_online) {
@@ -1504,10 +1536,10 @@ static void stp_timing_alert(struct stp_irq_parm *intparm)
  * After a STP sync check the clock is not in sync. The machine check
  * is broadcasted to all cpus at the same time.
  */
-void stp_sync_check(void)
+int stp_sync_check(void)
 {
 	disable_sync_clock(NULL);
-	queue_work(time_sync_wq, &stp_work);
+	return 1;
 }
 
 /*
@@ -1516,18 +1548,23 @@ void stp_sync_check(void)
  * have matching CTN ids and have a valid stratum-1 configuration
  * but the configurations do not match.
  */
-void stp_island_check(void)
+int stp_island_check(void)
 {
 	disable_sync_clock(NULL);
-	queue_work(time_sync_wq, &stp_work);
+	return 1;
 }
 
+void stp_queue_work(void)
+{
+	queue_work(time_sync_wq, &stp_work);
+}
 
 static int stp_sync_clock(void *data)
 {
 	static int first;
-	unsigned long long old_clock, delta;
+	unsigned long long old_clock, delta, new_clock, clock_delta;
 	struct clock_sync_data *stp_sync;
+	struct ptff_qto qto;
 	int rc;
 
 	stp_sync = data;
@@ -1549,9 +1586,16 @@ static int stp_sync_clock(void *data)
 	    stp_info.todoff[2] || stp_info.todoff[3] ||
 	    stp_info.tmd != 2) {
 		old_clock = get_tod_clock();
-		rc = chsc_sstpc(stp_page, STP_OP_SYNC, 0);
+		rc = chsc_sstpc(stp_page, STP_OP_SYNC, 0, &clock_delta);
 		if (rc == 0) {
-			delta = adjust_time(old_clock, get_tod_clock(), 0);
+			new_clock = old_clock + clock_delta;
+			delta = adjust_time(old_clock, new_clock, 0);
+			if (ptff_query(PTFF_QTO) &&
+			    ptff(&qto, sizeof(qto), PTFF_QTO) == 0)
+				/* Update LPAR offset */
+				lpar_offset = qto.tod_epoch_difference;
+			atomic_notifier_call_chain(&s390_epoch_delta_notifier,
+						   0, &clock_delta);
 			fixup_clock_comparator(delta);
 			rc = chsc_sstpi(stp_page, &stp_info,
 					sizeof(struct stp_sstpi));
@@ -1581,12 +1625,12 @@ static void stp_work_fn(struct work_struct *work)
 	mutex_lock(&stp_work_mutex);
 
 	if (!stp_online) {
-		chsc_sstpc(stp_page, STP_OP_CTRL, 0x0000);
+		chsc_sstpc(stp_page, STP_OP_CTRL, 0x0000, NULL);
 		del_timer_sync(&stp_timer);
 		goto out_unlock;
 	}
 
-	rc = chsc_sstpc(stp_page, STP_OP_CTRL, 0xb0e0);
+	rc = chsc_sstpc(stp_page, STP_OP_CTRL, 0xb0e0, NULL);
 	if (rc)
 		goto out_unlock;
 

@@ -66,28 +66,34 @@ endif
 UTS_MACHINE := $(OLDARCH)
 
 ifeq ($(CONFIG_CPU_LITTLE_ENDIAN),y)
-override CC	+= -mlittle-endian
-ifneq ($(COMPILER),clang)
-override CC	+= -mno-strict-align
-endif
-override AS	+= -mlittle-endian
 override LD	+= -EL
-override CROSS32CC += -mlittle-endian
 override CROSS32AS += -mlittle-endian
 LDEMULATION	:= lppc
 GNUTARGET	:= powerpcle
 MULTIPLEWORD	:= -mno-multiple
 KBUILD_CFLAGS_MODULE += $(call cc-option,-mno-save-toc-indirect)
 else
-ifeq ($(call cc-option-yn,-mbig-endian),y)
-override CC	+= -mbig-endian
-override AS	+= -mbig-endian
-endif
 override LD	+= -EB
 LDEMULATION	:= ppc
 GNUTARGET	:= powerpc
 MULTIPLEWORD	:= -mmultiple
 endif
+
+ifdef CONFIG_PPC64
+cflags-$(CONFIG_CPU_BIG_ENDIAN)		+= $(call cc-option,-mabi=elfv1)
+cflags-$(CONFIG_CPU_BIG_ENDIAN)		+= $(call cc-option,-mcall-aixdesc)
+aflags-$(CONFIG_CPU_BIG_ENDIAN)		+= $(call cc-option,-mabi=elfv1)
+aflags-$(CONFIG_CPU_LITTLE_ENDIAN)	+= -mabi=elfv2
+endif
+
+cflags-$(CONFIG_CPU_LITTLE_ENDIAN)	+= -mlittle-endian
+cflags-$(CONFIG_CPU_BIG_ENDIAN)		+= $(call cc-option,-mbig-endian)
+ifneq ($(cc-name),clang)
+  cflags-$(CONFIG_CPU_LITTLE_ENDIAN)	+= -mno-strict-align
+endif
+
+aflags-$(CONFIG_CPU_BIG_ENDIAN)		+= $(call cc-option,-mbig-endian)
+aflags-$(CONFIG_CPU_LITTLE_ENDIAN)	+= -mlittle-endian
 
 ifeq ($(HAS_BIARCH),y)
 override AS	+= -a$(CONFIG_WORD_SIZE)
@@ -121,7 +127,9 @@ ifeq ($(CONFIG_CPU_LITTLE_ENDIAN),y)
 CFLAGS-$(CONFIG_PPC64)	+= $(call cc-option,-mabi=elfv2,$(call cc-option,-mcall-aixdesc))
 AFLAGS-$(CONFIG_PPC64)	+= $(call cc-option,-mabi=elfv2)
 else
+CFLAGS-$(CONFIG_PPC64)	+= $(call cc-option,-mabi=elfv1)
 CFLAGS-$(CONFIG_PPC64)	+= $(call cc-option,-mcall-aixdesc)
+AFLAGS-$(CONFIG_PPC64)	+= $(call cc-option,-mabi=elfv1)
 endif
 CFLAGS-$(CONFIG_PPC64)	+= $(call cc-option,-mcmodel=medium,$(call cc-option,-mminimal-toc))
 CFLAGS-$(CONFIG_PPC64)	+= $(call cc-option,-mno-pointers-to-nested-functions)
@@ -156,8 +164,6 @@ else
 CFLAGS-$(CONFIG_E500) += $(call cc-option,-mcpu=8540 -msoft-float,-mcpu=powerpc)
 endif
 endif
-
-CFLAGS-$(CONFIG_TUNE_CELL) += $(call cc-option,-mtune=cell)
 
 asinstr := $(call as-instr,lis 9$(comma)foo@high,-DHAVE_AS_ATHIGH=1)
 
@@ -214,6 +220,9 @@ cpu-as-$(CONFIG_E200)		+= -Wa,-me200
 KBUILD_AFLAGS += $(cpu-as-y)
 KBUILD_CFLAGS += $(cpu-as-y)
 
+KBUILD_AFLAGS += $(aflags-y)
+KBUILD_CFLAGS += $(cflags-y)
+
 head-y				:= arch/powerpc/kernel/head_$(CONFIG_WORD_SIZE).o
 head-$(CONFIG_8xx)		:= arch/powerpc/kernel/head_8xx.o
 head-$(CONFIG_40x)		:= arch/powerpc/kernel/head_40x.o
@@ -243,7 +252,7 @@ drivers-$(CONFIG_OPROFILE)	+= arch/powerpc/oprofile/
 all: zImage
 
 # With make 3.82 we cannot mix normal and wildcard targets
-BOOT_TARGETS1 := zImage zImage.initrd uImage
+BOOT_TARGETS1 := zImage zImage.initrd uImage vmlinux.strip
 BOOT_TARGETS2 := zImage% dtbImage% treeImage.% cuImage.% simpleImage.% uImage.%
 
 PHONY += $(BOOT_TARGETS1) $(BOOT_TARGETS2)
@@ -288,6 +297,30 @@ PHONY += pseries_le_defconfig
 pseries_le_defconfig:
 	$(call merge_into_defconfig,pseries_defconfig,le)
 
+PHONY += ppc64le_defconfig
+ppc64le_defconfig:
+	$(call merge_into_defconfig,ppc64_defconfig,le)
+
+PHONY += mpc85xx_defconfig
+mpc85xx_defconfig:
+	$(call merge_into_defconfig,mpc85xx_basic_defconfig,\
+		85xx-32bit 85xx-hw fsl-emb-nonhw)
+
+PHONY += mpc85xx_smp_defconfig
+mpc85xx_smp_defconfig:
+	$(call merge_into_defconfig,mpc85xx_basic_defconfig,\
+		85xx-32bit 85xx-smp 85xx-hw fsl-emb-nonhw)
+
+PHONY += corenet32_smp_defconfig
+corenet32_smp_defconfig:
+	$(call merge_into_defconfig,corenet_basic_defconfig,\
+		85xx-32bit 85xx-smp 85xx-hw fsl-emb-nonhw)
+
+PHONY += corenet64_smp_defconfig
+corenet64_smp_defconfig:
+	$(call merge_into_defconfig,corenet_basic_defconfig,\
+		85xx-64bit 85xx-smp altivec 85xx-hw fsl-emb-nonhw)
+
 define archhelp
   @echo '* zImage          - Build default images selected by kernel config'
   @echo '  zImage.*        - Compressed kernel image (arch/$(ARCH)/boot/zImage.*)'
@@ -317,7 +350,9 @@ vdso_install:
 ifeq ($(CONFIG_PPC64),y)
 	$(Q)$(MAKE) $(build)=arch/$(ARCH)/kernel/vdso64 $@
 endif
+ifdef CONFIG_VDSO32
 	$(Q)$(MAKE) $(build)=arch/$(ARCH)/kernel/vdso32 $@
+endif
 
 archclean:
 	$(Q)$(MAKE) $(clean)=$(boot)
@@ -333,7 +368,7 @@ TOUT	:= .tmp_gas_check
 # - Require gcc 4.0 or above on 64-bit
 # - gcc-4.2.0 has issues compiling modules on 64-bit
 checkbin:
-	@if test "${COMPILER}" != "clang" \
+	@if test "$(cc-name)" != "clang" \
 	    && test "$(cc-version)" = "0304" ; then \
 		if ! /bin/echo mftb 5 | $(AS) -v -mppc -many -o $(TOUT) >/dev/null 2>&1 ; then \
 			echo -n '*** ${VERSION}.${PATCHLEVEL} kernels no longer build '; \
@@ -342,14 +377,14 @@ checkbin:
 			false; \
 		fi ; \
 	fi
-	@if test "${COMPILER}" != "clang" \
+	@if test "$(cc-name)" != "clang" \
 	    && test "$(cc-version)" -lt "0400" \
 	    && test "x${CONFIG_PPC64}" = "xy" ; then \
                 echo -n "Sorry, GCC v4.0 or above is required to build " ; \
                 echo "the 64-bit powerpc kernel." ; \
                 false ; \
         fi
-	@if test "${COMPILER}" != "clang" \
+	@if test "$(cc-name)" != "clang" \
 	    && test "$(cc-fullversion)" = "040200" \
 	    && test "x${CONFIG_MODULES}${CONFIG_PPC64}" = "xyy" ; then \
 		echo -n '*** GCC-4.2.0 cannot compile the 64-bit powerpc ' ; \

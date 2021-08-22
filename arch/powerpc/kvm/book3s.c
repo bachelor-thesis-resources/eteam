@@ -53,6 +53,7 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
 	{ "ext_intr",    VCPU_STAT(ext_intr_exits) },
 	{ "queue_intr",  VCPU_STAT(queue_intr) },
 	{ "halt_successful_poll", VCPU_STAT(halt_successful_poll), },
+	{ "halt_attempted_poll", VCPU_STAT(halt_attempted_poll), },
 	{ "halt_wakeup", VCPU_STAT(halt_wakeup) },
 	{ "pf_storage",  VCPU_STAT(pf_storage) },
 	{ "sp_storage",  VCPU_STAT(sp_storage) },
@@ -69,8 +70,11 @@ void kvmppc_unfixup_split_real(struct kvm_vcpu *vcpu)
 {
 	if (vcpu->arch.hflags & BOOK3S_HFLAG_SPLIT_HACK) {
 		ulong pc = kvmppc_get_pc(vcpu);
+		ulong lr = kvmppc_get_lr(vcpu);
 		if ((pc & SPLIT_HACK_MASK) == SPLIT_HACK_OFFS)
 			kvmppc_set_pc(vcpu, pc & ~SPLIT_HACK_MASK);
+		if ((lr & SPLIT_HACK_MASK) == SPLIT_HACK_OFFS)
+			kvmppc_set_lr(vcpu, lr & ~SPLIT_HACK_MASK);
 		vcpu->arch.hflags &= ~BOOK3S_HFLAG_SPLIT_HACK;
 	}
 }
@@ -240,7 +244,8 @@ void kvmppc_core_queue_inst_storage(struct kvm_vcpu *vcpu, ulong flags)
 	kvmppc_book3s_queue_irqprio(vcpu, BOOK3S_INTERRUPT_INST_STORAGE);
 }
 
-int kvmppc_book3s_irqprio_deliver(struct kvm_vcpu *vcpu, unsigned int priority)
+static int kvmppc_book3s_irqprio_deliver(struct kvm_vcpu *vcpu,
+					 unsigned int priority)
 {
 	int deliver = 1;
 	int vec = 0;
@@ -589,9 +594,6 @@ int kvmppc_get_one_reg(struct kvm_vcpu *vcpu, u64 id,
 		case KVM_REG_PPC_BESCR:
 			*val = get_reg_val(id, vcpu->arch.bescr);
 			break;
-		case KVM_REG_PPC_VTB:
-			*val = get_reg_val(id, vcpu->arch.vtb);
-			break;
 		case KVM_REG_PPC_IC:
 			*val = get_reg_val(id, vcpu->arch.ic);
 			break;
@@ -662,9 +664,6 @@ int kvmppc_set_one_reg(struct kvm_vcpu *vcpu, u64 id,
 			break;
 		case KVM_REG_PPC_BESCR:
 			vcpu->arch.bescr = set_reg_val(id, *val);
-			break;
-		case KVM_REG_PPC_VTB:
-			vcpu->arch.vtb = set_reg_val(id, *val);
 			break;
 		case KVM_REG_PPC_IC:
 			vcpu->arch.ic = set_reg_val(id, *val);
@@ -807,6 +806,7 @@ int kvmppc_core_init_vm(struct kvm *kvm)
 #ifdef CONFIG_PPC64
 	INIT_LIST_HEAD(&kvm->arch.spapr_tce_tables);
 	INIT_LIST_HEAD(&kvm->arch.rtas_tokens);
+	mutex_init(&kvm->arch.rtas_token_lock);
 #endif
 
 	return kvm->arch.kvm_ops->init_vm(kvm);
@@ -827,12 +827,15 @@ int kvmppc_h_logical_ci_load(struct kvm_vcpu *vcpu)
 	unsigned long size = kvmppc_get_gpr(vcpu, 4);
 	unsigned long addr = kvmppc_get_gpr(vcpu, 5);
 	u64 buf;
+	int srcu_idx;
 	int ret;
 
 	if (!is_power_of_2(size) || (size > sizeof(buf)))
 		return H_TOO_HARD;
 
+	srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
 	ret = kvm_io_bus_read(vcpu, KVM_MMIO_BUS, addr, size, &buf);
+	srcu_read_unlock(&vcpu->kvm->srcu, srcu_idx);
 	if (ret != 0)
 		return H_TOO_HARD;
 
@@ -867,6 +870,7 @@ int kvmppc_h_logical_ci_store(struct kvm_vcpu *vcpu)
 	unsigned long addr = kvmppc_get_gpr(vcpu, 5);
 	unsigned long val = kvmppc_get_gpr(vcpu, 6);
 	u64 buf;
+	int srcu_idx;
 	int ret;
 
 	switch (size) {
@@ -890,7 +894,9 @@ int kvmppc_h_logical_ci_store(struct kvm_vcpu *vcpu)
 		return H_TOO_HARD;
 	}
 
+	srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
 	ret = kvm_io_bus_write(vcpu, KVM_MMIO_BUS, addr, size, &buf);
+	srcu_read_unlock(&vcpu->kvm->srcu, srcu_idx);
 	if (ret != 0)
 		return H_TOO_HARD;
 
@@ -902,7 +908,7 @@ int kvmppc_core_check_processor_compat(void)
 {
 	/*
 	 * We always return 0 for book3s. We check
-	 * for compatability while loading the HV
+	 * for compatibility while loading the HV
 	 * or PR module
 	 */
 	return 0;

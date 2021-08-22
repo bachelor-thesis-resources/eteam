@@ -101,6 +101,8 @@ void output_thread_info_defines(void)
 	OFFSET(TI_REGS, thread_info, regs);
 	DEFINE(_THREAD_SIZE, THREAD_SIZE);
 	DEFINE(_THREAD_MASK, THREAD_MASK);
+	DEFINE(_IRQ_STACK_SIZE, IRQ_STACK_SIZE);
+	DEFINE(_IRQ_STACK_START, IRQ_STACK_START);
 	BLANK();
 }
 
@@ -128,6 +130,7 @@ void output_thread_defines(void)
 	       thread.cp0_baduaddr);
 	OFFSET(THREAD_ECODE, task_struct, \
 	       thread.error_code);
+	OFFSET(THREAD_TRAPNO, task_struct, thread.trap_nr);
 	BLANK();
 }
 
@@ -241,17 +244,6 @@ void output_sc_defines(void)
 	OFFSET(SC_MDLO, sigcontext, sc_mdlo);
 	OFFSET(SC_PC, sigcontext, sc_pc);
 	OFFSET(SC_FPC_CSR, sigcontext, sc_fpc_csr);
-	BLANK();
-}
-#endif
-
-#ifdef CONFIG_MIPS32_COMPAT
-void output_sc32_defines(void)
-{
-	COMMENT("Linux 32-bit sigcontext offsets.");
-	OFFSET(SC32_FPREGS, sigcontext32, sc_fpregs);
-	OFFSET(SC32_FPC_CSR, sigcontext32, sc_fpc_csr);
-	OFFSET(SC32_FPC_EIR, sigcontext32, sc_fpc_eir);
 	BLANK();
 }
 #endif

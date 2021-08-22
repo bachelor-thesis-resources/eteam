@@ -134,23 +134,11 @@
 
 #define pte_iterate_hashed_end() } while(0)
 
-#ifdef CONFIG_PPC_HAS_HASH_64K
 /*
  * We expect this to be called only for user addresses or kernel virtual
  * addresses other than the linear mapping.
  */
-#define pte_pagesize_index(mm, addr, pte)			\
-	({							\
-		unsigned int psize;				\
-		if (is_kernel_addr(addr))			\
-			psize = MMU_PAGE_4K;			\
-		else						\
-			psize = get_slice_psize(mm, addr);	\
-		psize;						\
-	})
-#else
 #define pte_pagesize_index(mm, addr, pte)	MMU_PAGE_4K
-#endif
 
 #endif /* __real_pte */
 
@@ -449,9 +437,9 @@ static inline char *get_hpte_slot_array(pmd_t *pmdp)
 
 }
 
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
 extern void hpte_do_hugepage_flush(struct mm_struct *mm, unsigned long addr,
 				   pmd_t *pmdp, unsigned long old_pmd);
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
 extern pmd_t pfn_pmd(unsigned long pfn, pgprot_t pgprot);
 extern pmd_t mk_pmd(struct page *page, pgprot_t pgprot);
 extern pmd_t pmd_modify(pmd_t pmd, pgprot_t newprot);
@@ -491,6 +479,14 @@ static inline int pmd_trans_splitting(pmd_t pmd)
 }
 
 extern int has_transparent_hugepage(void);
+#else
+static inline void hpte_do_hugepage_flush(struct mm_struct *mm,
+					  unsigned long addr, pmd_t *pmdp,
+					  unsigned long old_pmd)
+{
+
+	WARN(1, "%s called with THP disabled\n", __func__);
+}
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 
 static inline int pmd_large(pmd_t pmd)

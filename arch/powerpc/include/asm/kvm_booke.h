@@ -54,12 +54,12 @@ static inline u32 kvmppc_get_cr(struct kvm_vcpu *vcpu)
 	return vcpu->arch.cr;
 }
 
-static inline void kvmppc_set_xer(struct kvm_vcpu *vcpu, u32 val)
+static inline void kvmppc_set_xer(struct kvm_vcpu *vcpu, ulong val)
 {
 	vcpu->arch.xer = val;
 }
 
-static inline u32 kvmppc_get_xer(struct kvm_vcpu *vcpu)
+static inline ulong kvmppc_get_xer(struct kvm_vcpu *vcpu)
 {
 	return vcpu->arch.xer;
 }
@@ -98,6 +98,11 @@ static inline void kvmppc_set_pc(struct kvm_vcpu *vcpu, ulong val)
 static inline ulong kvmppc_get_pc(struct kvm_vcpu *vcpu)
 {
 	return vcpu->arch.pc;
+}
+
+static inline bool kvmppc_is_bigendian(struct kvm_vcpu *vcpu)
+{
+	return 1;
 }
 
 static inline ulong kvmppc_get_fault_dar(struct kvm_vcpu *vcpu)

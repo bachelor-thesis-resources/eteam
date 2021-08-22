@@ -64,7 +64,6 @@ END_FTR_SECTION(0, 1);						\
 	OPAL_BRANCH(opal_tracepoint_entry) \
 	mfcr	r12;			\
 	stw	r12,8(r1);		\
-	std	r1,PACAR1(r13);		\
 	li	r11,0;			\
 	mfmsr	r12;			\
 	ori	r11,r11,MSR_EE;		\
@@ -127,7 +126,6 @@ opal_tracepoint_entry:
 	mfcr	r12
 	std	r11,16(r1)
 	stw	r12,8(r1)
-	std	r1,PACAR1(r13)
 	li	r11,0
 	mfmsr	r12
 	ori	r11,r11,MSR_EE
@@ -148,7 +146,7 @@ opal_tracepoint_entry:
 opal_tracepoint_return:
 	std	r3,STK_REG(R31)(r1)
 	mr	r4,r3
-	ld	r0,STK_REG(R23)(r1)
+	ld	r3,STK_REG(R23)(r1)
 	bl	__trace_opal_exit
 	ld	r3,STK_REG(R31)(r1)
 	addi	r1,r1,STACKFRAMESIZE
@@ -202,6 +200,7 @@ OPAL_CALL(opal_rtc_read,			OPAL_RTC_READ);
 OPAL_CALL(opal_rtc_write,			OPAL_RTC_WRITE);
 OPAL_CALL(opal_cec_power_down,			OPAL_CEC_POWER_DOWN);
 OPAL_CALL(opal_cec_reboot,			OPAL_CEC_REBOOT);
+OPAL_CALL(opal_cec_reboot2,			OPAL_CEC_REBOOT2);
 OPAL_CALL(opal_read_nvram,			OPAL_READ_NVRAM);
 OPAL_CALL(opal_write_nvram,			OPAL_WRITE_NVRAM);
 OPAL_CALL(opal_handle_interrupt,		OPAL_HANDLE_INTERRUPT);
@@ -249,6 +248,7 @@ OPAL_CALL(opal_pci_reinit,			OPAL_PCI_REINIT);
 OPAL_CALL(opal_pci_mask_pe_error,		OPAL_PCI_MASK_PE_ERROR);
 OPAL_CALL(opal_set_slot_led_status,		OPAL_SET_SLOT_LED_STATUS);
 OPAL_CALL(opal_get_epow_status,			OPAL_GET_EPOW_STATUS);
+OPAL_CALL(opal_get_dpo_status,			OPAL_GET_DPO_STATUS);
 OPAL_CALL(opal_set_system_attention_led,	OPAL_SET_SYSTEM_ATTENTION_LED);
 OPAL_CALL(opal_pci_next_error,			OPAL_PCI_NEXT_ERROR);
 OPAL_CALL(opal_pci_poll,			OPAL_PCI_POLL);
@@ -297,3 +297,6 @@ OPAL_CALL(opal_flash_read,			OPAL_FLASH_READ);
 OPAL_CALL(opal_flash_write,			OPAL_FLASH_WRITE);
 OPAL_CALL(opal_flash_erase,			OPAL_FLASH_ERASE);
 OPAL_CALL(opal_prd_msg,				OPAL_PRD_MSG);
+OPAL_CALL(opal_leds_get_ind,			OPAL_LEDS_GET_INDICATOR);
+OPAL_CALL(opal_leds_set_ind,			OPAL_LEDS_SET_INDICATOR);
+OPAL_CALL(opal_console_flush,			OPAL_CONSOLE_FLUSH);
