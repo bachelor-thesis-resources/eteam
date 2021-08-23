@@ -1,3 +1,52 @@
+Building the Kernel (Ubuntu-Way)
+
+  - Install dependencies:
+
+      apt update && apt dist-upgrade
+      apt install fakeroot build-essential crash kexec-tools makedumpfile\
+        kernel-wedge bison flex libelf-dev libncurses5 libncurses5-dev\
+        asciidoc binutils-dev libudev-dev libpci-dev libiberty-dev curl
+  
+  - Add sources repositories (if not already done by you):
+    
+      sed -Ei 's/^# deb-src /deb-src /' /etc/apt/sources.list
+  
+  - Get Linux Sources
+
+      apt-get source linux-image-4.4.0-209-generic
+  
+  - (git) clone this Kernel Repository into your working dir
+
+  - cd into recently cloned repository
+
+  - Set file permissions:
+    chmod -R a+x *
+  
+  - clean the repository (maybe)
+    
+    make mrproper
+    fakeroot debian/rules clean
+  
+  - Edit Configurations:
+
+    - Answer Yes (by hitting Enter) for each Question about configuring an specific 
+      architecture build
+
+    - A Curses-Menu will pop up in terminal
+    
+    - Navigate right (Right-Arrow), hit Enter (namely Exit) and Confirm the save-dialog
+    
+    - Repeat aforementioned bullet point for any question
+    
+    - Start the described configuration process by:
+      fakeroot debian/rules editconfigs
+
+  - Start the build:
+    
+    fakeroot debian/rules binary-headers binary-generic
+
+===============================================================================
+
         Linux kernel release 4.x <http://kernel.org/>
 
 These are the release notes for Linux version 4.  Read them carefully,
