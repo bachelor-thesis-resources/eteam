@@ -1,49 +1,65 @@
-Building the Kernel (Ubuntu-Way)
+                          Informations
 
-  - Install dependencies:
+  The applied patch of the Ubuntu Linux Kernel is based on the changes
+  made by Technical University Dresden, namely Operating System Group
+
+  Their repositories may be found on Github:
+
+  https://github.com/TUD-OS
+
+  The applied patch originates from the TU Dresden Repository eteam:
+
+  https://github.com/TUD-OS/eteam
+
+                  Building the Kernel (Ubuntu-Way)
+
+  1. INSTALL DEPENDENCIES:
 
       apt update && apt dist-upgrade
       apt install fakeroot build-essential crash kexec-tools makedumpfile\
         kernel-wedge bison flex libelf-dev libncurses5 libncurses5-dev\
         asciidoc binutils-dev libudev-dev libpci-dev libiberty-dev curl
   
-  - Add sources repositories (if not already done by you):
+  2. ADD SOURCES REPOSITORIES (if not already done by you):
     
       sed -Ei 's/^# deb-src /deb-src /' /etc/apt/sources.list
   
-  - Get Linux Sources
+  3. GET LINUX SOURCES
 
       apt-get source linux-image-4.4.0-209-generic
   
-  - (git) clone this Kernel Repository into your working dir
+  4. CLONE (GIT) THIS KERNEL REPOSITORY INTO YOUR WORKING DIR
 
-  - cd into recently cloned repository
+  5. CD INTO RECENTLY CLONED REPOSITORY
 
-  - Set file permissions:
-    chmod -R a+x *
-  
-  - clean the repository (maybe)
+  6. SET FILE PERMISSIONS
     
-    make mrproper
-    fakeroot debian/rules clean
+      chmod -R a+x *
   
-  - Edit Configurations:
+  7. CLEAN THE REPOSITORY (MAYBE)
 
-    - Answer Yes (by hitting Enter) for each Question about configuring an specific 
-      architecture build
+      make mrproper
+      fakeroot debian/rules clean
+  
+  8. Edit Configurations:
 
-    - A Curses-Menu will pop up in terminal
+    - Answer Yes (by hitting Enter) for each Question about configuring a 
+      specific architecture build
+
+    - A curses menu will pop up in terminal
     
-    - Navigate right (Right-Arrow), hit Enter (namely Exit) and Confirm the save-dialog
+    - Navigate right (Right-Arrow), hit Enter (namely Exit) and Confirm the 
+      save-dialog
     
     - Repeat aforementioned bullet point for any question
     
     - Start the described configuration process by:
-      fakeroot debian/rules editconfigs
+      
+        fakeroot debian/rules editconfigs
 
   - Start the build:
     
-    fakeroot debian/rules binary-headers binary-generic
+        fakeroot debian/rules binary-headers binary-generic
 
 ===============================================================================
 
