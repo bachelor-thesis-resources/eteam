@@ -7,7 +7,7 @@
 
   https://github.com/TUD-OS
 
-  The applied patch originates from the TU Dresden Repository eteam:
+  The applied patch originates from the TU Dresden Repository 'eteam':
 
   https://github.com/TUD-OS/eteam
 
@@ -16,8 +16,8 @@
   1. INSTALL DEPENDENCIES:
 
       apt update && apt dist-upgrade
-      apt install fakeroot build-essential crash kexec-tools makedumpfile\
-        kernel-wedge bison flex libelf-dev libncurses5 libncurses5-dev\
+      apt install fakeroot build-essential crash kexec-tools makedumpfile\ 
+        kernel-wedge bison flex libelf-dev libncurses5 libncurses5-dev\ 
         asciidoc binutils-dev libudev-dev libpci-dev libiberty-dev curl
   
   2. ADD SOURCES REPOSITORIES (if not already done by you):
