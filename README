@@ -41,7 +41,7 @@
       make mrproper
       fakeroot debian/rules clean
   
-  8. Edit Configurations:
+  8. EDIT CONFIGURATIONS:
 
     - Answer Yes (by hitting Enter) for each Question about configuring a 
       specific architecture build
@@ -57,7 +57,7 @@
       
         fakeroot debian/rules editconfigs
 
-  - Start the build:
+  9. START THE BUILD:
     
         fakeroot debian/rules binary-headers binary-generic
 
