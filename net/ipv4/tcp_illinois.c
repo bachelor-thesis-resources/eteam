@@ -6,7 +6,7 @@
  * The algorithm is described in:
  * "TCP-Illinois: A Loss and Delay-Based Congestion Control Algorithm
  *  for High-Speed Networks"
- * http://www.ifp.illinois.edu/~srikant/Papers/liubassri06perf.pdf
+ * http://tamerbasar.csl.illinois.edu/LiuBasarSrikantPerfEvalArtJun2008.pdf
  *
  * Implemented from description in paper and ns-2 simulation.
  * Copyright (C) 2007 Stephen Hemminger <shemminger@linux-foundation.org>
@@ -268,7 +268,7 @@ static void tcp_illinois_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 		return;
 
 	/* In slow start */
-	if (tp->snd_cwnd <= tp->snd_ssthresh)
+	if (tcp_in_slow_start(tp))
 		tcp_slow_start(tp, acked);
 
 	else {

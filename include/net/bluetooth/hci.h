@@ -44,6 +44,9 @@
 #define HCI_DEV_DOWN			4
 #define HCI_DEV_SUSPEND			5
 #define HCI_DEV_RESUME			6
+#define HCI_DEV_OPEN			7
+#define HCI_DEV_CLOSE			8
+#define HCI_DEV_SETUP			9
 
 /* HCI notify events */
 #define HCI_NOTIFY_CONN_ADD		1
@@ -168,6 +171,15 @@ enum {
 	 * during the hdev->setup vendor callback.
 	 */
 	HCI_QUIRK_SIMULTANEOUS_DISCOVERY,
+
+	/* When this quirk is set, the enabling of diagnostic mode is
+	 * not persistent over HCI Reset. Every time the controller
+	 * is brought up it needs to be reprogrammed.
+	 *
+	 * This quirk can be set before hci_register_dev is called or
+	 * during the hdev->setup vendor callback.
+	 */
+	HCI_QUIRK_NON_PERSISTENT_DIAG,
 };
 
 /* HCI device flags */
@@ -238,6 +250,7 @@ enum {
 	HCI_LE_SCAN_INTERRUPTED,
 
 	HCI_DUT_MODE,
+	HCI_VENDOR_DIAG,
 	HCI_FORCE_BREDR_SMP,
 	HCI_FORCE_STATIC_ADDR,
 
@@ -253,13 +266,14 @@ enum {
 #define HCI_AUTO_OFF_TIMEOUT	msecs_to_jiffies(2000)	/* 2 seconds */
 #define HCI_POWER_OFF_TIMEOUT	msecs_to_jiffies(5000)	/* 5 seconds */
 #define HCI_LE_CONN_TIMEOUT	msecs_to_jiffies(20000)	/* 20 seconds */
-#define HCI_LE_AUTOCONN_TIMEOUT	msecs_to_jiffies(2000)	/* 2 seconds */
+#define HCI_LE_AUTOCONN_TIMEOUT	msecs_to_jiffies(4000)	/* 4 seconds */
 
 /* HCI data types */
 #define HCI_COMMAND_PKT		0x01
 #define HCI_ACLDATA_PKT		0x02
 #define HCI_SCODATA_PKT		0x03
 #define HCI_EVENT_PKT		0x04
+#define HCI_DIAG_PKT		0xf0
 #define HCI_VENDOR_PKT		0xff
 
 /* HCI packet types */

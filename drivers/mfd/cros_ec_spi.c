@@ -660,6 +660,7 @@ static int cros_ec_spi_probe(struct spi_device *spi)
 			   sizeof(struct ec_response_get_protocol_info);
 	ec_dev->dout_size = sizeof(struct ec_host_request);
 
+	ec_spi->last_transfer_ns = ktime_get_ns();
 
 	err = cros_ec_register(ec_dev);
 	if (err) {
@@ -701,6 +702,12 @@ static int cros_ec_spi_resume(struct device *dev)
 static SIMPLE_DEV_PM_OPS(cros_ec_spi_pm_ops, cros_ec_spi_suspend,
 			 cros_ec_spi_resume);
 
+static const struct of_device_id cros_ec_spi_of_match[] = {
+	{ .compatible = "google,cros-ec-spi", },
+	{ /* sentinel */ },
+};
+MODULE_DEVICE_TABLE(of, cros_ec_spi_of_match);
+
 static const struct spi_device_id cros_ec_spi_id[] = {
 	{ "cros-ec-spi", 0 },
 	{ }
@@ -710,7 +717,7 @@ MODULE_DEVICE_TABLE(spi, cros_ec_spi_id);
 static struct spi_driver cros_ec_driver_spi = {
 	.driver	= {
 		.name	= "cros-ec-spi",
-		.owner	= THIS_MODULE,
+		.of_match_table = of_match_ptr(cros_ec_spi_of_match),
 		.pm	= &cros_ec_spi_pm_ops,
 	},
 	.probe		= cros_ec_spi_probe,

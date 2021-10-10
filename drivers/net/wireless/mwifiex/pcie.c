@@ -17,6 +17,7 @@
  * this warranty disclaimer.
  */
 
+#include <linux/dmi.h>
 #include <linux/firmware.h>
 
 #include "decl.h"
@@ -189,6 +190,8 @@ static int mwifiex_pcie_probe(struct pci_dev *pdev,
 					const struct pci_device_id *ent)
 {
 	struct pcie_service_card *card;
+	struct mwifiex_private *priv;
+	struct pci_dev *pdev_host;
 
 	pr_debug("info: vendor=0x%4.04X device=0x%4.04X rev=%d\n",
 		 pdev->vendor, pdev->device, pdev->revision);
@@ -216,6 +219,14 @@ static int mwifiex_pcie_probe(struct pci_dev *pdev,
 		return -1;
 	}
 
+	priv = mwifiex_get_priv(card->adapter, MWIFIEX_BSS_ROLE_STA);
+	pdev_host = pci_get_subsys(PCI_ANY_ID, PCI_ANY_ID, 0x1028, 0x0720, NULL);
+	if (!pdev_host)
+		pdev_host = pci_get_subsys(PCI_ANY_ID, PCI_ANY_ID, 0x1028, 0x0733, NULL);
+	if (pdev_host) {
+		priv->is_edge_gateway = true;
+		pci_dev_put(pdev_host);
+	}
 	return 0;
 }
 
@@ -266,12 +277,17 @@ static const struct pci_device_id mwifiex_ids[] = {
 	{
 		PCIE_VENDOR_ID_MARVELL, PCIE_DEVICE_ID_MARVELL_88W8766P,
 		PCI_ANY_ID, PCI_ANY_ID, 0, 0,
-		.driver_data = (unsigned long) &mwifiex_pcie8766,
+		.driver_data = (unsigned long)&mwifiex_pcie8766,
 	},
 	{
 		PCIE_VENDOR_ID_MARVELL, PCIE_DEVICE_ID_MARVELL_88W8897,
 		PCI_ANY_ID, PCI_ANY_ID, 0, 0,
-		.driver_data = (unsigned long) &mwifiex_pcie8897,
+		.driver_data = (unsigned long)&mwifiex_pcie8897,
+	},
+	{
+		PCIE_VENDOR_ID_MARVELL, PCIE_DEVICE_ID_MARVELL_88W8997,
+		PCI_ANY_ID, PCI_ANY_ID, 0, 0,
+		.driver_data = (unsigned long)&mwifiex_pcie8997,
 	},
 	{},
 };
@@ -572,8 +588,11 @@ static int mwifiex_pcie_init_evt_ring(struct mwifiex_adapter *adapter)
 		skb_put(skb, MAX_EVENT_SIZE);
 
 		if (mwifiex_map_pci_memory(adapter, skb, MAX_EVENT_SIZE,
-					   PCI_DMA_FROMDEVICE))
+					   PCI_DMA_FROMDEVICE)) {
+			kfree_skb(skb);
+			kfree(card->evtbd_ring_vbase);
 			return -1;
+		}
 
 		buf_pa = MWIFIEX_SKB_DMA_ADDR(skb);
 
@@ -913,8 +932,10 @@ static int mwifiex_pcie_alloc_cmdrsp_buf(struct mwifiex_adapter *adapter)
 	}
 	skb_put(skb, MWIFIEX_UPLD_SIZE);
 	if (mwifiex_map_pci_memory(adapter, skb, MWIFIEX_UPLD_SIZE,
-				   PCI_DMA_FROMDEVICE))
+				   PCI_DMA_FROMDEVICE)) {
+		kfree_skb(skb);
 		return -1;
+	}
 
 	card->cmdrsp_buf = skb;
 
@@ -942,6 +963,7 @@ static int mwifiex_pcie_delete_cmdrsp_buf(struct mwifiex_adapter *adapter)
 	if (card && card->cmd_buf) {
 		mwifiex_unmap_pci_memory(adapter, card->cmd_buf,
 					 PCI_DMA_TODEVICE);
+		dev_kfree_skb_any(card->cmd_buf);
 	}
 	return 0;
 }
@@ -1082,6 +1104,7 @@ static int mwifiex_pcie_send_data_complete(struct mwifiex_adapter *adapter)
 			card->txbd_rdptr++;
 			break;
 		case PCIE_DEVICE_ID_MARVELL_88W8897:
+		case PCIE_DEVICE_ID_MARVELL_88W8997:
 			card->txbd_rdptr += reg->ring_tx_start_ptr;
 			break;
 		}
@@ -1179,6 +1202,7 @@ mwifiex_pcie_send_data(struct mwifiex_adapter *adapter, struct sk_buff *skb,
 			card->txbd_wrptr++;
 			break;
 		case PCIE_DEVICE_ID_MARVELL_88W8897:
+		case PCIE_DEVICE_ID_MARVELL_88W8997:
 			card->txbd_wrptr += reg->ring_tx_start_ptr;
 			break;
 		}
@@ -1506,6 +1530,11 @@ mwifiex_pcie_send_cmd(struct mwifiex_adapter *adapter, struct sk_buff *skb)
 		return -1;
 
 	card->cmd_buf = skb;
+	/*
+	 * Need to keep a reference, since core driver might free up this
+	 * buffer before we've unmapped it.
+	 */
+	skb_get(skb);
 
 	/* To send a command, the driver will:
 		1. Write the 64bit physical address of the data buffer to
@@ -1603,6 +1632,7 @@ static int mwifiex_pcie_process_cmd_complete(struct mwifiex_adapter *adapter)
 	if (card->cmd_buf) {
 		mwifiex_unmap_pci_memory(adapter, card->cmd_buf,
 					 PCI_DMA_TODEVICE);
+		dev_kfree_skb_any(card->cmd_buf);
 		card->cmd_buf = NULL;
 	}
 
@@ -1807,6 +1837,7 @@ static int mwifiex_pcie_event_complete(struct mwifiex_adapter *adapter,
 
 	if (!card->evt_buf_list[rdptr]) {
 		skb_push(skb, INTF_HEADER_LEN);
+		skb_put(skb, MAX_EVENT_SIZE - skb->len);
 		if (mwifiex_map_pci_memory(adapter, skb,
 					   MAX_EVENT_SIZE,
 					   PCI_DMA_FROMDEVICE))
@@ -2731,3 +2762,4 @@ MODULE_VERSION(PCIE_VERSION);
 MODULE_LICENSE("GPL v2");
 MODULE_FIRMWARE(PCIE8766_DEFAULT_FW_NAME);
 MODULE_FIRMWARE(PCIE8897_DEFAULT_FW_NAME);
+MODULE_FIRMWARE(PCIE8997_DEFAULT_FW_NAME);

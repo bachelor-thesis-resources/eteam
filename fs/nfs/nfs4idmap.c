@@ -184,7 +184,7 @@ static struct key_type key_type_id_resolver = {
 	.read		= user_read,
 };
 
-static int nfs_idmap_init_keyring(void)
+int nfs_idmap_init(void)
 {
 	struct cred *cred;
 	struct key *keyring;
@@ -230,7 +230,7 @@ failed_put_cred:
 	return ret;
 }
 
-static void nfs_idmap_quit_keyring(void)
+void nfs_idmap_quit(void)
 {
 	key_revoke(id_resolver_cache->thread_keyring);
 	unregister_key_type(&key_type_id_resolver);
@@ -297,7 +297,7 @@ static ssize_t nfs_idmap_get_key(const char *name, size_t namelen,
 {
 	const struct cred *saved_cred;
 	struct key *rkey;
-	struct user_key_payload *payload;
+	const struct user_key_payload *payload;
 	ssize_t ret;
 
 	saved_cred = override_creds(id_resolver_cache);
@@ -316,7 +316,7 @@ static ssize_t nfs_idmap_get_key(const char *name, size_t namelen,
 	if (ret < 0)
 		goto out_up;
 
-	payload = rcu_dereference(rkey->payload.rcudata);
+	payload = user_key_payload(rkey);
 	if (IS_ERR_OR_NULL(payload)) {
 		ret = PTR_ERR(payload);
 		goto out_up;
@@ -343,7 +343,7 @@ static ssize_t nfs_idmap_lookup_name(__u32 id, const char *type, char *buf,
 	int id_len;
 	ssize_t ret;
 
-	id_len = snprintf(id_str, sizeof(id_str), "%u", id);
+	id_len = nfs_map_numeric_to_string(id, id_str, sizeof(id_str));
 	ret = nfs_idmap_get_key(id_str, id_len, type, buf, buflen, idmap);
 	if (ret < 0)
 		return -EINVAL;
@@ -492,16 +492,6 @@ nfs_idmap_delete(struct nfs_client *clp)
 	kfree(idmap);
 }
 
-int nfs_idmap_init(void)
-{
-	return nfs_idmap_init_keyring();
-}
-
-void nfs_idmap_quit(void)
-{
-	nfs_idmap_quit_keyring();
-}
-
 static int nfs_idmap_prepare_message(char *desc, struct idmap *idmap,
 				     struct idmap_msg *im,
 				     struct rpc_pipe_msg *msg)
@@ -577,9 +567,13 @@ static int nfs_idmap_legacy_upcall(struct key_construction *cons,
 	struct idmap_msg *im;
 	struct idmap *idmap = (struct idmap *)aux;
 	struct key *key = cons->key;
-	int ret = -ENOMEM;
+	int ret = -ENOKEY;
+
+	if (!aux)
+		goto out1;
 
 	/* msg and im are freed in idmap_pipe_destroy_msg */
+	ret = -ENOMEM;
 	data = kzalloc(sizeof(*data), GFP_KERNEL);
 	if (!data)
 		goto out1;
@@ -632,7 +626,8 @@ static int nfs_idmap_read_and_verify_message(struct idmap_msg *im,
 		if (strcmp(upcall->im_name, im->im_name) != 0)
 			break;
 		/* Note: here we store the NUL terminator too */
-		len = sprintf(id_str, "%d", im->im_id) + 1;
+		len = 1 + nfs_map_numeric_to_string(im->im_id, id_str,
+						    sizeof(id_str));
 		ret = nfs_idmap_instantiate(key, authkey, id_str, len);
 		break;
 	case IDMAP_CONV_IDTONAME:

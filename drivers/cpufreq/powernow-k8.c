@@ -795,7 +795,7 @@ err_out_mem:
 	kfree(powernow_table);
 
 err_out:
-	acpi_processor_unregister_performance(&data->acpi_data, data->cpu);
+	acpi_processor_unregister_performance(data->cpu);
 
 	/* data->acpi_data.state_count informs us at ->exit()
 	 * whether ACPI was used */
@@ -863,8 +863,7 @@ static int fill_powernow_table_fidvid(struct powernow_k8_data *data,
 static void powernow_k8_cpu_exit_acpi(struct powernow_k8_data *data)
 {
 	if (data->acpi_data.state_count)
-		acpi_processor_unregister_performance(&data->acpi_data,
-				data->cpu);
+		acpi_processor_unregister_performance(data->cpu);
 	free_cpumask_var(data->acpi_data.shared_cpu_map);
 }
 
@@ -888,9 +887,9 @@ static int get_transition_latency(struct powernow_k8_data *data)
 
 /* Take a frequency, and issue the fid/vid transition command */
 static int transition_frequency_fidvid(struct powernow_k8_data *data,
-		unsigned int index)
+		unsigned int index,
+		struct cpufreq_policy *policy)
 {
-	struct cpufreq_policy *policy;
 	u32 fid = 0;
 	u32 vid = 0;
 	int res;
@@ -921,9 +920,6 @@ static int transition_frequency_fidvid(struct powernow_k8_data *data,
 		smp_processor_id(), fid, vid);
 	freqs.old = find_khz_freq_from_fid(data->currfid);
 	freqs.new = find_khz_freq_from_fid(fid);
-
-	policy = cpufreq_cpu_get(smp_processor_id());
-	cpufreq_cpu_put(policy);
 
 	cpufreq_freq_transition_begin(policy, &freqs);
 	res = transition_fid_vid(data, fid, vid);
@@ -979,7 +975,7 @@ static long powernowk8_target_fn(void *arg)
 
 	powernow_k8_acpi_pst_values(data, newstate);
 
-	ret = transition_frequency_fidvid(data, newstate);
+	ret = transition_frequency_fidvid(data, newstate, pol);
 
 	if (ret) {
 		pr_err("transition frequency failed\n");

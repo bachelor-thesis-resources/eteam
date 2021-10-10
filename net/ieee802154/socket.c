@@ -273,7 +273,7 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 		goto out;
 	}
 
-	mtu = dev->mtu;
+	mtu = IEEE802154_MTU;
 	pr_debug("name = %s, mtu = %u\n", dev->name, mtu);
 
 	if (size > mtu) {
@@ -302,11 +302,11 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	skb->sk  = sk;
 	skb->protocol = htons(ETH_P_IEEE802154);
 
-	dev_put(dev);
-
 	err = dev_queue_xmit(skb);
 	if (err > 0)
 		err = net_xmit_errno(err);
+
+	dev_put(dev);
 
 	return err ?: size;
 
@@ -637,7 +637,7 @@ static int dgram_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 		err = -ENXIO;
 		goto out;
 	}
-	mtu = dev->mtu;
+	mtu = IEEE802154_MTU;
 	pr_debug("name = %s, mtu = %u\n", dev->name, mtu);
 
 	if (size > mtu) {
@@ -676,8 +676,8 @@ static int dgram_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	cb->seclevel = ro->seclevel;
 	cb->seclevel_override = ro->seclevel_override;
 
-	err = dev_hard_header(skb, dev, ETH_P_IEEE802154, &dst_addr,
-			      ro->bound ? &ro->src_addr : NULL, size);
+	err = wpan_dev_hard_header(skb, dev, &dst_addr,
+				   ro->bound ? &ro->src_addr : NULL, size);
 	if (err < 0)
 		goto out_skb;
 
@@ -689,11 +689,11 @@ static int dgram_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	skb->sk  = sk;
 	skb->protocol = htons(ETH_P_IEEE802154);
 
-	dev_put(dev);
-
 	err = dev_queue_xmit(skb);
 	if (err > 0)
 		err = net_xmit_errno(err);
+
+	dev_put(dev);
 
 	return err ?: size;
 
@@ -999,6 +999,9 @@ static int ieee802154_create(struct net *net, struct socket *sock,
 
 	switch (sock->type) {
 	case SOCK_RAW:
+		rc = -EPERM;
+		if (!capable(CAP_NET_RAW))
+			goto out;
 		proto = &ieee802154_raw_prot;
 		ops = &ieee802154_raw_ops;
 		break;

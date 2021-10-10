@@ -125,13 +125,10 @@ xfs_attr_get(
 	uint			lock_mode;
 	int			error;
 
-	XFS_STATS_INC(xs_attr_get);
+	XFS_STATS_INC(ip->i_mount, xs_attr_get);
 
 	if (XFS_FORCED_SHUTDOWN(ip->i_mount))
 		return -EIO;
-
-	if (!xfs_inode_hasattr(ip))
-		return -ENOATTR;
 
 	error = xfs_attr_args_init(&args, ip, name, flags);
 	if (error)
@@ -139,6 +136,8 @@ xfs_attr_get(
 
 	args.value = value;
 	args.valuelen = *valuelenp;
+	/* Entirely possible to look up a name which doesn't exist */
+	args.op_flags = XFS_DA_OP_OKNOENT;
 
 	lock_mode = xfs_ilock_attr_map_shared(ip);
 	if (!xfs_inode_hasattr(ip))
@@ -207,7 +206,7 @@ xfs_attr_set(
 	int			rsvd = (flags & ATTR_ROOT) != 0;
 	int			error, err2, committed, local;
 
-	XFS_STATS_INC(xs_attr_set);
+	XFS_STATS_INC(mp, xs_attr_set);
 
 	if (XFS_FORCED_SHUTDOWN(dp->i_mount))
 		return -EIO;
@@ -410,13 +409,10 @@ xfs_attr_remove(
 	xfs_fsblock_t		firstblock;
 	int			error;
 
-	XFS_STATS_INC(xs_attr_remove);
+	XFS_STATS_INC(mp, xs_attr_remove);
 
 	if (XFS_FORCED_SHUTDOWN(dp->i_mount))
 		return -EIO;
-
-	if (!xfs_inode_hasattr(dp))
-		return -ENOATTR;
 
 	error = xfs_attr_args_init(&args, dp, name, flags);
 	if (error)
@@ -532,7 +528,14 @@ xfs_attr_shortform_addname(xfs_da_args_t *args)
 		if (args->flags & ATTR_CREATE)
 			return retval;
 		retval = xfs_attr_shortform_remove(args);
-		ASSERT(retval == 0);
+		if (retval)
+			return retval;
+		/*
+		 * Since we have removed the old attr, clear ATTR_REPLACE so
+		 * that the leaf format add routine won't trip over the attr
+		 * not being around.
+		 */
+		args->flags &= ~ATTR_REPLACE;
 	}
 
 	if (args->namelen >= XFS_ATTR_SF_ENTSIZE_MAX ||

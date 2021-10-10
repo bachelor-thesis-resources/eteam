@@ -276,7 +276,7 @@ static int elan_i2c_get_sm_version(struct i2c_client *client,
 	return 0;
 }
 
-static int elan_i2c_get_product_id(struct i2c_client *client, u8 *id)
+static int elan_i2c_get_product_id(struct i2c_client *client, u16 *id)
 {
 	int error;
 	u8 val[3];
@@ -287,7 +287,7 @@ static int elan_i2c_get_product_id(struct i2c_client *client, u8 *id)
 		return error;
 	}
 
-	*id = val[0];
+	*id = le16_to_cpup((__le16 *)val);
 	return 0;
 }
 
@@ -557,7 +557,14 @@ static int elan_i2c_finish_fw_update(struct i2c_client *client,
 	long ret;
 	int error;
 	int len;
-	u8 buffer[ETP_I2C_INF_LENGTH];
+	u8 buffer[ETP_I2C_REPORT_LEN];
+
+	len = i2c_master_recv(client, buffer, ETP_I2C_REPORT_LEN);
+	if (len != ETP_I2C_REPORT_LEN) {
+		error = len < 0 ? len : -EIO;
+		dev_warn(dev, "failed to read I2C data after FW WDT reset: %d (%d)\n",
+			error, len);
+	}
 
 	reinit_completion(completion);
 	enable_irq(client->irq);

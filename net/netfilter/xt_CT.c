@@ -168,8 +168,13 @@ xt_ct_set_timeout(struct nf_conn *ct, const struct xt_tgchk_param *par,
 		goto err_put_timeout;
 	}
 	timeout_ext = nf_ct_timeout_ext_add(ct, timeout, GFP_ATOMIC);
-	if (timeout_ext == NULL)
+	if (!timeout_ext) {
 		ret = -ENOMEM;
+		goto err_put_timeout;
+	}
+
+	rcu_read_unlock();
+	return ret;
 
 err_put_timeout:
 	__xt_ct_tg_timeout_put(timeout);
@@ -181,9 +186,24 @@ out:
 #endif
 }
 
+static u16 xt_ct_flags_to_dir(const struct xt_ct_target_info_v1 *info)
+{
+	switch (info->flags & (XT_CT_ZONE_DIR_ORIG |
+			       XT_CT_ZONE_DIR_REPL)) {
+	case XT_CT_ZONE_DIR_ORIG:
+		return NF_CT_ZONE_DIR_ORIG;
+	case XT_CT_ZONE_DIR_REPL:
+		return NF_CT_ZONE_DIR_REPL;
+	default:
+		return NF_CT_DEFAULT_ZONE_DIR;
+	}
+}
+
 static int xt_ct_tg_check(const struct xt_tgchk_param *par,
 			  struct xt_ct_target_info_v1 *info)
 {
+	struct nf_conntrack_zone zone;
+	struct nf_conn_help *help;
 	struct nf_conn *ct;
 	int ret = -EOPNOTSUPP;
 
@@ -193,7 +213,9 @@ static int xt_ct_tg_check(const struct xt_tgchk_param *par,
 	}
 
 #ifndef CONFIG_NF_CONNTRACK_ZONES
-	if (info->zone)
+	if (info->zone || info->flags & (XT_CT_ZONE_DIR_ORIG |
+					 XT_CT_ZONE_DIR_REPL |
+					 XT_CT_ZONE_MARK))
 		goto err1;
 #endif
 
@@ -201,7 +223,13 @@ static int xt_ct_tg_check(const struct xt_tgchk_param *par,
 	if (ret < 0)
 		goto err1;
 
-	ct = nf_ct_tmpl_alloc(par->net, info->zone, GFP_KERNEL);
+	memset(&zone, 0, sizeof(zone));
+	zone.id = info->zone;
+	zone.dir = xt_ct_flags_to_dir(info);
+	if (info->flags & XT_CT_ZONE_MARK)
+		zone.flags |= NF_CT_FLAG_MARK;
+
+	ct = nf_ct_tmpl_alloc(par->net, &zone, GFP_KERNEL);
 	if (!ct) {
 		ret = -ENOMEM;
 		goto err2;
@@ -224,7 +252,7 @@ static int xt_ct_tg_check(const struct xt_tgchk_param *par,
 	if (info->timeout[0]) {
 		ret = xt_ct_set_timeout(ct, par, info->timeout);
 		if (ret < 0)
-			goto err3;
+			goto err4;
 	}
 	__set_bit(IPS_CONFIRMED_BIT, &ct->status);
 	nf_conntrack_get(&ct->ct_general);
@@ -232,8 +260,12 @@ out:
 	info->ct = ct;
 	return 0;
 
+err4:
+	help = nfct_help(ct);
+	if (help)
+		module_put(help->helper->me);
 err3:
-	nf_conntrack_free(ct);
+	nf_ct_tmpl_free(ct);
 err2:
 	nf_ct_l3proto_module_put(par->family);
 err1:
@@ -296,8 +328,10 @@ static void xt_ct_destroy_timeout(struct nf_conn *ct)
 
 	if (timeout_put) {
 		timeout_ext = nf_ct_timeout_find(ct);
-		if (timeout_ext)
+		if (timeout_ext) {
 			timeout_put(timeout_ext->timeout);
+			RCU_INIT_POINTER(timeout_ext->timeout, NULL);
+		}
 	}
 	rcu_read_unlock();
 #endif

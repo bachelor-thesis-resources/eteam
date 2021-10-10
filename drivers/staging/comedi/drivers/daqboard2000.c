@@ -636,7 +636,7 @@ static const void *daqboard2000_find_boardinfo(struct comedi_device *dev,
 	const struct daq200_boardtype *board;
 	int i;
 
-	if (pcidev->subsystem_device != PCI_VENDOR_ID_IOTECH)
+	if (pcidev->subsystem_vendor != PCI_VENDOR_ID_IOTECH)
 		return NULL;
 
 	for (i = 0; i < ARRAY_SIZE(boardtypes); i++) {
@@ -713,12 +713,8 @@ static int daqboard2000_auto_attach(struct comedi_device *dev,
 		return result;
 
 	s = &dev->subdevices[2];
-	result = subdev_8255_init(dev, s, daqboard2000_8255_cb,
-				  dioP2ExpansionIO8Bit);
-	if (result)
-		return result;
-
-	return 0;
+	return subdev_8255_init(dev, s, daqboard2000_8255_cb,
+				dioP2ExpansionIO8Bit);
 }
 
 static void daqboard2000_detach(struct comedi_device *dev)

@@ -1114,7 +1114,8 @@ int cx231xx_enum_input(struct file *file, void *priv,
 	struct cx231xx_fh *fh = priv;
 	struct cx231xx *dev = fh->dev;
 	u32 gen_stat;
-	unsigned int ret, n;
+	unsigned int n;
+	int ret;
 
 	n = i->index;
 	if (n >= MAX_CX231XX_INPUT)
@@ -1345,7 +1346,7 @@ int cx231xx_g_register(struct file *file, void *priv,
 		ret = cx231xx_read_ctrl_reg(dev, VRT_GET_REGISTER,
 				(u16)reg->reg, value, 4);
 		reg->val = value[0] | value[1] << 8 |
-			value[2] << 16 | value[3] << 24;
+			value[2] << 16 | (u32)value[3] << 24;
 		reg->size = 4;
 		break;
 	case 1:	/* AFE - read byte */
@@ -1875,7 +1876,7 @@ static int cx231xx_close(struct file *filp)
 			v4l2_fh_exit(&fh->fh);
 			kfree(fh);
 			dev->users--;
-			wake_up_interruptible_nr(&dev->open, 1);
+			wake_up_interruptible(&dev->open);
 			return 0;
 		}
 
@@ -1908,7 +1909,7 @@ static int cx231xx_close(struct file *filp)
 	}
 	v4l2_fh_exit(&fh->fh);
 	kfree(fh);
-	wake_up_interruptible_nr(&dev->open, 1);
+	wake_up_interruptible(&dev->open);
 	return 0;
 }
 

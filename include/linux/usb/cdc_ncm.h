@@ -82,6 +82,7 @@
 
 /* Driver flags */
 #define CDC_NCM_FLAG_NDP_TO_END	0x02		/* NDP is placed at end of frame */
+#define CDC_NCM_FLAG_RESET_NTB16 0x08	/* set NDP16 one more time after altsetting switch */
 
 #define cdc_ncm_comm_intf_is_mbim(x)  ((x)->desc.bInterfaceSubClass == USB_CDC_SUBCLASS_MBIM && \
 				       (x)->desc.bInterfaceProtocol == USB_CDC_PROTO_NONE)
@@ -138,6 +139,7 @@ struct cdc_ncm_ctx {
 };
 
 u8 cdc_ncm_select_altsetting(struct usb_interface *intf);
+int cdc_ncm_change_mtu(struct net_device *net, int new_mtu);
 int cdc_ncm_bind_common(struct usbnet *dev, struct usb_interface *intf, u8 data_altsetting, int drvflags);
 void cdc_ncm_unbind(struct usbnet *dev, struct usb_interface *intf);
 struct sk_buff *cdc_ncm_fill_tx_frame(struct usbnet *dev, struct sk_buff *skb, __le32 sign);

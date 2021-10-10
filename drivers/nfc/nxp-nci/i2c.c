@@ -36,7 +36,7 @@
 #include <linux/of_gpio.h>
 #include <linux/of_irq.h>
 #include <linux/platform_data/nxp-nci.h>
-#include <linux/unaligned/access_ok.h>
+#include <asm/unaligned.h>
 
 #include <net/nfc/nfc.h>
 
@@ -106,7 +106,7 @@ static int nxp_nci_i2c_write(void *phy_id, struct sk_buff *skb)
 	return r;
 }
 
-static struct nxp_nci_phy_ops i2c_phy_ops = {
+static const struct nxp_nci_phy_ops i2c_phy_ops = {
 	.set_mode = nxp_nci_i2c_set_mode,
 	.write = nxp_nci_i2c_write,
 };
@@ -239,8 +239,10 @@ static irqreturn_t nxp_nci_i2c_irq_thread_fn(int irq, void *phy_id)
 
 	if (r == -EREMOTEIO) {
 		phy->hard_fault = r;
-		skb = NULL;
-	} else if (r < 0) {
+		if (info->mode == NXP_NCI_MODE_FW)
+			nxp_nci_fw_recv_frame(phy->ndev, NULL);
+	}
+	if (r < 0) {
 		nfc_err(&client->dev, "Read failed with error %d\n", r);
 		goto exit_irq_handled;
 	}
@@ -318,18 +320,14 @@ static int nxp_nci_i2c_acpi_config(struct nxp_nci_i2c_phy *phy)
 	struct i2c_client *client = phy->i2c_dev;
 	struct gpio_desc *gpiod_en, *gpiod_fw, *gpiod_irq;
 
-	gpiod_en = devm_gpiod_get_index(&client->dev, NULL, 2);
-	gpiod_fw = devm_gpiod_get_index(&client->dev, NULL, 1);
-	gpiod_irq = devm_gpiod_get_index(&client->dev, NULL, 0);
+	gpiod_en = devm_gpiod_get_index(&client->dev, NULL, 2, GPIOD_OUT_LOW);
+	gpiod_fw = devm_gpiod_get_index(&client->dev, NULL, 1, GPIOD_OUT_LOW);
+	gpiod_irq = devm_gpiod_get_index(&client->dev, NULL, 0, GPIOD_IN);
 
 	if (IS_ERR(gpiod_en) || IS_ERR(gpiod_fw) || IS_ERR(gpiod_irq)) {
 		nfc_err(&client->dev, "No GPIOs\n");
 		return -EINVAL;
 	}
-
-	gpiod_direction_output(gpiod_en, 0);
-	gpiod_direction_output(gpiod_fw, 0);
-	gpiod_direction_input(gpiod_irq);
 
 	client->irq = gpiod_to_irq(gpiod_irq);
 	if (client->irq < 0) {

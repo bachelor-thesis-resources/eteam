@@ -214,7 +214,13 @@ static int hvc_opal_probe(struct platform_device *dev)
 		dev->dev.of_node->full_name,
 		boot ? " (boot console)" : "");
 
-	irq = opal_event_request(ilog2(OPAL_EVENT_CONSOLE_INPUT));
+	irq = irq_of_parse_and_map(dev->dev.of_node, 0);
+	if (!irq) {
+		pr_info("hvc%d: No interrupts property, using OPAL event\n",
+				termno);
+		irq = opal_event_request(ilog2(OPAL_EVENT_CONSOLE_INPUT));
+	}
+
 	if (!irq) {
 		pr_err("hvc_opal: Unable to map interrupt for device %s\n",
 			dev->dev.of_node->full_name);
@@ -224,6 +230,9 @@ static int hvc_opal_probe(struct platform_device *dev)
 	hp = hvc_alloc(termno, irq, ops, MAX_VIO_PUT_CHARS);
 	if (IS_ERR(hp))
 		return PTR_ERR(hp);
+
+	/* hvc consoles on powernv may need to share a single irq */
+	hp->flags = IRQF_SHARED;
 	dev_set_drvdata(&dev->dev, hp);
 
 	return 0;
@@ -323,7 +332,6 @@ static void udbg_init_opal_common(void)
 	udbg_putc = udbg_opal_putc;
 	udbg_getc = udbg_opal_getc;
 	udbg_getc_poll = udbg_opal_getc_poll;
-	tb_ticks_per_usec = 0x200; /* Make udelay not suck */
 }
 
 void __init hvc_opal_init_early(void)

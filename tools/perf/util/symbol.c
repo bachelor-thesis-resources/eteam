@@ -56,6 +56,7 @@ static enum dso_binary_type binary_type_symtab[] = {
 	DSO_BINARY_TYPE__SYSTEM_PATH_KMODULE,
 	DSO_BINARY_TYPE__SYSTEM_PATH_KMODULE_COMP,
 	DSO_BINARY_TYPE__OPENEMBEDDED_DEBUGINFO,
+	DSO_BINARY_TYPE__MIXEDUP_UBUNTU_DEBUGINFO,
 	DSO_BINARY_TYPE__NOT_FOUND,
 };
 
@@ -151,6 +152,9 @@ void symbols__fixup_duplicate(struct rb_root *symbols)
 	struct rb_node *nd;
 	struct symbol *curr, *next;
 
+	if (symbol_conf.allow_aliases)
+		return;
+
 	nd = rb_first(symbols);
 
 	while (nd) {
@@ -197,7 +201,7 @@ void symbols__fixup_end(struct rb_root *symbols)
 
 	/* Last entry */
 	if (curr->end == curr->start)
-		curr->end = roundup(curr->start, 4096);
+		curr->end = roundup(curr->start, 4096) + 4096;
 }
 
 void __map_groups__fixup_end(struct map_groups *mg, enum map_type type)
@@ -441,10 +445,25 @@ static struct symbol *symbols__find_by_name(struct rb_root *symbols,
 	return &s->sym;
 }
 
+void dso__reset_find_symbol_cache(struct dso *dso)
+{
+	enum map_type type;
+
+	for (type = MAP__FUNCTION; type <= MAP__VARIABLE; ++type) {
+		dso->last_find_result[type].addr   = 0;
+		dso->last_find_result[type].symbol = NULL;
+	}
+}
+
 struct symbol *dso__find_symbol(struct dso *dso,
 				enum map_type type, u64 addr)
 {
-	return symbols__find(&dso->symbols[type], addr);
+	if (dso->last_find_result[type].addr != addr) {
+		dso->last_find_result[type].addr   = addr;
+		dso->last_find_result[type].symbol = symbols__find(&dso->symbols[type], addr);
+	}
+
+	return dso->last_find_result[type].symbol;
 }
 
 struct symbol *dso__first_symbol(struct dso *dso, enum map_type type)
@@ -609,7 +628,7 @@ static int map__process_kallsym_symbol(void *arg, const char *name,
 	 * symbols, setting length to 0, and rely on
 	 * symbols__fixup_end() to fix it up.
 	 */
-	sym = symbol__new(start, 0, kallsyms2elf_type(type), name);
+	sym = symbol__new(start, 0, kallsyms2elf_binding(type), name);
 	if (sym == NULL)
 		return -ENOMEM;
 	/*
@@ -639,18 +658,23 @@ static int dso__split_kallsyms_for_kcore(struct dso *dso, struct map *map,
 	struct map_groups *kmaps = map__kmaps(map);
 	struct map *curr_map;
 	struct symbol *pos;
-	int count = 0, moved = 0;
+	int count = 0;
+	struct rb_root old_root = dso->symbols[map->type];
 	struct rb_root *root = &dso->symbols[map->type];
 	struct rb_node *next = rb_first(root);
 
 	if (!kmaps)
 		return -1;
 
+	*root = RB_ROOT;
+
 	while (next) {
 		char *module;
 
 		pos = rb_entry(next, struct symbol, rb_node);
 		next = rb_next(&pos->rb_node);
+
+		rb_erase_init(&pos->rb_node, &old_root);
 
 		module = strchr(pos->name, '\t');
 		if (module)
@@ -659,28 +683,21 @@ static int dso__split_kallsyms_for_kcore(struct dso *dso, struct map *map,
 		curr_map = map_groups__find(kmaps, map->type, pos->start);
 
 		if (!curr_map || (filter && filter(curr_map, pos))) {
-			rb_erase_init(&pos->rb_node, root);
 			symbol__delete(pos);
-		} else {
-			pos->start -= curr_map->start - curr_map->pgoff;
-			if (pos->end)
-				pos->end -= curr_map->start - curr_map->pgoff;
-			if (curr_map != map) {
-				rb_erase_init(&pos->rb_node, root);
-				symbols__insert(
-					&curr_map->dso->symbols[curr_map->type],
-					pos);
-				++moved;
-			} else {
-				++count;
-			}
+			continue;
 		}
+
+		pos->start -= curr_map->start - curr_map->pgoff;
+		if (pos->end)
+			pos->end -= curr_map->start - curr_map->pgoff;
+		symbols__insert(&curr_map->dso->symbols[curr_map->type], pos);
+		++count;
 	}
 
 	/* Symbols have been adjusted */
 	dso->adjust_symbols = 1;
 
-	return count + moved;
+	return count;
 }
 
 /*
@@ -1133,8 +1150,8 @@ static int dso__load_kcore(struct dso *dso, struct map *map,
 
 	fd = open(kcore_filename, O_RDONLY);
 	if (fd < 0) {
-		pr_err("%s requires CAP_SYS_RAWIO capability to access.\n",
-			kcore_filename);
+		pr_debug("Failed to open %s. Note /proc/kcore requires CAP_SYS_RAWIO capability to access.\n",
+			 kcore_filename);
 		return -EINVAL;
 	}
 
@@ -1262,8 +1279,8 @@ int dso__load_kallsyms(struct dso *dso, const char *filename,
 	if (kallsyms__delta(map, filename, &delta))
 		return -1;
 
-	symbols__fixup_duplicate(&dso->symbols[map->type]);
 	symbols__fixup_end(&dso->symbols[map->type]);
+	symbols__fixup_duplicate(&dso->symbols[map->type]);
 
 	if (dso->kernel == DSO_TYPE_GUEST_KERNEL)
 		dso->symtab_type = DSO_BINARY_TYPE__GUEST_KALLSYMS;
@@ -1347,6 +1364,7 @@ static bool dso__is_compatible_symtab_type(struct dso *dso, bool kmod,
 	case DSO_BINARY_TYPE__SYSTEM_PATH_DSO:
 	case DSO_BINARY_TYPE__FEDORA_DEBUGINFO:
 	case DSO_BINARY_TYPE__UBUNTU_DEBUGINFO:
+	case DSO_BINARY_TYPE__MIXEDUP_UBUNTU_DEBUGINFO:
 	case DSO_BINARY_TYPE__BUILDID_DEBUGINFO:
 	case DSO_BINARY_TYPE__OPENEMBEDDED_DEBUGINFO:
 		return !kmod && dso->kernel == DSO_TYPE_USER;
@@ -1391,6 +1409,7 @@ int dso__load(struct dso *dso, struct map *map, symbol_filter_t filter)
 	struct symsrc ss_[2];
 	struct symsrc *syms_ss = NULL, *runtime_ss = NULL;
 	bool kmod;
+	unsigned char build_id[BUILD_ID_SIZE];
 
 	pthread_mutex_lock(&dso->lock);
 
@@ -1422,9 +1441,9 @@ int dso__load(struct dso *dso, struct map *map, symbol_filter_t filter)
 		if (lstat(dso->name, &st) < 0)
 			goto out;
 
-		if (st.st_uid && (st.st_uid != geteuid())) {
+		if (!symbol_conf.force && st.st_uid && (st.st_uid != geteuid())) {
 			pr_warning("File %s not owned by current user or root, "
-				"ignoring it.\n", dso->name);
+				   "ignoring it (use -f to override).\n", dso->name);
 			goto out;
 		}
 
@@ -1445,6 +1464,14 @@ int dso__load(struct dso *dso, struct map *map, symbol_filter_t filter)
 		dso->symtab_type == DSO_BINARY_TYPE__SYSTEM_PATH_KMODULE_COMP ||
 		dso->symtab_type == DSO_BINARY_TYPE__GUEST_KMODULE ||
 		dso->symtab_type == DSO_BINARY_TYPE__GUEST_KMODULE_COMP;
+
+
+	/*
+	 * Read the build id if possible. This is required for
+	 * DSO_BINARY_TYPE__BUILDID_DEBUGINFO to work
+	 */
+	if (filename__read_build_id(dso->name, build_id, BUILD_ID_SIZE) > 0)
+		dso__set_build_id(dso, build_id);
 
 	/*
 	 * Iterate over candidate debug images.
@@ -1592,6 +1619,15 @@ int dso__load_vmlinux_path(struct dso *dso, struct map *map,
 	int i, err = 0;
 	char *filename = NULL;
 
+	pr_debug("Looking at the vmlinux_path (%d entries long)\n",
+		 vmlinux_path__nr_entries + 1);
+
+	for (i = 0; i < vmlinux_path__nr_entries; ++i) {
+		err = dso__load_vmlinux(dso, map, vmlinux_path[i], false, filter);
+		if (err > 0)
+			goto out;
+	}
+
 	if (!symbol_conf.ignore_vmlinux_buildid)
 		filename = dso__build_id_filename(dso, NULL, 0);
 	if (filename != NULL) {
@@ -1599,15 +1635,6 @@ int dso__load_vmlinux_path(struct dso *dso, struct map *map,
 		if (err > 0)
 			goto out;
 		free(filename);
-	}
-
-	pr_debug("Looking at the vmlinux_path (%d entries long)\n",
-		 vmlinux_path__nr_entries + 1);
-
-	for (i = 0; i < vmlinux_path__nr_entries; ++i) {
-		err = dso__load_vmlinux(dso, map, vmlinux_path[i], false, filter);
-		if (err > 0)
-			break;
 	}
 out:
 	return err;
@@ -1838,7 +1865,7 @@ static void vmlinux_path__exit(void)
 	zfree(&vmlinux_path);
 }
 
-static int vmlinux_path__init(struct perf_session_env *env)
+static int vmlinux_path__init(struct perf_env *env)
 {
 	struct utsname uts;
 	char bf[PATH_MAX];
@@ -1906,7 +1933,7 @@ int setup_list(struct strlist **list, const char *list_str,
 	if (list_str == NULL)
 		return 0;
 
-	*list = strlist__new(true, list_str);
+	*list = strlist__new(list_str, NULL);
 	if (!*list) {
 		pr_err("problems parsing %s list\n", list_name);
 		return -1;
@@ -1949,7 +1976,7 @@ static bool symbol__read_kptr_restrict(void)
 	return value;
 }
 
-int symbol__init(struct perf_session_env *env)
+int symbol__init(struct perf_env *env)
 {
 	const char *symfs;
 

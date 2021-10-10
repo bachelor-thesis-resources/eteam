@@ -293,7 +293,8 @@ static int wl1271_probe(struct sdio_func *func,
 	/* Use block mode for transferring over one block size of data */
 	func->card->quirks |= MMC_QUIRK_BLKSZ_FOR_BYTE_MODE;
 
-	if (wlcore_probe_of(&func->dev, &irq, &pdev_data))
+	ret = wlcore_probe_of(&func->dev, &irq, &pdev_data);
+	if (ret)
 		goto out_free_glue;
 
 	/* if sdio can keep power while host is suspended, enable wow */
@@ -386,6 +387,11 @@ static int wl1271_suspend(struct device *dev)
 	struct wl1271 *wl = platform_get_drvdata(glue->core);
 	mmc_pm_flag_t sdio_flags;
 	int ret = 0;
+
+	if (!wl) {
+		dev_err(dev, "no wilink module was probed\n");
+		goto out;
+	}
 
 	dev_dbg(dev, "wl1271 suspend. wow_enabled: %d\n",
 		wl->wow_enabled);

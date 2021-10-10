@@ -145,7 +145,7 @@ config DEBUG_INFO_REDUCED
 
 config DEBUG_INFO_SPLIT
 	bool "Produce split debuginfo in .dwo files"
-	depends on DEBUG_INFO
+	depends on DEBUG_INFO && !FRV
 	help
 	  Generate debug info into separate .dwo files. This significantly
 	  reduces the build directory size for builds with DEBUG_INFO,
@@ -197,6 +197,7 @@ config ENABLE_MUST_CHECK
 config FRAME_WARN
 	int "Warn for stack frames larger than (needs gcc 4.4)"
 	range 0 8192
+	default 2048 if GCC_PLUGIN_LATENT_ENTROPY
 	default 1024 if !64BIT
 	default 2048 if 64BIT
 	help
@@ -256,6 +257,7 @@ config PAGE_OWNER
 
 config DEBUG_FS
 	bool "Debug Filesystem"
+	select SRCU
 	help
 	  debugfs is a virtual file system that kernel developers use to put
 	  debugging files into.  Enable this option to be able to read and
@@ -310,6 +312,15 @@ config DEBUG_SECTION_MISMATCH
 	    reported at least twice.
 	  - Enable verbose reporting from modpost in order to help resolve
 	    the section mismatches that are reported.
+
+config SECTION_MISMATCH_WARN_ONLY
+	bool "Make section mismatch errors non-fatal"
+	default y
+	help
+	  If you say N here, the build process will fail if there are any
+	  section mismatch, instead of just throwing warnings.
+
+	  If unsure, say Y.
 
 #
 # Select this config option from the architecture Kconfig, if it
@@ -511,7 +522,7 @@ config DEBUG_KMEMLEAK_EARLY_LOG_SIZE
 	int "Maximum kmemleak early log entries"
 	depends on DEBUG_KMEMLEAK
 	range 200 40000
-	default 400
+	default 16000
 	help
 	  Kmemleak must track all the memory allocations to avoid
 	  reporting false positives. Since memory may be allocated or
@@ -883,20 +894,6 @@ config DEBUG_TIMEKEEPING
 
 	  If unsure, say N.
 
-config TIMER_STATS
-	bool "Collect kernel timers statistics"
-	depends on DEBUG_KERNEL && PROC_FS
-	help
-	  If you say Y here, additional code will be inserted into the
-	  timer routines to collect statistics about kernel timers being
-	  reprogrammed. The statistics can be read from /proc/timer_stats.
-	  The statistics collection is started by writing 1 to /proc/timer_stats,
-	  writing 0 stops it. This feature is useful to collect information
-	  about timer usage patterns in kernel and userspace. This feature
-	  is lightweight if enabled in the kernel config but not activated
-	  (it defaults to deactivated on bootup and will only be activated
-	  if some application like powertop activates it explicitly).
-
 config DEBUG_PREEMPT
 	bool "Debug preemptible kernel"
 	depends on DEBUG_KERNEL && PREEMPT && TRACE_IRQFLAGS_SUPPORT
@@ -915,12 +912,6 @@ config DEBUG_RT_MUTEXES
 	help
 	 This allows rt mutex semantics violations and rt mutex related
 	 deadlocks (lockups) to be detected and reported automatically.
-
-config RT_MUTEX_TESTER
-	bool "Built-in scriptable tester for rt-mutexes"
-	depends on DEBUG_KERNEL && RT_MUTEXES && BROKEN
-	help
-	  This option enables a rt-mutex tester.
 
 config DEBUG_SPINLOCK
 	bool "Spinlock and rw-lock debugging: basic checks"
@@ -1353,20 +1344,6 @@ config RCU_CPU_STALL_TIMEOUT
 	  RCU grace period persists, additional CPU stall warnings are
 	  printed at more widely spaced intervals.
 
-config RCU_CPU_STALL_INFO
-	bool "Print additional diagnostics on RCU CPU stall"
-	depends on (TREE_RCU || PREEMPT_RCU) && DEBUG_KERNEL
-	default y
-	help
-	  For each stalled CPU that is aware of the current RCU grace
-	  period, print out additional per-CPU diagnostic information
-	  regarding scheduling-clock ticks, idle state, and,
-	  for RCU_FAST_NO_HZ kernels, idle-entry state.
-
-	  Say N if you are unsure.
-
-	  Say Y if you want to enable such diagnostics.
-
 config RCU_TRACE
 	bool "Enable tracing for RCU"
 	depends on DEBUG_KERNEL
@@ -1379,7 +1356,7 @@ config RCU_TRACE
 	  Say N if you are unsure.
 
 config RCU_EQS_DEBUG
-	bool "Use this when adding any sort of NO_HZ support to your arch"
+	bool "Provide debugging asserts for adding NO_HZ support to an arch"
 	depends on DEBUG_KERNEL
 	help
 	  This option provides consistency checks in RCU's handling of
@@ -1542,6 +1519,13 @@ config FAIL_MMC_REQUEST
 	  and to test how the mmc host driver handles retries from
 	  the block device.
 
+config FAIL_FUTEX
+	bool "Fault-injection capability for futexes"
+	select DEBUG_FS
+	depends on FAULT_INJECTION && FUTEX
+	help
+	  Provide fault-injection capability for futexes.
+
 config FAULT_INJECTION_DEBUG_FS
 	bool "Debugfs entries for fault-injection capabilities"
 	depends on FAULT_INJECTION && SYSFS && DEBUG_FS
@@ -1698,6 +1682,9 @@ config TEST_STRING_HELPERS
 config TEST_KSTRTOX
 	tristate "Test kstrto*() family of functions at runtime"
 
+config TEST_PRINTF
+	tristate "Test printf() family of functions at runtime"
+
 config TEST_RHASHTABLE
 	tristate "Perform selftest on resizable hash table"
 	default n
@@ -1705,6 +1692,17 @@ config TEST_RHASHTABLE
 	  Enable this option to test the rhashtable functions at boot.
 
 	  If unsure, say N.
+
+config TEST_HASH
+	tristate "Perform selftest on hash functions"
+	default n
+	help
+	  Enable this option to test the kernel's integer (<linux/hash.h>),
+	  string (<linux/stringhash.h>), and siphash (<linux/siphash.h>)
+	  hash functions on boot (or module load).
+
+	  This is intended to help people writing architecture-specific
+	  optimized versions.  If unsure, say N.
 
 endmenu # runtime tests
 
@@ -1839,6 +1837,15 @@ config MEMTEST
 	        ...
 	        memtest=17, mean do 17 test patterns.
 	  If you are unsure how to answer this question, answer N.
+
+config TEST_STATIC_KEYS
+	tristate "Test static keys"
+	default n
+	depends on m
+	help
+	  Test the static key interfaces.
+
+	  If unsure, say N.
 
 source "samples/Kconfig"
 

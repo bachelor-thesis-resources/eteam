@@ -791,7 +791,7 @@ static int mmc_test_nonblock_transfer(struct mmc_test_card *test,
 	struct mmc_async_req *cur_areq = &test_areq[0].areq;
 	struct mmc_async_req *other_areq = &test_areq[1].areq;
 	int i;
-	int ret;
+	int ret = RESULT_OK;
 
 	test_areq[0].test = test;
 	test_areq[1].test = test;
@@ -2263,14 +2263,11 @@ static int mmc_test_profile_sglen_r_nonblock_perf(struct mmc_test_card *test)
 /*
  * eMMC hardware reset.
  */
-static int mmc_test_hw_reset(struct mmc_test_card *test)
+static int mmc_test_reset(struct mmc_test_card *test)
 {
 	struct mmc_card *card = test->card;
 	struct mmc_host *host = card->host;
 	int err;
-
-	if (!mmc_card_mmc(card) || !mmc_can_reset(card))
-		return RESULT_UNSUP_CARD;
 
 	err = mmc_hw_reset(host);
 	if (!err)
@@ -2605,8 +2602,8 @@ static const struct mmc_test_case mmc_test_cases[] = {
 	},
 
 	{
-		.name = "eMMC hardware reset",
-		.run = mmc_test_hw_reset,
+		.name = "Reset test",
+		.run = mmc_test_reset,
 	},
 };
 

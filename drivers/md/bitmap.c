@@ -613,12 +613,10 @@ re_read:
 	daemon_sleep = le32_to_cpu(sb->daemon_sleep) * HZ;
 	write_behind = le32_to_cpu(sb->write_behind);
 	sectors_reserved = le32_to_cpu(sb->sectors_reserved);
-	/* XXX: This is a hack to ensure that we don't use clustering
-	 *  in case:
-	 *	- dm-raid is in use and
-	 *	- the nodes written in bitmap_sb is erroneous.
+	/* Setup nodes/clustername only if bitmap version is
+	 * cluster-compatible
 	 */
-	if (!bitmap->mddev->sync_super) {
+	if (sb->version == cpu_to_le32(BITMAP_MAJOR_CLUSTERED)) {
 		nodes = le32_to_cpu(sb->nodes);
 		strlcpy(bitmap->mddev->bitmap_info.cluster_name,
 				sb->cluster_name, 64);
@@ -628,7 +626,7 @@ re_read:
 	if (sb->magic != cpu_to_le32(BITMAP_MAGIC))
 		reason = "bad magic";
 	else if (le32_to_cpu(sb->version) < BITMAP_MAJOR_LO ||
-		 le32_to_cpu(sb->version) > BITMAP_MAJOR_HI)
+		 le32_to_cpu(sb->version) > BITMAP_MAJOR_CLUSTERED)
 		reason = "unrecognized superblock version";
 	else if (chunksize < 512)
 		reason = "bitmap chunksize too small";
@@ -1334,7 +1332,7 @@ __acquires(bitmap->lock)
 	if (bitmap->bp[page].hijacked ||
 	    bitmap->bp[page].map == NULL)
 		csize = ((sector_t)1) << (bitmap->chunkshift +
-					  PAGE_COUNTER_SHIFT - 1);
+					  PAGE_COUNTER_SHIFT);
 	else
 		csize = ((sector_t)1) << bitmap->chunkshift;
 	*blocks = csize - (offset & (csize - 1));
@@ -1572,7 +1570,7 @@ void bitmap_close_sync(struct bitmap *bitmap)
 }
 EXPORT_SYMBOL(bitmap_close_sync);
 
-void bitmap_cond_end_sync(struct bitmap *bitmap, sector_t sector)
+void bitmap_cond_end_sync(struct bitmap *bitmap, sector_t sector, bool force)
 {
 	sector_t s = 0;
 	sector_t blocks;
@@ -1583,7 +1581,7 @@ void bitmap_cond_end_sync(struct bitmap *bitmap, sector_t sector)
 		bitmap->last_end_sync = jiffies;
 		return;
 	}
-	if (time_before(jiffies, (bitmap->last_end_sync
+	if (!force && time_before(jiffies, (bitmap->last_end_sync
 				  + bitmap->mddev->bitmap_info.daemon_sleep)))
 		return;
 	wait_event(bitmap->mddev->recovery_wait,
@@ -1673,7 +1671,7 @@ void bitmap_flush(struct mddev *mddev)
 /*
  * free memory that was allocated
  */
-static void bitmap_free(struct bitmap *bitmap)
+static void md_bitmap_free(struct bitmap *bitmap)
 {
 	unsigned long k, pages;
 	struct bitmap_page *bp;
@@ -1723,7 +1721,7 @@ void bitmap_destroy(struct mddev *mddev)
 	if (bitmap->sysfs_can_clear)
 		sysfs_put(bitmap->sysfs_can_clear);
 
-	bitmap_free(bitmap);
+	md_bitmap_free(bitmap);
 }
 
 /*
@@ -1807,7 +1805,7 @@ struct bitmap *bitmap_create(struct mddev *mddev, int slot)
 
 	return bitmap;
  error:
-	bitmap_free(bitmap);
+	md_bitmap_free(bitmap);
 	return ERR_PTR(err);
 }
 
@@ -1906,7 +1904,7 @@ int bitmap_copy_from_slot(struct mddev *mddev, int slot,
 	*low = lo;
 	*high = hi;
 err:
-	bitmap_free(bitmap);
+	md_bitmap_free(bitmap);
 	return rv;
 }
 EXPORT_SYMBOL_GPL(bitmap_copy_from_slot);
@@ -1962,6 +1960,11 @@ int bitmap_resize(struct bitmap *bitmap, sector_t blocks,
 	long pages;
 	struct bitmap_page *new_bp;
 
+	if (bitmap->storage.file && !init) {
+		pr_info("md: cannot resize file-based bitmap\n");
+		return -EINVAL;
+	}
+
 	if (chunksize == 0) {
 		/* If there is enough space, leave the chunk size unchanged,
 		 * else increase by factor of two until there is enough space.
@@ -1997,7 +2000,8 @@ int bitmap_resize(struct bitmap *bitmap, sector_t blocks,
 	if (bitmap->mddev->bitmap_info.offset || bitmap->mddev->bitmap_info.file)
 		ret = bitmap_storage_alloc(&store, chunks,
 					   !bitmap->mddev->bitmap_info.external,
-					   bitmap->cluster_slot);
+					   mddev_is_clustered(bitmap->mddev)
+					   ? bitmap->cluster_slot : 0);
 	if (ret)
 		goto err;
 

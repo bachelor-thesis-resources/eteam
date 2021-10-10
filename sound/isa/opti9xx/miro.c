@@ -69,19 +69,19 @@ module_param(index, int, 0444);
 MODULE_PARM_DESC(index, "Index value for miro soundcard.");
 module_param(id, charp, 0444);
 MODULE_PARM_DESC(id, "ID string for miro soundcard.");
-module_param(port, long, 0444);
+module_param_hw(port, long, ioport, 0444);
 MODULE_PARM_DESC(port, "WSS port # for miro driver.");
-module_param(mpu_port, long, 0444);
+module_param_hw(mpu_port, long, ioport, 0444);
 MODULE_PARM_DESC(mpu_port, "MPU-401 port # for miro driver.");
-module_param(fm_port, long, 0444);
+module_param_hw(fm_port, long, ioport, 0444);
 MODULE_PARM_DESC(fm_port, "FM Port # for miro driver.");
-module_param(irq, int, 0444);
+module_param_hw(irq, int, irq, 0444);
 MODULE_PARM_DESC(irq, "WSS irq # for miro driver.");
-module_param(mpu_irq, int, 0444);
+module_param_hw(mpu_irq, int, irq, 0444);
 MODULE_PARM_DESC(mpu_irq, "MPU-401 irq # for miro driver.");
-module_param(dma1, int, 0444);
+module_param_hw(dma1, int, dma, 0444);
 MODULE_PARM_DESC(dma1, "1st dma # for miro driver.");
-module_param(dma2, int, 0444);
+module_param_hw(dma2, int, dma, 0444);
 MODULE_PARM_DESC(dma2, "2nd dma # for miro driver.");
 module_param(wss, int, 0444);
 MODULE_PARM_DESC(wss, "wss mode");
@@ -875,10 +875,13 @@ static void snd_miro_write(struct snd_miro *chip, unsigned char reg,
 	spin_unlock_irqrestore(&chip->lock, flags);
 }
 
+static inline void snd_miro_write_mask(struct snd_miro *chip,
+		unsigned char reg, unsigned char value, unsigned char mask)
+{
+	unsigned char oldval = snd_miro_read(chip, reg);
 
-#define snd_miro_write_mask(chip, reg, value, mask)	\
-	snd_miro_write(chip, reg,			\
-		(snd_miro_read(chip, reg) & ~(mask)) | ((value) & (mask)))
+	snd_miro_write(chip, reg, (oldval & ~mask) | (value & mask));
+}
 
 /*
  *  Proc Interface

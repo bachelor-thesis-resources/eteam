@@ -75,7 +75,7 @@ EXPORT_SYMBOL_GPL(xen_store_interface);
 enum xenstore_init xen_store_domain_type;
 EXPORT_SYMBOL_GPL(xen_store_domain_type);
 
-static unsigned long xen_store_mfn;
+static unsigned long xen_store_gfn;
 
 static BLOCKING_NOTIFIER_HEAD(xenstore_chain);
 
@@ -137,6 +137,7 @@ static int watch_otherend(struct xenbus_device *dev)
 		container_of(dev->dev.bus, struct xen_bus_type, bus);
 
 	return xenbus_watch_pathfmt(dev, &dev->otherend_watch,
+				    bus->otherend_will_handle,
 				    bus->otherend_changed,
 				    "%s/%s", dev->otherend, "state");
 }
@@ -470,8 +471,11 @@ int xenbus_probe_node(struct xen_bus_type *bus,
 
 	/* Register with generic device framework. */
 	err = device_register(&xendev->dev);
-	if (err)
+	if (err) {
+		put_device(&xendev->dev);
+		xendev = NULL;
 		goto fail;
+	}
 
 	return 0;
 fail:
@@ -711,9 +715,7 @@ static int __init xenstored_local_init(void)
 	if (!page)
 		goto out_err;
 
-	xen_store_mfn = xen_start_info->store_mfn =
-		pfn_to_mfn(virt_to_phys((void *)page) >>
-			   PAGE_SHIFT);
+	xen_store_gfn = xen_start_info->store_mfn = virt_to_gfn((void *)page);
 
 	/* Next allocate a local port which xenstored can bind to */
 	alloc_unbound.dom        = DOMID_SELF;
@@ -787,12 +789,12 @@ static int __init xenbus_init(void)
 		err = xenstored_local_init();
 		if (err)
 			goto out_error;
-		xen_store_interface = mfn_to_virt(xen_store_mfn);
+		xen_store_interface = gfn_to_virt(xen_store_gfn);
 		break;
 	case XS_PV:
 		xen_store_evtchn = xen_start_info->store_evtchn;
-		xen_store_mfn = xen_start_info->store_mfn;
-		xen_store_interface = mfn_to_virt(xen_store_mfn);
+		xen_store_gfn = xen_start_info->store_mfn;
+		xen_store_interface = gfn_to_virt(xen_store_gfn);
 		break;
 	case XS_HVM:
 		err = hvm_get_parameter(HVM_PARAM_STORE_EVTCHN, &v);
@@ -802,9 +804,10 @@ static int __init xenbus_init(void)
 		err = hvm_get_parameter(HVM_PARAM_STORE_PFN, &v);
 		if (err)
 			goto out_error;
-		xen_store_mfn = (unsigned long)v;
+		xen_store_gfn = (unsigned long)v;
 		xen_store_interface =
-			xen_remap(xen_store_mfn << PAGE_SHIFT, PAGE_SIZE);
+			xen_remap(xen_store_gfn << XEN_PAGE_SHIFT,
+				  XEN_PAGE_SIZE);
 		break;
 	default:
 		pr_warn("Xenstore state unknown\n");
@@ -827,7 +830,7 @@ static int __init xenbus_init(void)
 	 * Create xenfs mountpoint in /proc for compatibility with
 	 * utilities that expect to find "xenbus" under "/proc/xen".
 	 */
-	proc_mkdir("xen", NULL);
+	proc_create_mount_point("xen");
 #endif
 
 out_error:

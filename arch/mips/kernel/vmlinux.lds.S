@@ -17,7 +17,9 @@ OUTPUT_ARCH(mips)
 ENTRY(kernel_entry)
 PHDRS {
 	text PT_LOAD FLAGS(7);	/* RWX */
+#ifndef CONFIG_CAVIUM_OCTEON_SOC
 	note PT_NOTE FLAGS(4);	/* R__ */
+#endif /* CAVIUM_OCTEON_SOC */
 }
 
 #ifdef CONFIG_32BIT
@@ -71,7 +73,12 @@ SECTIONS
 		__stop___dbe_table = .;
 	}
 
-	NOTES :text :note
+#ifdef CONFIG_CAVIUM_OCTEON_SOC
+#define NOTES_HEADER
+#else /* CONFIG_CAVIUM_OCTEON_SOC */
+#define NOTES_HEADER :note
+#endif /* CONFIG_CAVIUM_OCTEON_SOC */
+	NOTES :text NOTES_HEADER
 	.dummy : { *(.dummy) } :text
 
 	_sdata = .;			/* Start of data section */
@@ -83,6 +90,7 @@ SECTIONS
 
 		INIT_TASK_DATA(THREAD_SIZE)
 		NOSAVE_DATA
+		PAGE_ALIGNED_DATA(PAGE_SIZE)
 		CACHELINE_ALIGNED_DATA(1 << CONFIG_MIPS_L1_CACHE_SHIFT)
 		READ_MOSTLY_DATA(1 << CONFIG_MIPS_L1_CACHE_SHIFT)
 		DATA_DATA
@@ -132,6 +140,11 @@ SECTIONS
 	__appended_dtb = .;
 	/* leave space for appended DTB */
 	. += 0x100000;
+#elif defined(CONFIG_MIPS_ELF_APPENDED_DTB)
+	.appended_dtb : AT(ADDR(.appended_dtb) - LOAD_OFFSET) {
+		*(.appended_dtb)
+		KEEP(*(.appended_dtb))
+	}
 #endif
 	/*
 	 * Align to 64K in attempt to eliminate holes before the
@@ -147,7 +160,7 @@ SECTIONS
 	 * Force .bss to 64K alignment so that .bss..swapper_pg_dir
 	 * gets that alignment.	 .sbss should be empty, so there will be
 	 * no holes after __init_end. */
-	BSS_SECTION(0, 0x10000, 0)
+	BSS_SECTION(0, 0x10000, 8)
 
 	_end = . ;
 
@@ -181,6 +194,7 @@ SECTIONS
 	DISCARDS
 	/DISCARD/ : {
 		/* ABI crap starts here */
+		*(.MIPS.abiflags)
 		*(.MIPS.options)
 		*(.options)
 		*(.pdr)

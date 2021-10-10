@@ -25,6 +25,7 @@
 #include <linux/if_ether.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/lockdep.h>
 #include <linux/netdevice.h>
 #include <linux/pkt_sched.h>
 #include <linux/skbuff.h>
@@ -66,7 +67,7 @@ void batadv_frag_purge_orig(struct batadv_orig_node *orig_node,
 			    bool (*check_cb)(struct batadv_frag_table_entry *))
 {
 	struct batadv_frag_table_entry *chain;
-	uint8_t i;
+	u8 i;
 
 	for (i = 0; i < BATADV_FRAG_BUFFER_COUNT; i++) {
 		chain = &orig_node->fragments[i];
@@ -110,8 +111,10 @@ static int batadv_frag_size_limit(void)
  * without searching for the right position.
  */
 static bool batadv_frag_init_chain(struct batadv_frag_table_entry *chain,
-				   uint16_t seqno)
+				   u16 seqno)
 {
+	lockdep_assert_held(&chain->lock);
+
 	if (chain->seqno == seqno)
 		return false;
 
@@ -145,8 +148,8 @@ static bool batadv_frag_insert_packet(struct batadv_orig_node *orig_node,
 	struct batadv_frag_list_entry *frag_entry_new = NULL, *frag_entry_curr;
 	struct batadv_frag_list_entry *frag_entry_last = NULL;
 	struct batadv_frag_packet *frag_packet;
-	uint8_t bucket;
-	uint16_t seqno, hdr_size = sizeof(struct batadv_frag_packet);
+	u8 bucket;
+	u16 seqno, hdr_size = sizeof(struct batadv_frag_packet);
 	bool ret = false;
 
 	/* Linearize packet to avoid linearizing 16 packets in a row when doing
@@ -230,8 +233,10 @@ err_unlock:
 	spin_unlock_bh(&chain->lock);
 
 err:
-	if (!ret)
+	if (!ret) {
 		kfree(frag_entry_new);
+		kfree_skb(skb);
+	}
 
 	return ret;
 }
@@ -263,7 +268,7 @@ batadv_frag_merge_packets(struct hlist_head *chain)
 	kfree(entry);
 
 	packet = (struct batadv_frag_packet *)skb_out->data;
-	size = ntohs(packet->total_size);
+	size = ntohs(packet->total_size) + hdr_size;
 
 	/* Make room for the rest of the fragments. */
 	if (pskb_expand_head(skb_out, 0, size - skb_out->len, GFP_ATOMIC) < 0) {
@@ -275,7 +280,8 @@ batadv_frag_merge_packets(struct hlist_head *chain)
 	/* Move the existing MAC header to just before the payload. (Override
 	 * the fragment header.)
 	 */
-	skb_pull_rcsum(skb_out, hdr_size);
+	skb_pull(skb_out, hdr_size);
+	skb_out->ip_summed = CHECKSUM_NONE;
 	memmove(skb_out->data - ETH_HLEN, skb_mac_header(skb_out), ETH_HLEN);
 	skb_set_mac_header(skb_out, -ETH_HLEN);
 	skb_reset_network_header(skb_out);
@@ -325,9 +331,9 @@ bool batadv_frag_skb_buffer(struct sk_buff **skb,
 		goto out_err;
 
 out:
-	*skb = skb_out;
 	ret = true;
 out_err:
+	*skb = skb_out;
 	return ret;
 }
 
@@ -351,7 +357,7 @@ bool batadv_frag_skb_fwd(struct sk_buff *skb,
 	struct batadv_orig_node *orig_node_dst = NULL;
 	struct batadv_neigh_node *neigh_node = NULL;
 	struct batadv_frag_packet *packet;
-	uint16_t total_size;
+	u16 total_size;
 	bool ret = false;
 
 	packet = (struct batadv_frag_packet *)skb->data;
@@ -474,6 +480,10 @@ bool batadv_frag_send_packet(struct sk_buff *skb,
 
 	/* Eat and send fragments from the tail of skb */
 	while (skb->len > max_fragment_size) {
+		/* The initial check in this function should cover this case */
+		if (frag_header.no == BATADV_FRAG_MAX_FRAGMENTS - 1)
+			goto out_err;
+
 		skb_fragment = batadv_frag_create(skb, &frag_header, mtu);
 		if (!skb_fragment)
 			goto out_err;
@@ -484,10 +494,6 @@ bool batadv_frag_send_packet(struct sk_buff *skb,
 		batadv_send_skb_packet(skb_fragment, neigh_node->if_incoming,
 				       neigh_node->addr);
 		frag_header.no++;
-
-		/* The initial check in this function should cover this case */
-		if (frag_header.no == BATADV_FRAG_MAX_FRAGMENTS - 1)
-			goto out_err;
 	}
 
 	/* Make room for the fragment header. */

@@ -22,6 +22,13 @@
 #include <linux/ctype.h>
 #include <linux/projid.h>
 #include <linux/fs_struct.h>
+#include <linux/nospec.h>
+
+/*
+ * sysctl determining whether unprivileged users may unshare a new
+ * userns.  Allowed by default
+ */
+int unprivileged_userns_clone = 1;
 
 static struct kmem_cache *user_ns_cachep __read_mostly;
 static DEFINE_MUTEX(userns_state_mutex);
@@ -39,6 +46,7 @@ static void set_cred_user_ns(struct cred *cred, struct user_namespace *user_ns)
 	cred->cap_inheritable = CAP_EMPTY_SET;
 	cred->cap_permitted = CAP_FULL_SET;
 	cred->cap_effective = CAP_FULL_SET;
+	cred->cap_ambient = CAP_EMPTY_SET;
 	cred->cap_bset = CAP_FULL_SET;
 #ifdef CONFIG_KEYS
 	key_put(cred->request_key_auth);
@@ -495,8 +503,10 @@ static void *m_start(struct seq_file *seq, loff_t *ppos,
 	struct uid_gid_extent *extent = NULL;
 	loff_t pos = *ppos;
 
-	if (pos < map->nr_extents)
+	if (pos < map->nr_extents) {
+		pos = array_index_nospec((unsigned long)pos, map->nr_extents); /* needed? */
 		extent = &map->extent[pos];
+	}
 
 	return extent;
 }
@@ -601,9 +611,26 @@ static ssize_t map_write(struct file *file, const char __user *buf,
 	struct uid_gid_map new_map;
 	unsigned idx;
 	struct uid_gid_extent *extent = NULL;
-	unsigned long page = 0;
+	unsigned long page;
 	char *kbuf, *pos, *next_line;
-	ssize_t ret = -EINVAL;
+	ssize_t ret;
+
+	/* Only allow < page size writes at the beginning of the file */
+	if ((*ppos != 0) || (count >= PAGE_SIZE))
+		return -EINVAL;
+
+	/* Get a buffer */
+	page = __get_free_page(GFP_TEMPORARY);
+	kbuf = (char *) page;
+	if (!page)
+		return -ENOMEM;
+
+	/* Slurp in the user data */
+	if (copy_from_user(kbuf, buf, count)) {
+		free_page(page);
+		return -EFAULT;
+	}
+	kbuf[count] = '\0';
 
 	/*
 	 * The userns_state_mutex serializes all writes to any given map.
@@ -636,24 +663,6 @@ static ssize_t map_write(struct file *file, const char __user *buf,
 	 */
 	if (cap_valid(cap_setid) && !file_ns_capable(file, ns, CAP_SYS_ADMIN))
 		goto out;
-
-	/* Get a buffer */
-	ret = -ENOMEM;
-	page = __get_free_page(GFP_TEMPORARY);
-	kbuf = (char *) page;
-	if (!page)
-		goto out;
-
-	/* Only allow < page size writes at the beginning of the file */
-	ret = -EINVAL;
-	if ((*ppos != 0) || (count >= PAGE_SIZE))
-		goto out;
-
-	/* Slurp in the user data */
-	ret = -EFAULT;
-	if (copy_from_user(kbuf, buf, count))
-		goto out;
-	kbuf[count] = '\0';
 
 	/* Parse the user data */
 	ret = -EINVAL;
@@ -944,6 +953,21 @@ bool userns_may_setgroups(const struct user_namespace *ns)
 	return allowed;
 }
 
+/*
+ * Returns true if @ns is the same namespace as or a descendant of
+ * @target_ns.
+ */
+bool current_in_userns(const struct user_namespace *target_ns)
+{
+	struct user_namespace *ns;
+	for (ns = current_user_ns(); ns; ns = ns->parent) {
+		if (ns == target_ns)
+			return true;
+	}
+	return false;
+}
+EXPORT_SYMBOL(current_in_userns);
+
 static inline struct user_namespace *to_user_ns(struct ns_common *ns)
 {
 	return container_of(ns, struct user_namespace, ns);
@@ -976,8 +1000,8 @@ static int userns_install(struct nsproxy *nsproxy, struct ns_common *ns)
 	if (user_ns == current_user_ns())
 		return -EINVAL;
 
-	/* Threaded processes may not enter a different user namespace */
-	if (atomic_read(&current->mm->mm_users) > 1)
+	/* Tasks that share a thread group must share a user namespace */
+	if (!thread_group_empty(current))
 		return -EINVAL;
 
 	if (current->fs->users != 1)

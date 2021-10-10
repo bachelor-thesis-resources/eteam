@@ -1031,36 +1031,8 @@ err_out:
 static void print_packet( byte * buf, int length )
 {
 #if 0
-	int i;
-	int remainder;
-	int lines;
-
-	pr_dbg("Packet of length %d\n", length);
-	lines = length / 16;
-	remainder = length % 16;
-
-	for ( i = 0; i < lines ; i ++ ) {
-		int cur;
-
-		printk(KERN_DEBUG);
-		for ( cur = 0; cur < 8; cur ++ ) {
-			byte a, b;
-
-			a = *(buf ++ );
-			b = *(buf ++ );
-			pr_cont("%02x%02x ", a, b);
-		}
-		pr_cont("\n");
-	}
-	printk(KERN_DEBUG);
-	for ( i = 0; i < remainder/2 ; i++ ) {
-		byte a, b;
-
-		a = *(buf ++ );
-		b = *(buf ++ );
-		pr_cont("%02x%02x ", a, b);
-	}
-	pr_cont("\n");
+	print_hex_dump_debug(DRV_NAME, DUMP_PREFIX_OFFSET, 16, 1,
+			     buf, length, true);
 #endif
 }
 #endif
@@ -1530,8 +1502,8 @@ static void smc_set_multicast_list(struct net_device *dev)
 static struct net_device *devSMC9194;
 MODULE_LICENSE("GPL");
 
-module_param(io, int, 0);
-module_param(irq, int, 0);
+module_param_hw(io, int, ioport, 0);
+module_param_hw(irq, int, irq, 0);
 module_param(ifport, int, 0);
 MODULE_PARM_DESC(io, "SMC 99194 I/O base address");
 MODULE_PARM_DESC(irq, "SMC 99194 IRQ number");

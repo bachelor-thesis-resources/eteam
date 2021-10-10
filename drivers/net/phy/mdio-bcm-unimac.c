@@ -177,6 +177,8 @@ static int unimac_mdio_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!r)
+		return -EINVAL;
 
 	/* Just ioremap, as this MDIO block is usually integrated into an
 	 * Ethernet MAC controller register range
@@ -244,6 +246,7 @@ static const struct of_device_id unimac_mdio_ids[] = {
 	{ .compatible = "brcm,unimac-mdio", },
 	{ /* sentinel */ },
 };
+MODULE_DEVICE_TABLE(of, unimac_mdio_ids);
 
 static struct platform_driver unimac_mdio_driver = {
 	.driver = {

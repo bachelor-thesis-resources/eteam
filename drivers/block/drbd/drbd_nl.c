@@ -632,14 +632,15 @@ drbd_set_role(struct drbd_device *const device, enum drbd_role new_role, int for
 		if (rv == SS_TWO_PRIMARIES) {
 			/* Maybe the peer is detected as dead very soon...
 			   retry at most once more in this case. */
-			int timeo;
-			rcu_read_lock();
-			nc = rcu_dereference(connection->net_conf);
-			timeo = nc ? (nc->ping_timeo + 1) * HZ / 10 : 1;
-			rcu_read_unlock();
-			schedule_timeout_interruptible(timeo);
-			if (try < max_tries)
+			if (try < max_tries) {
+				int timeo;
 				try = max_tries - 1;
+				rcu_read_lock();
+				nc = rcu_dereference(connection->net_conf);
+				timeo = nc ? (nc->ping_timeo + 1) * HZ / 10 : 1;
+				rcu_read_unlock();
+				schedule_timeout_interruptible(timeo);
+			}
 			continue;
 		}
 		if (rv < SS_SUCCESS) {
@@ -1156,25 +1157,27 @@ static void drbd_setup_queue_param(struct drbd_device *device, struct drbd_backi
 			/* For now, don't allow more than one activity log extent worth of data
 			 * to be discarded in one go. We may need to rework drbd_al_begin_io()
 			 * to allow for even larger discard ranges */
-			q->limits.max_discard_sectors = DRBD_MAX_DISCARD_SECTORS;
+			blk_queue_max_discard_sectors(q, DRBD_MAX_DISCARD_SECTORS);
 
 			queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, q);
 			/* REALLY? Is stacking secdiscard "legal"? */
 			if (blk_queue_secdiscard(b))
 				queue_flag_set_unlocked(QUEUE_FLAG_SECDISCARD, q);
 		} else {
-			q->limits.max_discard_sectors = 0;
+			blk_queue_max_discard_sectors(q, 0);
 			queue_flag_clear_unlocked(QUEUE_FLAG_DISCARD, q);
 			queue_flag_clear_unlocked(QUEUE_FLAG_SECDISCARD, q);
 		}
 
 		blk_queue_stack_limits(q, b);
 
-		if (q->backing_dev_info.ra_pages != b->backing_dev_info.ra_pages) {
+		if (q->backing_dev_info->ra_pages !=
+		    b->backing_dev_info->ra_pages) {
 			drbd_info(device, "Adjusting my ra_pages to backing device's (%lu -> %lu)\n",
-				 q->backing_dev_info.ra_pages,
-				 b->backing_dev_info.ra_pages);
-			q->backing_dev_info.ra_pages = b->backing_dev_info.ra_pages;
+				 q->backing_dev_info->ra_pages,
+				 b->backing_dev_info->ra_pages);
+			q->backing_dev_info->ra_pages =
+						b->backing_dev_info->ra_pages;
 		}
 	}
 }
@@ -1684,9 +1687,9 @@ int drbd_adm_attach(struct sk_buff *skb, struct genl_info *info)
 		}
 	}
 
-	if (device->state.conn < C_CONNECTED &&
-	    device->state.role == R_PRIMARY && device->ed_uuid &&
-	    (device->ed_uuid & ~((u64)1)) != (nbc->md.uuid[UI_CURRENT] & ~((u64)1))) {
+	if (device->state.pdsk != D_UP_TO_DATE && device->ed_uuid &&
+	    (device->state.role == R_PRIMARY || device->state.peer == R_PRIMARY) &&
+            (device->ed_uuid & ~((u64)1)) != (nbc->md.uuid[UI_CURRENT] & ~((u64)1))) {
 		drbd_err(device, "Can only attach to data with current UUID=%016llX\n",
 		    (unsigned long long)device->ed_uuid);
 		retcode = ERR_DATA_NOT_CURRENT;

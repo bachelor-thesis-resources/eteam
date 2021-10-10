@@ -119,13 +119,13 @@ static int eukrea_tlv320_probe(struct platform_device *pdev)
 		if (ret) {
 			dev_err(&pdev->dev,
 				"fsl,mux-int-port node missing or invalid.\n");
-			return ret;
+			goto err;
 		}
 		ret = of_property_read_u32(np, "fsl,mux-ext-port", &ext_port);
 		if (ret) {
 			dev_err(&pdev->dev,
 				"fsl,mux-ext-port node missing or invalid.\n");
-			return ret;
+			goto err;
 		}
 
 		/*
@@ -182,7 +182,7 @@ static int eukrea_tlv320_probe(struct platform_device *pdev)
 		);
 	} else {
 		if (np) {
-			/* The eukrea,asoc-tlv320 driver was explicitely
+			/* The eukrea,asoc-tlv320 driver was explicitly
 			 * requested (through the device tree).
 			 */
 			dev_err(&pdev->dev,

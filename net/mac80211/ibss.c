@@ -7,6 +7,7 @@
  * Copyright 2007, Michael Wu <flamingice@sourmilk.net>
  * Copyright 2009, Johannes Berg <johannes@sipsolutions.net>
  * Copyright 2013-2014  Intel Mobile Communications GmbH
+ * Copyright(c) 2016 Intel Deutschland GmbH
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -65,6 +66,8 @@ ieee80211_ibss_build_presp(struct ieee80211_sub_if_data *sdata,
 		    2 + (IEEE80211_MAX_SUPP_RATES - 8) +
 		    2 + sizeof(struct ieee80211_ht_cap) +
 		    2 + sizeof(struct ieee80211_ht_operation) +
+		    2 + sizeof(struct ieee80211_vht_cap) +
+		    2 + sizeof(struct ieee80211_vht_operation) +
 		    ifibss->ie_len;
 	presp = kzalloc(sizeof(*presp) + frame_len, GFP_KERNEL);
 	if (!presp)
@@ -188,7 +191,7 @@ ieee80211_ibss_build_presp(struct ieee80211_sub_if_data *sdata,
 		 * keep them at 0
 		 */
 		pos = ieee80211_ie_build_ht_oper(pos, &sband->ht_cap,
-						 chandef, 0);
+						 chandef, 0, false);
 
 		/* add VHT capability and information IEs */
 		if (chandef->width != NL80211_CHAN_WIDTH_20 &&
@@ -229,7 +232,7 @@ static void __ieee80211_sta_join_ibss(struct ieee80211_sub_if_data *sdata,
 	struct cfg80211_chan_def chandef;
 	struct ieee80211_channel *chan;
 	struct beacon_data *presp;
-	enum nl80211_bss_scan_width scan_width;
+	struct cfg80211_inform_bss bss_meta = {};
 	bool have_higher_than_11mbit;
 	bool radar_required;
 	int err;
@@ -356,7 +359,7 @@ static void __ieee80211_sta_join_ibss(struct ieee80211_sub_if_data *sdata,
 	else
 		sdata->flags &= ~IEEE80211_SDATA_OPERATING_GMODE;
 
-	ieee80211_set_wmm_default(sdata, true);
+	ieee80211_set_wmm_default(sdata, true, false);
 
 	sdata->vif.bss_conf.ibss_joined = true;
 	sdata->vif.bss_conf.ibss_creator = creator;
@@ -383,10 +386,11 @@ static void __ieee80211_sta_join_ibss(struct ieee80211_sub_if_data *sdata,
 	mod_timer(&ifibss->timer,
 		  round_jiffies(jiffies + IEEE80211_IBSS_MERGE_INTERVAL));
 
-	scan_width = cfg80211_chandef_to_scan_width(&chandef);
-	bss = cfg80211_inform_bss_width_frame(local->hw.wiphy, chan,
-					      scan_width, mgmt,
-					      presp->head_len, 0, GFP_KERNEL);
+	bss_meta.chan = chan;
+	bss_meta.scan_width = cfg80211_chandef_to_scan_width(&chandef);
+	bss = cfg80211_inform_bss_frame_data(local->hw.wiphy, &bss_meta, mgmt,
+					     presp->head_len, GFP_KERNEL);
+
 	cfg80211_put_bss(local->hw.wiphy, bss);
 	netif_carrier_on(sdata->dev);
 	cfg80211_ibss_joined(sdata->dev, ifibss->bssid, chan, GFP_KERNEL);
@@ -484,14 +488,14 @@ int ieee80211_ibss_csa_beacon(struct ieee80211_sub_if_data *sdata,
 	struct beacon_data *presp, *old_presp;
 	struct cfg80211_bss *cbss;
 	const struct cfg80211_bss_ies *ies;
-	u16 capability = 0;
+	u16 capability = WLAN_CAPABILITY_IBSS;
 	u64 tsf;
 	int ret = 0;
 
 	sdata_assert_lock(sdata);
 
 	if (ifibss->privacy)
-		capability = WLAN_CAPABILITY_PRIVACY;
+		capability |= WLAN_CAPABILITY_PRIVACY;
 
 	cbss = cfg80211_get_bss(sdata->local->hw.wiphy, ifibss->chandef.chan,
 				ifibss->bssid, ifibss->ssid,
@@ -646,7 +650,7 @@ ieee80211_ibss_add_sta(struct ieee80211_sub_if_data *sdata, const u8 *bssid,
 		return NULL;
 	}
 
-	sta->last_rx = jiffies;
+	sta->rx_stats.last_rx = jiffies;
 
 	/* make sure mandatory rates are always added */
 	sband = local->hw.wiphy->bands[band];
@@ -668,7 +672,8 @@ static int ieee80211_sta_active_ibss(struct ieee80211_sub_if_data *sdata)
 
 	list_for_each_entry_rcu(sta, &local->sta_list, list) {
 		if (sta->sdata == sdata &&
-		    time_after(sta->last_rx + IEEE80211_IBSS_MERGE_INTERVAL,
+		    time_after(sta->rx_stats.last_rx +
+			       IEEE80211_IBSS_MERGE_INTERVAL,
 			       jiffies)) {
 			active++;
 			break;
@@ -943,8 +948,8 @@ static void ieee80211_rx_mgmt_deauth_ibss(struct ieee80211_sub_if_data *sdata,
 	if (len < IEEE80211_DEAUTH_FRAME_LEN)
 		return;
 
-	ibss_dbg(sdata, "RX DeAuth SA=%pM DA=%pM BSSID=%pM (reason: %d)\n",
-		 mgmt->sa, mgmt->da, mgmt->bssid, reason);
+	ibss_dbg(sdata, "RX DeAuth SA=%pM DA=%pM\n", mgmt->sa, mgmt->da);
+	ibss_dbg(sdata, "\tBSSID=%pM (reason: %d)\n", mgmt->bssid, reason);
 	sta_info_destroy_addr(sdata, mgmt->sa);
 }
 
@@ -962,9 +967,9 @@ static void ieee80211_rx_mgmt_auth_ibss(struct ieee80211_sub_if_data *sdata,
 	auth_alg = le16_to_cpu(mgmt->u.auth.auth_alg);
 	auth_transaction = le16_to_cpu(mgmt->u.auth.auth_transaction);
 
-	ibss_dbg(sdata,
-		 "RX Auth SA=%pM DA=%pM BSSID=%pM (auth_transaction=%d)\n",
-		 mgmt->sa, mgmt->da, mgmt->bssid, auth_transaction);
+	ibss_dbg(sdata, "RX Auth SA=%pM DA=%pM\n", mgmt->sa, mgmt->da);
+	ibss_dbg(sdata, "\tBSSID=%pM (auth_transaction=%d)\n",
+		 mgmt->bssid, auth_transaction);
 
 	if (auth_alg != WLAN_AUTH_OPEN || auth_transaction != 1)
 		return;
@@ -1169,10 +1174,10 @@ static void ieee80211_rx_bss_info(struct ieee80211_sub_if_data *sdata,
 		rx_timestamp = drv_get_tsf(local, sdata);
 	}
 
-	ibss_dbg(sdata,
-		 "RX beacon SA=%pM BSSID=%pM TSF=0x%llx BCN=0x%llx diff=%lld @%lu\n",
+	ibss_dbg(sdata, "RX beacon SA=%pM BSSID=%pM TSF=0x%llx\n",
 		 mgmt->sa, mgmt->bssid,
-		 (unsigned long long)rx_timestamp,
+		 (unsigned long long)rx_timestamp);
+	ibss_dbg(sdata, "\tBCN=0x%llx diff=%lld @%lu\n",
 		 (unsigned long long)beacon_timestamp,
 		 (unsigned long long)(rx_timestamp - beacon_timestamp),
 		 jiffies);
@@ -1234,7 +1239,7 @@ void ieee80211_ibss_rx_no_sta(struct ieee80211_sub_if_data *sdata,
 	if (!sta)
 		return;
 
-	sta->last_rx = jiffies;
+	sta->rx_stats.last_rx = jiffies;
 
 	/* make sure mandatory rates are always added */
 	sband = local->hw.wiphy->bands[band];
@@ -1252,7 +1257,7 @@ static void ieee80211_ibss_sta_expire(struct ieee80211_sub_if_data *sdata)
 	struct ieee80211_local *local = sdata->local;
 	struct sta_info *sta, *tmp;
 	unsigned long exp_time = IEEE80211_IBSS_INACTIVITY_LIMIT;
-	unsigned long exp_rsn_time = IEEE80211_IBSS_RSN_INACTIVITY_LIMIT;
+	unsigned long exp_rsn = IEEE80211_IBSS_RSN_INACTIVITY_LIMIT;
 
 	mutex_lock(&local->sta_mtx);
 
@@ -1260,8 +1265,8 @@ static void ieee80211_ibss_sta_expire(struct ieee80211_sub_if_data *sdata)
 		if (sdata != sta->sdata)
 			continue;
 
-		if (time_after(jiffies, sta->last_rx + exp_time) ||
-		    (time_after(jiffies, sta->last_rx + exp_rsn_time) &&
+		if (time_after(jiffies, sta->rx_stats.last_rx + exp_time) ||
+		    (time_after(jiffies, sta->rx_stats.last_rx + exp_rsn) &&
 		     sta->sta_state != IEEE80211_STA_AUTHORIZED)) {
 			sta_dbg(sta->sdata, "expiring inactive %sSTA %pM\n",
 				sta->sta_state != IEEE80211_STA_AUTHORIZED ?
@@ -1482,14 +1487,21 @@ static void ieee80211_sta_find_ibss(struct ieee80211_sub_if_data *sdata)
 
 		sdata_info(sdata, "Trigger new scan to find an IBSS to join\n");
 
-		num = ieee80211_ibss_setup_scan_channels(local->hw.wiphy,
-							 &ifibss->chandef,
-							 channels,
-							 ARRAY_SIZE(channels));
 		scan_width = cfg80211_chandef_to_scan_width(&ifibss->chandef);
-		ieee80211_request_ibss_scan(sdata, ifibss->ssid,
-					    ifibss->ssid_len, channels, num,
-					    scan_width);
+
+		if (ifibss->fixed_channel) {
+			num = ieee80211_ibss_setup_scan_channels(local->hw.wiphy,
+								 &ifibss->chandef,
+								 channels,
+								 ARRAY_SIZE(channels));
+			ieee80211_request_ibss_scan(sdata, ifibss->ssid,
+						    ifibss->ssid_len, channels,
+						    num, scan_width);
+		} else {
+			ieee80211_request_ibss_scan(sdata, ifibss->ssid,
+						    ifibss->ssid_len, NULL,
+						    0, scan_width);
+		}
 	} else {
 		int interval = IEEE80211_SCAN_INTERVAL;
 
@@ -1524,9 +1536,9 @@ static void ieee80211_rx_mgmt_probe_req(struct ieee80211_sub_if_data *sdata,
 
 	tx_last_beacon = drv_tx_last_beacon(local);
 
-	ibss_dbg(sdata,
-		 "RX ProbeReq SA=%pM DA=%pM BSSID=%pM (tx_last_beacon=%d)\n",
-		 mgmt->sa, mgmt->da, mgmt->bssid, tx_last_beacon);
+	ibss_dbg(sdata, "RX ProbeReq SA=%pM DA=%pM\n", mgmt->sa, mgmt->da);
+	ibss_dbg(sdata, "\tBSSID=%pM (tx_last_beacon=%d)\n",
+		 mgmt->bssid, tx_last_beacon);
 
 	if (!tx_last_beacon && is_multicast_ether_addr(mgmt->da))
 		return;
@@ -1730,7 +1742,6 @@ void ieee80211_ibss_notify_scan_completed(struct ieee80211_local *local)
 		if (sdata->vif.type != NL80211_IFTYPE_ADHOC)
 			continue;
 		sdata->u.ibss.last_scan_completed = jiffies;
-		ieee80211_queue_work(&local->hw, &sdata->work);
 	}
 	mutex_unlock(&local->iflist_mtx);
 }

@@ -592,10 +592,7 @@ static struct page *__r4w_get_page(void *priv, u64 offset, bool *uptodate)
 			}
 			unlock_page(page);
 		}
-		if (PageDirty(page) || PageWriteback(page))
-			*uptodate = true;
-		else
-			*uptodate = PageUptodate(page);
+		*uptodate = PageUptodate(page);
 		EXOFS_DBGMSG2("index=0x%lx uptodate=%d\n", index, *uptodate);
 		return page;
 	} else {
@@ -1038,7 +1035,7 @@ int exofs_setattr(struct dentry *dentry, struct iattr *iattr)
 	if (unlikely(error))
 		return error;
 
-	error = inode_change_ok(inode, iattr);
+	error = setattr_prepare(dentry, iattr);
 	if (unlikely(error))
 		return error;
 

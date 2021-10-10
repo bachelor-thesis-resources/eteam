@@ -127,6 +127,7 @@ typedef struct xfs_mount {
 	int64_t			m_low_space[XFS_LOWSP_MAX];
 						/* low free space thresholds */
 	struct xfs_kobj		m_kobj;
+	struct xstats		m_stats;	/* per-fs stats */
 
 	struct workqueue_struct *m_buf_workqueue;
 	struct workqueue_struct	*m_data_workqueue;
@@ -277,6 +278,7 @@ typedef struct xfs_perag {
 	char		pagi_inodeok;	/* The agi is ok for inodes */
 	__uint8_t	pagf_levels[XFS_BTNUM_AGF];
 					/* # of levels in bno & cnt btree */
+	bool		pagf_agflreset; /* agfl requires reset before use */
 	__uint32_t	pagf_flcount;	/* count of blocks in freelist */
 	xfs_extlen_t	pagf_freeblks;	/* total free blocks */
 	xfs_extlen_t	pagf_longest;	/* longest free space */
@@ -312,6 +314,7 @@ typedef struct xfs_perag {
 	int		pagb_count;	/* pagb slots in use */
 } xfs_perag_t;
 
+extern void	xfs_uuid_table_free(void);
 extern int	xfs_log_sbcount(xfs_mount_t *);
 extern __uint64_t xfs_default_resblks(xfs_mount_t *mp);
 extern int	xfs_mountfs(xfs_mount_t *mp);
@@ -335,5 +338,8 @@ extern int	xfs_sb_validate_fsb_count(struct xfs_sb *, __uint64_t);
 extern int	xfs_dev_is_read_only(struct xfs_mount *, char *);
 
 extern void	xfs_set_low_space_thresholds(struct xfs_mount *);
+
+int	xfs_zero_extent(struct xfs_inode *ip, xfs_fsblock_t start_fsb,
+			xfs_off_t count_fsb);
 
 #endif	/* __XFS_MOUNT_H__ */

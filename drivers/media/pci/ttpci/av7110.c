@@ -303,7 +303,6 @@ static int arm_thread(void *data)
 static int DvbDmxFilterCallback(u8 *buffer1, size_t buffer1_len,
 				u8 *buffer2, size_t buffer2_len,
 				struct dvb_demux_filter *dvbdmxfilter,
-				enum dmx_success success,
 				struct av7110 *av7110)
 {
 	if (!dvbdmxfilter->feed->demux->dmx.frontend)
@@ -329,16 +328,14 @@ static int DvbDmxFilterCallback(u8 *buffer1, size_t buffer1_len,
 		}
 		return dvbdmxfilter->feed->cb.sec(buffer1, buffer1_len,
 						  buffer2, buffer2_len,
-						  &dvbdmxfilter->filter,
-						  DMX_OK);
+						  &dvbdmxfilter->filter);
 	case DMX_TYPE_TS:
 		if (!(dvbdmxfilter->feed->ts_type & TS_PACKET))
 			return 0;
 		if (dvbdmxfilter->feed->ts_type & TS_PAYLOAD_ONLY)
 			return dvbdmxfilter->feed->cb.ts(buffer1, buffer1_len,
 							 buffer2, buffer2_len,
-							 &dvbdmxfilter->feed->feed.ts,
-							 DMX_OK);
+							 &dvbdmxfilter->feed->feed.ts);
 		else
 			av7110_p2t_write(buffer1, buffer1_len,
 					 dvbdmxfilter->feed->pid,
@@ -422,21 +419,22 @@ static void debiirq(unsigned long cookie)
 			DvbDmxFilterCallback((u8 *)av7110->debi_virt,
 					     av7110->debilen, NULL, 0,
 					     av7110->handle2filter[handle],
-					     DMX_OK, av7110);
+					     av7110);
 		xfer = RX_BUFF;
 		break;
 
 	case DATA_CI_GET:
 	{
 		u8 *data = av7110->debi_virt;
+		u8 data_0 = data[0];
 
-		if ((data[0] < 2) && data[2] == 0xff) {
+		if (data_0 < 2 && data[2] == 0xff) {
 			int flags = 0;
 			if (data[5] > 0)
 				flags |= CA_CI_MODULE_PRESENT;
 			if (data[5] > 5)
 				flags |= CA_CI_MODULE_READY;
-			av7110->ci_slot[data[0]].flags = flags;
+			av7110->ci_slot[data_0].flags = flags;
 		} else
 			ci_get_data(&av7110->ci_rbuffer,
 				    av7110->debi_virt,

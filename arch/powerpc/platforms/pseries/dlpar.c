@@ -18,6 +18,8 @@
 #include <linux/cpu.h>
 #include <linux/slab.h>
 #include <linux/of.h>
+
+#include "of_helpers.h"
 #include "offline_states.h"
 #include "pseries.h"
 
@@ -53,6 +55,10 @@ static struct property *dlpar_parse_cc_property(struct cc_workarea *ccwa)
 
 	name = (char *)ccwa + be32_to_cpu(ccwa->name_offset);
 	prop->name = kstrdup(name, GFP_KERNEL);
+	if (!prop->name) {
+		dlpar_free_cc_property(prop);
+		return NULL;
+	}
 
 	prop->length = be32_to_cpu(ccwa->prop_length);
 	value = (char *)ccwa + be32_to_cpu(ccwa->prop_offset);
@@ -125,7 +131,6 @@ void dlpar_free_cc_nodes(struct device_node *dn)
 #define NEXT_PROPERTY   3
 #define PREV_PARENT     4
 #define MORE_MEMORY     5
-#define CALL_AGAIN	-2
 #define ERR_CFG_USE     -9003
 
 struct device_node *dlpar_configure_connector(__be32 drc_index,
@@ -166,6 +171,9 @@ struct device_node *dlpar_configure_connector(__be32 drc_index,
 		memcpy(data_buf, rtas_data_buf, RTAS_DATA_BUF_SIZE);
 
 		spin_unlock(&rtas_data_buf_lock);
+
+		if (rtas_busy_delay(rc))
+			continue;
 
 		switch (rc) {
 		case COMPLETE:
@@ -219,9 +227,6 @@ struct device_node *dlpar_configure_connector(__be32 drc_index,
 			parent_path = last_dn->parent->full_name;
 			break;
 
-		case CALL_AGAIN:
-			break;
-
 		case MORE_MEMORY:
 		case ERR_CFG_USE:
 		default:
@@ -244,36 +249,13 @@ cc_error:
 	return first_dn;
 }
 
-static struct device_node *derive_parent(const char *path)
-{
-	struct device_node *parent;
-	char *last_slash;
-
-	last_slash = strrchr(path, '/');
-	if (last_slash == path) {
-		parent = of_find_node_by_path("/");
-	} else {
-		char *parent_path;
-		int parent_path_len = last_slash - path + 1;
-		parent_path = kmalloc(parent_path_len, GFP_KERNEL);
-		if (!parent_path)
-			return NULL;
-
-		strlcpy(parent_path, path, parent_path_len);
-		parent = of_find_node_by_path(parent_path);
-		kfree(parent_path);
-	}
-
-	return parent;
-}
-
 int dlpar_attach_node(struct device_node *dn)
 {
 	int rc;
 
-	dn->parent = derive_parent(dn->full_name);
-	if (!dn->parent)
-		return -ENOMEM;
+	dn->parent = pseries_of_derive_parent(dn->full_name);
+	if (IS_ERR(dn->parent))
+		return PTR_ERR(dn->parent);
 
 	rc = of_attach_node(dn);
 	if (rc) {
@@ -301,7 +283,8 @@ int dlpar_detach_node(struct device_node *dn)
 	if (rc)
 		return rc;
 
-	of_node_put(dn); /* Must decrement the refcount */
+	of_node_put(dn);
+
 	return 0;
 }
 

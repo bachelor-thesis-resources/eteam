@@ -52,7 +52,9 @@ static inline u32 pmx_readl(struct tegra_pmx *pmx, u32 bank, u32 reg)
 
 static inline void pmx_writel(struct tegra_pmx *pmx, u32 val, u32 bank, u32 reg)
 {
-	writel(val, pmx->regs[bank] + reg);
+	writel_relaxed(val, pmx->regs[bank] + reg);
+	/* make sure pinmux register write completed */
+	pmx_readl(pmx, bank, reg);
 }
 
 static int tegra_pinctrl_get_groups_count(struct pinctrl_dev *pctldev)
@@ -416,7 +418,7 @@ static int tegra_pinconf_reg(struct tegra_pmx *pmx,
 		return -ENOTSUPP;
 	}
 
-	if (*reg < 0 || *bit > 31) {
+	if (*reg < 0 || *bit < 0)  {
 		if (report_err) {
 			const char *prop = "unknown";
 			int i;
@@ -624,6 +626,22 @@ static struct pinctrl_desc tegra_pinctrl_desc = {
 	.owner = THIS_MODULE,
 };
 
+static bool gpio_node_has_range(void)
+{
+	struct device_node *np;
+	bool has_prop = false;
+
+	np = of_find_compatible_node(NULL, NULL, "nvidia,tegra30-gpio");
+	if (!np)
+		return has_prop;
+
+	has_prop = of_find_property(np, "gpio-ranges", NULL);
+
+	of_node_put(np);
+
+	return has_prop;
+}
+
 int tegra_pinctrl_probe(struct platform_device *pdev,
 			const struct tegra_pinctrl_soc_data *soc_data)
 {
@@ -708,7 +726,8 @@ int tegra_pinctrl_probe(struct platform_device *pdev,
 		return PTR_ERR(pmx->pctl);
 	}
 
-	pinctrl_add_gpio_range(pmx->pctl, &tegra_pinctrl_gpio_range);
+	if (!gpio_node_has_range())
+		pinctrl_add_gpio_range(pmx->pctl, &tegra_pinctrl_gpio_range);
 
 	platform_set_drvdata(pdev, pmx);
 

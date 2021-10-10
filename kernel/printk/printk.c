@@ -269,6 +269,9 @@ static u32 clear_idx;
 #define PREFIX_MAX		32
 #define LOG_LINE_MAX		(1024 - PREFIX_MAX)
 
+#define LOG_LEVEL(v)		((v) & 0x07)
+#define LOG_FACILITY(v)		((v) >> 3 & 0xff)
+
 /* record buffer */
 #if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
 #define LOG_ALIGN 4
@@ -276,6 +279,7 @@ static u32 clear_idx;
 #define LOG_ALIGN __alignof__(struct printk_log)
 #endif
 #define __LOG_BUF_LEN (1 << CONFIG_LOG_BUF_SHIFT)
+#define LOG_BUF_LEN_MAX (u32)(1 << 31)
 static char __log_buf[__LOG_BUF_LEN] __aligned(LOG_ALIGN);
 static char *log_buf = __log_buf;
 static u32 log_buf_len = __LOG_BUF_LEN;
@@ -517,6 +521,7 @@ int check_syslog_permissions(int type, int source)
 ok:
 	return security_syslog(type);
 }
+EXPORT_SYMBOL_GPL(check_syslog_permissions);
 
 static void append_char(char **pp, char *e, char c)
 {
@@ -611,7 +616,6 @@ struct devkmsg_user {
 static ssize_t devkmsg_write(struct kiocb *iocb, struct iov_iter *from)
 {
 	char *buf, *line;
-	int i;
 	int level = default_message_loglevel;
 	int facility = 1;	/* LOG_USER */
 	size_t len = iov_iter_count(from);
@@ -641,12 +645,13 @@ static ssize_t devkmsg_write(struct kiocb *iocb, struct iov_iter *from)
 	line = buf;
 	if (line[0] == '<') {
 		char *endp = NULL;
+		unsigned int u;
 
-		i = simple_strtoul(line+1, &endp, 10);
+		u = simple_strtoul(line + 1, &endp, 10);
 		if (endp && endp[0] == '>') {
-			level = i & 7;
-			if (i >> 3)
-				facility = i >> 3;
+			level = LOG_LEVEL(u);
+			if (LOG_FACILITY(u) != 0)
+				facility = LOG_FACILITY(u);
 			endp++;
 			len -= endp - line;
 			line = endp;
@@ -835,7 +840,7 @@ const struct file_operations kmsg_fops = {
 	.release = devkmsg_release,
 };
 
-#ifdef CONFIG_KEXEC
+#ifdef CONFIG_KEXEC_CORE
 /*
  * This appends the listed symbols to /proc/vmcore
  *
@@ -866,18 +871,28 @@ void log_buf_kexec_setup(void)
 static unsigned long __initdata new_log_buf_len;
 
 /* we practice scaling the ring buffer by powers of 2 */
-static void __init log_buf_len_update(unsigned size)
+static void __init log_buf_len_update(u64 size)
 {
+	if (size > (u64)LOG_BUF_LEN_MAX) {
+		size = (u64)LOG_BUF_LEN_MAX;
+		pr_err("log_buf over 2G is not supported.\n");
+	}
+
 	if (size)
 		size = roundup_pow_of_two(size);
 	if (size > log_buf_len)
-		new_log_buf_len = size;
+		new_log_buf_len = (unsigned long)size;
 }
 
 /* save requested log_buf_len since it's too early to process it */
 static int __init log_buf_len_setup(char *str)
 {
-	unsigned size = memparse(str, &str);
+	u64 size;
+
+	if (!str)
+		return -EINVAL;
+
+	size = memparse(str, &str);
 
 	log_buf_len_update(size);
 
@@ -922,7 +937,7 @@ void __init setup_log_buf(int early)
 {
 	unsigned long flags;
 	char *new_log_buf;
-	int free;
+	unsigned int free;
 
 	if (log_buf != __log_buf)
 		return;
@@ -942,7 +957,7 @@ void __init setup_log_buf(int early)
 	}
 
 	if (unlikely(!new_log_buf)) {
-		pr_err("log_buf_len: %ld bytes not available\n",
+		pr_err("log_buf_len: %lu bytes not available\n",
 			new_log_buf_len);
 		return;
 	}
@@ -955,8 +970,8 @@ void __init setup_log_buf(int early)
 	memcpy(log_buf, __log_buf, __LOG_BUF_LEN);
 	raw_spin_unlock_irqrestore(&logbuf_lock, flags);
 
-	pr_info("log_buf_len: %d bytes\n", log_buf_len);
-	pr_info("early log buf free: %d(%d%%)\n",
+	pr_info("log_buf_len: %u bytes\n", log_buf_len);
+	pr_info("early log buf free: %u(%u%%)\n",
 		free, (free * 100) / __LOG_BUF_LEN);
 }
 
@@ -1432,7 +1447,7 @@ static void call_console_drivers(int level,
 {
 	struct console *con;
 
-	trace_console(text, len);
+	trace_console_rcuidle(text, len);
 
 	if (level >= console_loglevel && !ignore_loglevel)
 		return;
@@ -1805,20 +1820,12 @@ asmlinkage int vprintk_emit(int facility, int level,
 	if (!in_sched) {
 		lockdep_off();
 		/*
-		 * Disable preemption to avoid being preempted while holding
-		 * console_sem which would prevent anyone from printing to
-		 * console
-		 */
-		preempt_disable();
-
-		/*
 		 * Try to acquire and then immediately release the console
 		 * semaphore.  The release will print out buffers and wake up
 		 * /dev/kmsg and syslog() users.
 		 */
 		if (console_trylock_for_printk())
 			console_unlock();
-		preempt_enable();
 		lockdep_on();
 	}
 
@@ -2017,6 +2024,9 @@ static int __init console_setup(char *str)
 	char *s, *options, *brl_options = NULL;
 	int idx;
 
+	if (str[0] == 0)
+		return 1;
+
 	if (_braille_console_setup(&str, &brl_options))
 		return 1;
 
@@ -2169,7 +2179,20 @@ int console_trylock(void)
 		return 0;
 	}
 	console_locked = 1;
-	console_may_schedule = 0;
+	/*
+	 * When PREEMPT_COUNT disabled we can't reliably detect if it's
+	 * safe to schedule (e.g. calling printk while holding a spin_lock),
+	 * because preempt_disable()/preempt_enable() are just barriers there
+	 * and preempt_count() is always 0.
+	 *
+	 * RCU read sections have a separate preemption counter when
+	 * PREEMPT_RCU enabled thus we must take extra care and check
+	 * rcu_preempt_depth(), otherwise RCU read sections modify
+	 * preempt_count().
+	 */
+	console_may_schedule = !oops_in_progress &&
+			preemptible() &&
+			!rcu_preempt_depth();
 	return 1;
 }
 EXPORT_SYMBOL(console_trylock);
@@ -2229,13 +2252,24 @@ void console_unlock(void)
 	static u64 seen_seq;
 	unsigned long flags;
 	bool wake_klogd = false;
-	bool retry;
+	bool do_cond_resched, retry;
 
 	if (console_suspended) {
 		up_console_sem();
 		return;
 	}
 
+	/*
+	 * Console drivers are called under logbuf_lock, so
+	 * @console_may_schedule should be cleared before; however, we may
+	 * end up dumping a lot of lines, for example, if called from
+	 * console registration path, and should invoke cond_resched()
+	 * between lines if allowable.  Not doing so can cause a very long
+	 * scheduling stall on a slow console leading to RCU stall and
+	 * softlockup warnings which exacerbate the issue with more
+	 * messages practically incapacitating the system.
+	 */
+	do_cond_resched = console_may_schedule;
 	console_may_schedule = 0;
 
 	/* flush buffered message fragment immediately to console */
@@ -2307,6 +2341,9 @@ skip:
 		call_console_drivers(level, ext_text, ext_len, text, len);
 		start_critical_timings();
 		local_irq_restore(flags);
+
+		if (do_cond_resched)
+			cond_resched();
 	}
 	console_locked = 0;
 
@@ -2371,6 +2408,25 @@ void console_unblank(void)
 	for_each_console(c)
 		if ((c->flags & CON_ENABLED) && c->unblank)
 			c->unblank();
+	console_unlock();
+}
+
+/**
+ * console_flush_on_panic - flush console content on panic
+ *
+ * Immediately output all pending messages no matter what.
+ */
+void console_flush_on_panic(void)
+{
+	/*
+	 * If someone else is holding the console lock, trylock will fail
+	 * and may_schedule may be set.  Ignore and proceed to unlock so
+	 * that messages are flushed out.  As this can be called from any
+	 * context and we don't want to get preempted while flushing,
+	 * ensure may_schedule is cleared.
+	 */
+	console_trylock();
+	console_may_schedule = 0;
 	console_unlock();
 }
 
@@ -3006,7 +3062,7 @@ bool kmsg_dump_get_buffer(struct kmsg_dumper *dumper, bool syslog,
 	seq = dumper->cur_seq;
 	idx = dumper->cur_idx;
 	prev = 0;
-	while (l > size && seq < dumper->next_seq) {
+	while (l >= size && seq < dumper->next_seq) {
 		struct printk_log *msg = log_from_idx(idx);
 
 		l -= msg_print_text(msg, prev, true, NULL, 0);

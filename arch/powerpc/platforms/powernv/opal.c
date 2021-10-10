@@ -98,16 +98,11 @@ int __init early_init_dt_scan_opal(unsigned long node,
 	pr_debug("OPAL Entry = 0x%llx (sizep=%p runtimesz=%d)\n",
 		 opal.size, sizep, runtimesz);
 
-	powerpc_firmware_features |= FW_FEATURE_OPAL;
 	if (of_flat_dt_is_compatible(node, "ibm,opal-v3")) {
-		powerpc_firmware_features |= FW_FEATURE_OPALv2;
-		powerpc_firmware_features |= FW_FEATURE_OPALv3;
-		pr_info("OPAL V3 detected !\n");
-	} else if (of_flat_dt_is_compatible(node, "ibm,opal-v2")) {
-		powerpc_firmware_features |= FW_FEATURE_OPALv2;
-		pr_info("OPAL V2 detected !\n");
+		powerpc_firmware_features |= FW_FEATURE_OPAL;
+		pr_info("OPAL detected !\n");
 	} else {
-		pr_info("OPAL V1 detected !\n");
+		panic("OPAL != V3 detected, no longer supported.\n");
 	}
 
 	/* Reinit all cores with the right endian */
@@ -278,7 +273,7 @@ static void opal_handle_message(void)
 
 	/* Sanity check */
 	if (type >= OPAL_MSG_TYPE_MAX) {
-		pr_warning("%s: Unknown message type: %u\n", __func__, type);
+		pr_warn_once("%s: Unknown message type: %u\n", __func__, type);
 		return;
 	}
 	opal_message_do_notify(type, (void *)&msg);
@@ -352,17 +347,15 @@ int opal_put_chars(uint32_t vtermno, const char *data, int total_len)
 	 * enough room and be done with it
 	 */
 	spin_lock_irqsave(&opal_write_lock, flags);
-	if (firmware_has_feature(FW_FEATURE_OPALv2)) {
-		rc = opal_console_write_buffer_space(vtermno, &olen);
-		len = be64_to_cpu(olen);
-		if (rc || len < total_len) {
-			spin_unlock_irqrestore(&opal_write_lock, flags);
-			/* Closed -> drop characters */
-			if (rc)
-				return total_len;
-			opal_poll_events(NULL);
-			return -EAGAIN;
-		}
+	rc = opal_console_write_buffer_space(vtermno, &olen);
+	len = be64_to_cpu(olen);
+	if (rc || len < total_len) {
+		spin_unlock_irqrestore(&opal_write_lock, flags);
+		/* Closed -> drop characters */
+		if (rc)
+			return total_len;
+		opal_poll_events(NULL);
+		return -EAGAIN;
 	}
 
 	/* We still try to handle partial completions, though they
@@ -378,7 +371,7 @@ int opal_put_chars(uint32_t vtermno, const char *data, int total_len)
 		/* Closed or other error drop */
 		if (rc != OPAL_SUCCESS && rc != OPAL_BUSY &&
 		    rc != OPAL_BUSY_EVENT) {
-			written = total_len;
+			written += total_len;
 			break;
 		}
 		if (rc == OPAL_SUCCESS) {
@@ -408,6 +401,7 @@ static int opal_recover_mce(struct pt_regs *regs,
 
 	if (!(regs->msr & MSR_RI)) {
 		/* If MSR_RI isn't set, we cannot recover */
+		pr_err("Machine check interrupt unrecoverable: MSR(RI=0)\n");
 		recovered = 0;
 	} else if (evt->disposition == MCE_DISPOSITION_RECOVERED) {
 		/* Platform corrected itself */
@@ -441,6 +435,7 @@ static int opal_recover_mce(struct pt_regs *regs,
 int opal_machine_check(struct pt_regs *regs)
 {
 	struct machine_check_event evt;
+	int ret;
 
 	if (!get_mce_event(&evt, MCE_EVENT_RELEASE))
 		return 0;
@@ -455,6 +450,43 @@ int opal_machine_check(struct pt_regs *regs)
 
 	if (opal_recover_mce(regs, &evt))
 		return 1;
+
+	/*
+	 * Unrecovered machine check, we are heading to panic path.
+	 *
+	 * We may have hit this MCE in very early stage of kernel
+	 * initialization even before opal-prd has started running. If
+	 * this is the case then this MCE error may go un-noticed or
+	 * un-analyzed if we go down panic path. We need to inform
+	 * BMC/OCC about this error so that they can collect relevant
+	 * data for error analysis before rebooting.
+	 * Use opal_cec_reboot2(OPAL_REBOOT_PLATFORM_ERROR) to do so.
+	 * This function may not return on BMC based system.
+	 */
+	ret = opal_cec_reboot2(OPAL_REBOOT_PLATFORM_ERROR,
+			"Unrecoverable Machine Check exception");
+	if (ret == OPAL_UNSUPPORTED) {
+		pr_emerg("Reboot type %d not supported\n",
+					OPAL_REBOOT_PLATFORM_ERROR);
+	}
+
+	/*
+	 * We reached here. There can be three possibilities:
+	 * 1. We are running on a firmware level that do not support
+	 *    opal_cec_reboot2()
+	 * 2. We are running on a firmware level that do not support
+	 *    OPAL_REBOOT_PLATFORM_ERROR reboot type.
+	 * 3. We are running on FSP based system that does not need opal
+	 *    to trigger checkstop explicitly for error analysis. The FSP
+	 *    PRD component would have already got notified about this
+	 *    error through other channels.
+	 *
+	 * If hardware marked this as an unrecoverable MCE, we are
+	 * going to panic anyway. Even if it didn't, it's not safe to
+	 * continue at this point, so we should explicitly panic.
+	 */
+
+	panic("PowerNV Unrecovered Machine Check");
 	return 0;
 }
 
@@ -549,7 +581,10 @@ static ssize_t symbol_map_read(struct file *fp, struct kobject *kobj,
 				       bin_attr->size);
 }
 
-static BIN_ATTR_RO(symbol_map, 0);
+static struct bin_attribute symbol_map_attr = {
+	.attr = {.name = "symbol_map", .mode = 0400},
+	.read = symbol_map_read
+};
 
 static void opal_export_symmap(void)
 {
@@ -566,10 +601,10 @@ static void opal_export_symmap(void)
 		return;
 
 	/* Setup attributes */
-	bin_attr_symbol_map.private = __va(be64_to_cpu(syms[0]));
-	bin_attr_symbol_map.size = be64_to_cpu(syms[1]);
+	symbol_map_attr.private = __va(be64_to_cpu(syms[0]));
+	symbol_map_attr.size = be64_to_cpu(syms[1]);
 
-	rc = sysfs_create_bin_file(opal_kobj, &bin_attr_symbol_map);
+	rc = sysfs_create_bin_file(opal_kobj, &symbol_map_attr);
 	if (rc)
 		pr_warn("Error %d creating OPAL symbols file\n", rc);
 }
@@ -648,7 +683,7 @@ static void opal_init_heartbeat(void)
 
 static int __init opal_init(void)
 {
-	struct device_node *np, *consoles;
+	struct device_node *np, *consoles, *leds;
 	int rc;
 
 	opal_node = of_find_node_by_path("/ibm,opal");
@@ -658,10 +693,7 @@ static int __init opal_init(void)
 	}
 
 	/* Register OPAL consoles if any ports */
-	if (firmware_has_feature(FW_FEATURE_OPALv2))
-		consoles = of_find_node_by_path("/ibm,opal/consoles");
-	else
-		consoles = of_node_get(opal_node);
+	consoles = of_find_node_by_path("/ibm,opal/consoles");
 	if (consoles) {
 		for_each_child_of_node(consoles, np) {
 			if (strcmp(np->name, "serial"))
@@ -689,6 +721,13 @@ static int __init opal_init(void)
 	/* Setup a heatbeat thread if requested by OPAL */
 	opal_init_heartbeat();
 
+	/* Create leds platform devices */
+	leds = of_find_node_by_path("/ibm,opal/leds");
+	if (leds) {
+		of_platform_device_create(leds, "opal_leds", NULL);
+		of_node_put(leds);
+	}
+
 	/* Create "opal" kobject under /sys/firmware */
 	rc = opal_sysfs_init();
 	if (rc == 0) {
@@ -712,6 +751,9 @@ static int __init opal_init(void)
 	opal_pdev_init(opal_node, "ibm,opal-ipmi");
 	opal_pdev_init(opal_node, "ibm,opal-flash");
 	opal_pdev_init(opal_node, "ibm,opal-prd");
+
+	/* Initialise OPAL kmsg dumper for flushing console on panic */
+	opal_kmsg_init();
 
 	return 0;
 }
@@ -841,3 +883,6 @@ EXPORT_SYMBOL_GPL(opal_rtc_write);
 EXPORT_SYMBOL_GPL(opal_tpo_read);
 EXPORT_SYMBOL_GPL(opal_tpo_write);
 EXPORT_SYMBOL_GPL(opal_i2c_request);
+/* Export these symbols for PowerNV LED class driver */
+EXPORT_SYMBOL_GPL(opal_leds_get_ind);
+EXPORT_SYMBOL_GPL(opal_leds_set_ind);

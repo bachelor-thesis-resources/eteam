@@ -6,6 +6,7 @@
 #ifdef CONFIG_PARAVIRT
 #include <asm/pgtable_types.h>
 #include <asm/asm.h>
+#include <asm/nospec-branch.h>
 
 #include <asm/paravirt_types.h>
 
@@ -17,6 +18,12 @@
 static inline int paravirt_enabled(void)
 {
 	return pv_info.paravirt_enabled;
+}
+
+static inline int paravirt_has_feature(unsigned int feature)
+{
+	WARN_ON_ONCE(!pv_info.paravirt_enabled);
+	return (pv_info.features & feature);
 }
 
 static inline void load_sp0(struct tss_struct *tss,
@@ -153,7 +160,11 @@ do {						\
 	val = paravirt_read_msr(msr, &_err);	\
 } while (0)
 
-#define wrmsrl(msr, val)	wrmsr(msr, (u32)((u64)(val)), ((u64)(val))>>32)
+static inline void wrmsrl(unsigned msr, u64 val)
+{
+	wrmsr(msr, (u32)val, (u32)(val>>32));
+}
+
 #define wrmsr_safe(msr, a, b)	paravirt_write_msr(msr, a, b)
 
 /* rdmsr with exception handling */
@@ -173,19 +184,6 @@ static inline int rdmsrl_safe(unsigned msr, unsigned long long *p)
 	*p = paravirt_read_msr(msr, &err);
 	return err;
 }
-
-static inline u64 paravirt_read_tsc(void)
-{
-	return PVOP_CALL0(u64, pv_cpu_ops.read_tsc);
-}
-
-#define rdtscl(low)				\
-do {						\
-	u64 _l = paravirt_read_tsc();		\
-	low = (int)_l;				\
-} while (0)
-
-#define rdtscll(val) (val = paravirt_read_tsc())
 
 static inline unsigned long long paravirt_sched_clock(void)
 {
@@ -214,27 +212,6 @@ do {						\
 } while (0)
 
 #define rdpmcl(counter, val) ((val) = paravirt_read_pmc(counter))
-
-static inline unsigned long long paravirt_rdtscp(unsigned int *aux)
-{
-	return PVOP_CALL1(u64, pv_cpu_ops.read_tscp, aux);
-}
-
-#define rdtscp(low, high, aux)				\
-do {							\
-	int __aux;					\
-	unsigned long __val = paravirt_rdtscp(&__aux);	\
-	(low) = (u32)__val;				\
-	(high) = (u32)(__val >> 32);			\
-	(aux) = __aux;					\
-} while (0)
-
-#define rdtscpll(val, aux)				\
-do {							\
-	unsigned long __aux; 				\
-	val = paravirt_rdtscp(&__aux);			\
-	(aux) = __aux;					\
-} while (0)
 
 static inline void paravirt_alloc_ldt(struct desc_struct *ldt, unsigned entries)
 {
@@ -938,37 +915,35 @@ extern void default_banner(void);
 
 #define INTERRUPT_RETURN						\
 	PARA_SITE(PARA_PATCH(pv_cpu_ops, PV_CPU_iret), CLBR_NONE,	\
-		  jmp PARA_INDIRECT(pv_cpu_ops+PV_CPU_iret))
+		  ANNOTATE_RETPOLINE_SAFE;					\
+		  jmp PARA_INDIRECT(pv_cpu_ops+PV_CPU_iret);)
 
 #define DISABLE_INTERRUPTS(clobbers)					\
 	PARA_SITE(PARA_PATCH(pv_irq_ops, PV_IRQ_irq_disable), clobbers, \
 		  PV_SAVE_REGS(clobbers | CLBR_CALLEE_SAVE);		\
+		  ANNOTATE_RETPOLINE_SAFE;					\
 		  call PARA_INDIRECT(pv_irq_ops+PV_IRQ_irq_disable);	\
 		  PV_RESTORE_REGS(clobbers | CLBR_CALLEE_SAVE);)
 
 #define ENABLE_INTERRUPTS(clobbers)					\
 	PARA_SITE(PARA_PATCH(pv_irq_ops, PV_IRQ_irq_enable), clobbers,	\
 		  PV_SAVE_REGS(clobbers | CLBR_CALLEE_SAVE);		\
+		  ANNOTATE_RETPOLINE_SAFE;					\
 		  call PARA_INDIRECT(pv_irq_ops+PV_IRQ_irq_enable);	\
 		  PV_RESTORE_REGS(clobbers | CLBR_CALLEE_SAVE);)
 
 #define USERGS_SYSRET32							\
 	PARA_SITE(PARA_PATCH(pv_cpu_ops, PV_CPU_usergs_sysret32),	\
 		  CLBR_NONE,						\
+		  ANNOTATE_RETPOLINE_SAFE;					\
 		  jmp PARA_INDIRECT(pv_cpu_ops+PV_CPU_usergs_sysret32))
 
 #ifdef CONFIG_X86_32
 #define GET_CR0_INTO_EAX				\
 	push %ecx; push %edx;				\
+	ANNOTATE_RETPOLINE_SAFE;				\
 	call PARA_INDIRECT(pv_cpu_ops+PV_CPU_read_cr0);	\
 	pop %edx; pop %ecx
-
-#define ENABLE_INTERRUPTS_SYSEXIT					\
-	PARA_SITE(PARA_PATCH(pv_cpu_ops, PV_CPU_irq_enable_sysexit),	\
-		  CLBR_NONE,						\
-		  jmp PARA_INDIRECT(pv_cpu_ops+PV_CPU_irq_enable_sysexit))
-
-
 #else	/* !CONFIG_X86_32 */
 
 /*
@@ -988,21 +963,25 @@ extern void default_banner(void);
  */
 #define SWAPGS								\
 	PARA_SITE(PARA_PATCH(pv_cpu_ops, PV_CPU_swapgs), CLBR_NONE,	\
-		  call PARA_INDIRECT(pv_cpu_ops+PV_CPU_swapgs)		\
+		  ANNOTATE_RETPOLINE_SAFE;					\
+		  call PARA_INDIRECT(pv_cpu_ops+PV_CPU_swapgs);		\
 		 )
 
 #define GET_CR2_INTO_RAX				\
-	call PARA_INDIRECT(pv_mmu_ops+PV_MMU_read_cr2)
+	ANNOTATE_RETPOLINE_SAFE;				\
+	call PARA_INDIRECT(pv_mmu_ops+PV_MMU_read_cr2);
 
 #define PARAVIRT_ADJUST_EXCEPTION_FRAME					\
 	PARA_SITE(PARA_PATCH(pv_irq_ops, PV_IRQ_adjust_exception_frame), \
 		  CLBR_NONE,						\
+		  ANNOTATE_RETPOLINE_SAFE;				\
 		  call PARA_INDIRECT(pv_irq_ops+PV_IRQ_adjust_exception_frame))
 
 #define USERGS_SYSRET64							\
 	PARA_SITE(PARA_PATCH(pv_cpu_ops, PV_CPU_usergs_sysret64),	\
 		  CLBR_NONE,						\
-		  jmp PARA_INDIRECT(pv_cpu_ops+PV_CPU_usergs_sysret64))
+		  ANNOTATE_RETPOLINE_SAFE;					\
+		  jmp PARA_INDIRECT(pv_cpu_ops+PV_CPU_usergs_sysret64);)
 #endif	/* CONFIG_X86_32 */
 
 #endif /* __ASSEMBLY__ */

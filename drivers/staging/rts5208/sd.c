@@ -246,11 +246,10 @@ RTY_SEND_CMD:
 				}
 			}
 #ifdef SUPPORT_SD_LOCK
-			if (ptr[1] & 0x7D)
+			if (ptr[1] & 0x7D) {
 #else
-			if (ptr[1] & 0x7F)
+			if (ptr[1] & 0x7F) {
 #endif
-			{
 				dev_dbg(rtsx_dev(chip), "ptr[1]: 0x%02x\n",
 					ptr[1]);
 				rtsx_trace(chip);
@@ -3520,12 +3519,11 @@ int reset_sd_card(struct rtsx_chip *chip)
 			if (chip->sd_io) {
 				rtsx_trace(chip);
 				return STATUS_FAIL;
-			} else {
-				retval = reset_mmc(chip);
-				if (retval != STATUS_SUCCESS) {
-					rtsx_trace(chip);
-					return STATUS_FAIL;
-				}
+			}
+			retval = reset_mmc(chip);
+			if (retval != STATUS_SUCCESS) {
+				rtsx_trace(chip);
+				return STATUS_FAIL;
 			}
 		}
 	}
@@ -4149,11 +4147,10 @@ RTY_SEND_CMD:
 			}
 		}
 #ifdef SUPPORT_SD_LOCK
-		if (ptr[1] & 0x7D)
+		if (ptr[1] & 0x7D) {
 #else
-		if (ptr[1] & 0x7F)
+		if (ptr[1] & 0x7F) {
 #endif
-		{
 			rtsx_trace(chip);
 			return STATUS_FAIL;
 		}
@@ -4165,12 +4162,6 @@ RTY_SEND_CMD:
 		if (cmd_idx == SELECT_CARD) {
 			if (rsp_type == SD_RSP_TYPE_R2) {
 				if ((ptr[3] & 0x1E) != 0x04) {
-					rtsx_trace(chip);
-					return STATUS_FAIL;
-				}
-
-			} else if (rsp_type == SD_RSP_TYPE_R0) {
-				if ((ptr[3] & 0x1E) != 0x03) {
 					rtsx_trace(chip);
 					return STATUS_FAIL;
 				}
@@ -5034,7 +5025,7 @@ int sd_execute_write_data(struct scsi_cmnd *srb, struct rtsx_chip *chip)
 			goto SD_Execute_Write_Cmd_Failed;
 		}
 
-		rtsx_write_register(chip, SD_BYTE_CNT_L, 0xFF, 0x00);
+		retval = rtsx_write_register(chip, SD_BYTE_CNT_L, 0xFF, 0x00);
 		if (retval != STATUS_SUCCESS) {
 			rtsx_trace(chip);
 			goto SD_Execute_Write_Cmd_Failed;

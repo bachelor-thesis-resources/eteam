@@ -586,18 +586,10 @@ static void edac_mc_workq_setup(struct mem_ctl_info *mci, unsigned msec,
  */
 static void edac_mc_workq_teardown(struct mem_ctl_info *mci)
 {
-	int status;
+	mci->op_state = OP_OFFLINE;
 
-	if (mci->op_state != OP_RUNNING_POLL)
-		return;
-
-	status = cancel_delayed_work(&mci->work);
-	if (status == 0) {
-		edac_dbg(0, "not canceled, flush the queue\n");
-
-		/* workq instance might be running, wait for it */
-		flush_workqueue(edac_workqueue);
-	}
+	cancel_delayed_work_sync(&mci->work);
+	flush_workqueue(edac_workqueue);
 }
 
 /*
@@ -974,7 +966,7 @@ static void edac_inc_ue_error(struct mem_ctl_info *mci,
 	mci->ue_mc += count;
 
 	if (!enable_per_layer_report) {
-		mci->ce_noinfo_count += count;
+		mci->ue_noinfo_count += count;
 		return;
 	}
 
@@ -1302,7 +1294,7 @@ void edac_mc_handle_error(const enum hw_event_mc_err_type type,
 	grain_bits = fls_long(e->grain) + 1;
 	trace_mc_event(type, e->msg, e->label, e->error_count,
 		       mci->mc_idx, e->top_layer, e->mid_layer, e->low_layer,
-		       PAGES_TO_MiB(e->page_frame_number) | e->offset_in_page,
+		       (e->page_frame_number << PAGE_SHIFT) | e->offset_in_page,
 		       grain_bits, e->syndrome, e->other_detail);
 
 	edac_raw_mc_handle_error(type, mci, e);

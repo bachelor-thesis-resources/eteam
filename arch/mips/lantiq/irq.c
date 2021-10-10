@@ -160,8 +160,9 @@ static int ltq_eiu_settype(struct irq_data *d, unsigned int type)
 			if (edge)
 				irq_set_handler(d->hwirq, handle_edge_irq);
 
-			ltq_eiu_w32(ltq_eiu_r32(LTQ_EIU_EXIN_C) |
-				(val << (i * 4)), LTQ_EIU_EXIN_C);
+			ltq_eiu_w32((ltq_eiu_r32(LTQ_EIU_EXIN_C) &
+				    (~(7 << (i * 4)))) | (val << (i * 4)),
+				    LTQ_EIU_EXIN_C);
 		}
 	}
 
@@ -244,7 +245,7 @@ static void ltq_hw_irqdispatch(int module)
 	do_IRQ((int)irq + MIPS_CPU_IRQ_CASCADE + (INT_NUM_IM_OFFSET * module));
 
 	/* if this is a EBU irq, we need to ack it or get a deadlock */
-	if ((irq == LTQ_ICU_EBU_IRQ) && (module == 0) && LTQ_EBU_PCC_ISTAT)
+	if (irq == LTQ_ICU_EBU_IRQ && !module && LTQ_EBU_PCC_ISTAT != 0)
 		ltq_ebu_w32(ltq_ebu_r32(LTQ_EBU_PCC_ISTAT) | 0x10,
 			LTQ_EBU_PCC_ISTAT);
 }
@@ -369,8 +370,8 @@ int __init icu_of_init(struct device_node *node, struct device_node *parent)
 		if (of_address_to_resource(node, i, &res))
 			panic("Failed to get icu memory range");
 
-		if (request_mem_region(res.start, resource_size(&res),
-					res.name) < 0)
+		if (!request_mem_region(res.start, resource_size(&res),
+					res.name))
 			pr_err("Failed to request icu memory");
 
 		ltq_icu_membase[i] = ioremap_nocache(res.start,
@@ -449,8 +450,8 @@ int __init icu_of_init(struct device_node *node, struct device_node *parent)
 		if (ret != exin_avail)
 			panic("failed to load external irq resources");
 
-		if (request_mem_region(res.start, resource_size(&res),
-							res.name) < 0)
+		if (!request_mem_region(res.start, resource_size(&res),
+							res.name))
 			pr_err("Failed to request eiu memory");
 
 		ltq_eiu_membase = ioremap_nocache(res.start,

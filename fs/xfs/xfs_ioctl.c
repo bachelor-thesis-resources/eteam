@@ -40,6 +40,7 @@
 #include "xfs_symlink.h"
 #include "xfs_trans.h"
 #include "xfs_pnfs.h"
+#include "xfs_acl.h"
 
 #include <linux/capability.h>
 #include <linux/dcache.h>
@@ -402,6 +403,7 @@ xfs_attrlist_by_handle(
 {
 	int			error = -ENOMEM;
 	attrlist_cursor_kern_t	*cursor;
+	struct xfs_fsop_attrlist_handlereq __user	*p = arg;
 	xfs_fsop_attrlist_handlereq_t al_hreq;
 	struct dentry		*dentry;
 	char			*kbuf;
@@ -411,7 +413,7 @@ xfs_attrlist_by_handle(
 	if (copy_from_user(&al_hreq, arg, sizeof(xfs_fsop_attrlist_handlereq_t)))
 		return -EFAULT;
 	if (al_hreq.buflen < sizeof(struct attrlist) ||
-	    al_hreq.buflen > XATTR_LIST_MAX)
+	    al_hreq.buflen > XFS_XATTR_LIST_MAX)
 		return -EINVAL;
 
 	/*
@@ -434,6 +436,11 @@ xfs_attrlist_by_handle(
 	if (error)
 		goto out_kfree;
 
+	if (copy_to_user(&p->pos, cursor, sizeof(attrlist_cursor_kern_t))) {
+		error = -EFAULT;
+		goto out_kfree;
+	}
+
 	if (copy_to_user(al_hreq.buffer, kbuf, al_hreq.buflen))
 		error = -EFAULT;
 
@@ -455,7 +462,7 @@ xfs_attrmulti_attr_get(
 	unsigned char		*kbuf;
 	int			error = -EFAULT;
 
-	if (*len > XATTR_SIZE_MAX)
+	if (*len > XFS_XATTR_SIZE_MAX)
 		return -EINVAL;
 	kbuf = kmem_zalloc_large(*len, KM_SLEEP);
 	if (!kbuf)
@@ -482,17 +489,22 @@ xfs_attrmulti_attr_set(
 	__uint32_t		flags)
 {
 	unsigned char		*kbuf;
+	int			error;
 
 	if (IS_IMMUTABLE(inode) || IS_APPEND(inode))
 		return -EPERM;
-	if (len > XATTR_SIZE_MAX)
+	if (len > XFS_XATTR_SIZE_MAX)
 		return -EINVAL;
 
 	kbuf = memdup_user(ubuf, len);
 	if (IS_ERR(kbuf))
 		return PTR_ERR(kbuf);
 
-	return xfs_attr_set(XFS_I(inode), name, kbuf, len, flags);
+	error = xfs_attr_set(XFS_I(inode), name, kbuf, len, flags);
+	if (!error)
+		xfs_forget_acl(inode, name, flags);
+	kfree(kbuf);
+	return error;
 }
 
 int
@@ -501,9 +513,14 @@ xfs_attrmulti_attr_remove(
 	unsigned char		*name,
 	__uint32_t		flags)
 {
+	int			error;
+
 	if (IS_IMMUTABLE(inode) || IS_APPEND(inode))
 		return -EPERM;
-	return xfs_attr_remove(XFS_I(inode), name, flags);
+	error = xfs_attr_remove(XFS_I(inode), name, flags);
+	if (!error)
+		xfs_forget_acl(inode, name, flags);
+	return error;
 }
 
 STATIC int
@@ -720,7 +737,7 @@ xfs_ioc_space(
 		iattr.ia_valid = ATTR_SIZE;
 		iattr.ia_size = bf->l_start;
 
-		error = xfs_setattr_size(ip, &iattr);
+		error = xfs_vn_setattr_size(file_dentry(filp), &iattr);
 		break;
 	default:
 		ASSERT(0);
@@ -1028,7 +1045,7 @@ xfs_ioctl_setattr_xflags(
 	xfs_diflags_to_linux(ip);
 	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG);
 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
-	XFS_STATS_INC(xs_ig_attrchg);
+	XFS_STATS_INC(mp, xs_ig_attrchg);
 	return 0;
 }
 
@@ -1368,10 +1385,11 @@ xfs_ioc_getbmap(
 	unsigned int		cmd,
 	void			__user *arg)
 {
-	struct getbmapx		bmx;
+	struct getbmapx		bmx = { 0 };
 	int			error;
 
-	if (copy_from_user(&bmx, arg, sizeof(struct getbmapx)))
+	/* struct getbmap is a strict subset of struct getbmapx. */
+	if (copy_from_user(&bmx, arg, offsetof(struct getbmapx, bmv_iflags)))
 		return -EFAULT;
 
 	if (bmx.bmv_count < 2)

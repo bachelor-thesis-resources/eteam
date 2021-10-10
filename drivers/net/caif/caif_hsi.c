@@ -1120,7 +1120,7 @@ static void cfhsi_setup(struct net_device *dev)
 	dev->type = ARPHRD_CAIF;
 	dev->flags = IFF_POINTOPOINT | IFF_NOARP;
 	dev->mtu = CFHSI_MAX_CAIF_FRAME_SZ;
-	dev->tx_queue_len = 0;
+	dev->priv_flags |= IFF_NO_QUEUE;
 	dev->destructor = free_netdev;
 	dev->netdev_ops = &cfhsi_netdevops;
 	for (i = 0; i < CFHSI_PRIO_LAST; ++i)
@@ -1467,7 +1467,7 @@ static void __exit cfhsi_exit_module(void)
 	rtnl_lock();
 	list_for_each_safe(list_node, n, &cfhsi_list) {
 		cfhsi = list_entry(list_node, struct cfhsi, list);
-		unregister_netdev(cfhsi->ndev);
+		unregister_netdevice(cfhsi->ndev);
 	}
 	rtnl_unlock();
 }

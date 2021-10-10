@@ -24,7 +24,6 @@
 #include "virt-dma.h"
 
 #define DRIVER_NAME		"k3-dma"
-#define DMA_ALIGN		3
 #define DMA_MAX_SIZE		0x1ffc
 
 #define INT_STAT		0x00
@@ -661,7 +660,7 @@ static struct dma_chan *k3_of_dma_simple_xlate(struct of_phandle_args *dma_spec,
 	struct k3_dma_dev *d = ofdma->of_dma_data;
 	unsigned int request = dma_spec->args[0];
 
-	if (request > d->dma_requests)
+	if (request >= d->dma_requests)
 		return NULL;
 
 	return dma_get_slave_channel(&(d->chans[request].vc.chan));
@@ -732,7 +731,7 @@ static int k3_dma_probe(struct platform_device *op)
 	d->slave.device_pause = k3_dma_transfer_pause;
 	d->slave.device_resume = k3_dma_transfer_resume;
 	d->slave.device_terminate_all = k3_dma_terminate_all;
-	d->slave.copy_align = DMA_ALIGN;
+	d->slave.copy_align = DMAENGINE_ALIGN_8_BYTES;
 
 	/* init virtual channel */
 	d->chans = devm_kzalloc(&op->dev,

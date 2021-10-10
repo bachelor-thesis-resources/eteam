@@ -225,13 +225,14 @@ static int next_cpu_for_irq(struct irq_data *data)
 
 #ifdef CONFIG_SMP
 	int cpu;
-	int weight = cpumask_weight(data->affinity);
+	struct cpumask *mask = irq_data_get_affinity_mask(data);
+	int weight = cpumask_weight(mask);
 	struct octeon_ciu_chip_data *cd = irq_data_get_irq_chip_data(data);
 
 	if (weight > 1) {
 		cpu = cd->current_cpu;
 		for (;;) {
-			cpu = cpumask_next(cpu, data->affinity);
+			cpu = cpumask_next(cpu, mask);
 			if (cpu >= nr_cpu_ids) {
 				cpu = -1;
 				continue;
@@ -240,7 +241,7 @@ static int next_cpu_for_irq(struct irq_data *data)
 			}
 		}
 	} else if (weight == 1) {
-		cpu = cpumask_first(data->affinity);
+		cpu = cpumask_first(mask);
 	} else {
 		cpu = smp_processor_id();
 	}
@@ -662,6 +663,11 @@ static int octeon_irq_ciu_gpio_set_type(struct irq_data *data, unsigned int t)
 	irqd_set_trigger_type(data, t);
 	octeon_irq_gpio_setup(data);
 
+	if (irqd_get_trigger_type(data) & IRQ_TYPE_EDGE_BOTH)
+		irq_set_handler_locked(data, handle_edge_irq);
+	else
+		irq_set_handler_locked(data, handle_level_irq);
+
 	return IRQ_SET_MASK_OK;
 }
 
@@ -696,32 +702,23 @@ static void octeon_irq_ciu_gpio_ack(struct irq_data *data)
 	cvmx_write_csr(CVMX_GPIO_INT_CLR, mask);
 }
 
-static void octeon_irq_handle_trigger(unsigned int irq, struct irq_desc *desc)
-{
-	struct irq_data *data = irq_desc_get_irq_data(desc);
-
-	if (irqd_get_trigger_type(data) & IRQ_TYPE_EDGE_BOTH)
-		handle_edge_irq(irq, desc);
-	else
-		handle_level_irq(irq, desc);
-}
-
 #ifdef CONFIG_SMP
 
 static void octeon_irq_cpu_offline_ciu(struct irq_data *data)
 {
 	int cpu = smp_processor_id();
 	cpumask_t new_affinity;
+	struct cpumask *mask = irq_data_get_affinity_mask(data);
 
-	if (!cpumask_test_cpu(cpu, data->affinity))
+	if (!cpumask_test_cpu(cpu, mask))
 		return;
 
-	if (cpumask_weight(data->affinity) > 1) {
+	if (cpumask_weight(mask) > 1) {
 		/*
 		 * It has multi CPU affinity, just remove this CPU
 		 * from the affinity set.
 		 */
-		cpumask_copy(&new_affinity, data->affinity);
+		cpumask_copy(&new_affinity, mask);
 		cpumask_clear_cpu(cpu, &new_affinity);
 	} else {
 		/* Otherwise, put it on lowest numbered online CPU. */
@@ -1097,7 +1094,7 @@ static int octeon_irq_gpio_xlat(struct irq_domain *d,
 	unsigned int pin;
 	unsigned int trigger;
 
-	if (d->of_node != node)
+	if (irq_domain_get_of_node(d) != node)
 		return -EINVAL;
 
 	if (intsize < 2)
@@ -1223,12 +1220,17 @@ static int octeon_irq_gpio_map(struct irq_domain *d,
 
 	line = (hw + gpiod->base_hwirq) >> 6;
 	bit = (hw + gpiod->base_hwirq) & 63;
-	if (line > ARRAY_SIZE(octeon_irq_ciu_to_irq) ||
+	if (line >= ARRAY_SIZE(octeon_irq_ciu_to_irq) ||
 		octeon_irq_ciu_to_irq[line][bit] != 0)
 		return -EINVAL;
 
+	/*
+	 * Default to handle_level_irq. If the DT contains a different
+	 * trigger type, it will call the irq_set_type callback and
+	 * the handler gets updated.
+	 */
 	r = octeon_irq_set_ciu_mapping(virq, line, bit, hw,
-		octeon_irq_gpio_chip, octeon_irq_handle_trigger);
+				       octeon_irq_gpio_chip, handle_level_irq);
 	return r;
 }
 
@@ -2161,11 +2163,14 @@ static int octeon_irq_cib_map(struct irq_domain *d,
 
 	if (hw >= host_data->max_bits) {
 		pr_err("ERROR: %s mapping %u is to big!\n",
-		       d->of_node->name, (unsigned)hw);
+		       irq_domain_get_of_node(d)->name, (unsigned)hw);
 		return -EINVAL;
 	}
 
 	cd = kzalloc(sizeof(*cd), GFP_KERNEL);
+	if (!cd)
+		return -ENOMEM;
+
 	cd->host_data = host_data;
 	cd->bit = hw;
 
@@ -2219,7 +2224,7 @@ static irqreturn_t octeon_irq_cib_handler(int my_irq, void *data)
 			if (irqd_get_trigger_type(irq_data) &
 				IRQ_TYPE_EDGE_BOTH)
 				cvmx_write_csr(host_data->raw_reg, 1ull << i);
-			generic_handle_irq_desc(irq, desc);
+			generic_handle_irq_desc(desc);
 		}
 	}
 
@@ -2238,17 +2243,19 @@ static int __init octeon_irq_init_cib(struct device_node *ciu_node,
 
 	parent_irq = irq_of_parse_and_map(ciu_node, 0);
 	if (!parent_irq) {
-		pr_err("ERROR: Couldn't acquire parent_irq for %s\n.",
+		pr_err("ERROR: Couldn't acquire parent_irq for %s\n",
 			ciu_node->name);
 		return -EINVAL;
 	}
 
 	host_data = kzalloc(sizeof(*host_data), GFP_KERNEL);
+	if (!host_data)
+		return -ENOMEM;
 	raw_spin_lock_init(&host_data->lock);
 
 	addr = of_get_address(ciu_node, 0, NULL, NULL);
 	if (!addr) {
-		pr_err("ERROR: Couldn't acquire reg(0) %s\n.", ciu_node->name);
+		pr_err("ERROR: Couldn't acquire reg(0) %s\n", ciu_node->name);
 		return -EINVAL;
 	}
 	host_data->raw_reg = (u64)phys_to_virt(
@@ -2256,7 +2263,7 @@ static int __init octeon_irq_init_cib(struct device_node *ciu_node,
 
 	addr = of_get_address(ciu_node, 1, NULL, NULL);
 	if (!addr) {
-		pr_err("ERROR: Couldn't acquire reg(1) %s\n.", ciu_node->name);
+		pr_err("ERROR: Couldn't acquire reg(1) %s\n", ciu_node->name);
 		return -EINVAL;
 	}
 	host_data->en_reg = (u64)phys_to_virt(
@@ -2264,7 +2271,7 @@ static int __init octeon_irq_init_cib(struct device_node *ciu_node,
 
 	r = of_property_read_u32(ciu_node, "cavium,max-bits", &val);
 	if (r) {
-		pr_err("ERROR: Couldn't read cavium,max-bits from %s\n.",
+		pr_err("ERROR: Couldn't read cavium,max-bits from %s\n",
 			ciu_node->name);
 		return r;
 	}
@@ -2274,7 +2281,7 @@ static int __init octeon_irq_init_cib(struct device_node *ciu_node,
 					   &octeon_irq_domain_cib_ops,
 					   host_data);
 	if (!cib_domain) {
-		pr_err("ERROR: Couldn't irq_domain_add_linear()\n.");
+		pr_err("ERROR: Couldn't irq_domain_add_linear()\n");
 		return -ENOMEM;
 	}
 

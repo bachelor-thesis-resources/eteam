@@ -165,11 +165,21 @@ config HID_CHERRY
 	Support for Cherry Cymotion keyboard.
 
 config HID_CHICONY
-	tristate "Chicony Tactical pad"
+	tristate "Chicony devices"
 	depends on HID
 	default !EXPERT
 	---help---
-	Support for Chicony Tactical pad.
+	Support for Chicony Tactical pad and special keys on Chicony keyboards.
+
+config HID_CORSAIR
+	tristate "Corsair devices"
+	depends on HID && USB && LEDS_CLASS
+	---help---
+	Support for Corsair devices that are not fully compliant with the
+	HID standard.
+
+	Supported devices:
+	- Vengeance K90
 
 config HID_PRODIKEYS
 	tristate "Prodikeys PC-MIDI Keyboard support"
@@ -250,6 +260,18 @@ config HID_EZKEY
 	default !EXPERT
 	---help---
 	Support for Ezkey BTC 8193 keyboard.
+
+config HID_GEMBIRD
+	tristate "Gembird Joypad"
+	depends on HID
+	---help---
+	Support for Gembird JPD-DualForce 2.
+
+config HID_GFRM
+	tristate "Google Fiber TV Box remote control support"
+	depends on HID
+	---help---
+	Support for Google Fiber TV Box remote controls
 
 config HID_HOLTEK
 	tristate "Holtek HID devices"
@@ -480,6 +502,7 @@ config HID_MULTITOUCH
 	  - Atmel panels
 	  - Cando dual touch panels
 	  - Chunghwa panels
+	  - CJTouch panels
 	  - CVTouch panels
 	  - Cypress TrueTouch panels
 	  - Elan Microelectronics touch panels
@@ -665,9 +688,8 @@ config HID_SAITEK
 
 	Supported devices:
 	- PS1000 Dual Analog Pad
-	- R.A.T.9 Gaming Mouse
-	- R.A.T.7 Gaming Mouse
-	- M.M.O.7 Gaming Mouse
+	- Saitek R.A.T.7, R.A.T.9, M.M.O.7 Gaming Mice
+	- Mad Catz R.A.T.5, R.A.T.9 Gaming Mice
 
 config HID_SAMSUNG
 	tristate "Samsung InfraRed remote control or keyboards"
@@ -897,6 +919,14 @@ config HID_SENSOR_CUSTOM_SENSOR
 	  should't use these special custom sensor ids to export any of the
 	  standard sensors.
 	  Select this config option for custom/generic sensor support.
+
+config HID_ALPS
+	tristate "Alps HID device support"
+	depends on HID
+	---help---
+	Support for Alps I2C HID touchpads and StickPointer.
+	Say Y here if you have a Alps touchpads over i2c-hid or usbhid
+	and want support for its special functionalities.
 
 endmenu
 

@@ -24,35 +24,55 @@
 
 
 	.align	5
+#if !(IS_ENABLED(CONFIG_TRACE_IRQFLAGS) || IS_ENABLED(CONFIG_CONTEXT_TRACKING))
 /*
- * This is the fast syscall return path.  We do as little as
- * possible here, and this includes saving r0 back into the SVC
- * stack.
+ * This is the fast syscall return path.  We do as little as possible here,
+ * such as avoiding writing r0 to the stack.  We only use this path if we
+ * have tracing and context tracking disabled - the overheads from those
+ * features make this path too inefficient.
  */
 ret_fast_syscall:
  UNWIND(.fnstart	)
  UNWIND(.cantunwind	)
-	disable_irq				@ disable interrupts
+	disable_irq_notrace			@ disable interrupts
 	ldr	r1, [tsk, #TI_FLAGS]		@ re-check for syscall tracing
-	tst	r1, #_TIF_SYSCALL_WORK
-	bne	__sys_trace_return
-	tst	r1, #_TIF_WORK_MASK
+	tst	r1, #_TIF_SYSCALL_WORK | _TIF_WORK_MASK
 	bne	fast_work_pending
-	asm_trace_hardirqs_on
 
 	/* perform architecture specific actions before user return */
 	arch_ret_to_user r1, lr
-	ct_user_enter
 
 	restore_user_regs fast = 1, offset = S_OFF
  UNWIND(.fnend		)
+ENDPROC(ret_fast_syscall)
 
-/*
- * Ok, we need to do extra processing, enter the slow path.
- */
+	/* Ok, we need to do extra processing, enter the slow path. */
 fast_work_pending:
 	str	r0, [sp, #S_R0+S_OFF]!		@ returned r0
-work_pending:
+	/* fall through to work_pending */
+#else
+/*
+ * The "replacement" ret_fast_syscall for when tracing or context tracking
+ * is enabled.  As we will need to call out to some C functions, we save
+ * r0 first to avoid needing to save registers around each C function call.
+ */
+ret_fast_syscall:
+ UNWIND(.fnstart	)
+ UNWIND(.cantunwind	)
+	str	r0, [sp, #S_R0 + S_OFF]!	@ save returned r0
+	disable_irq_notrace			@ disable interrupts
+	ldr	r1, [tsk, #TI_FLAGS]		@ re-check for syscall tracing
+	tst	r1, #_TIF_SYSCALL_WORK | _TIF_WORK_MASK
+	beq	no_work_pending
+ UNWIND(.fnend		)
+ENDPROC(ret_fast_syscall)
+
+	/* Slower path - fall through to work_pending */
+#endif
+
+	tst	r1, #_TIF_SYSCALL_WORK
+	bne	__sys_trace_return_nosave
+slow_work_pending:
 	mov	r0, sp				@ 'regs'
 	mov	r2, why				@ 'syscall'
 	bl	do_work_pending
@@ -65,16 +85,19 @@ ENDPROC(ret_fast_syscall)
 
 /*
  * "slow" syscall return path.  "why" tells us if this was a real syscall.
+ * IRQs may be enabled here, so always disable them.  Note that we use the
+ * "notrace" version to avoid calling into the tracing code unnecessarily.
+ * do_work_pending() will update this state if necessary.
  */
 ENTRY(ret_to_user)
 ret_slow_syscall:
-	disable_irq				@ disable interrupts
+	disable_irq_notrace			@ disable interrupts
 ENTRY(ret_to_user_from_irq)
 	ldr	r1, [tsk, #TI_FLAGS]
 	tst	r1, #_TIF_WORK_MASK
-	bne	work_pending
+	bne	slow_work_pending
 no_work_pending:
-	asm_trace_hardirqs_on
+	asm_trace_hardirqs_on save = 0
 
 	/* perform architecture specific actions before user return */
 	arch_ret_to_user r1, lr
@@ -174,6 +197,8 @@ ENTRY(vector_swi)
  USER(	ldr	scno, [lr, #-4]		)	@ get SWI instruction
 #endif
 
+	uaccess_disable tbl
+
 	adr	tbl, sys_call_table		@ load syscall table pointer
 
 #if defined(CONFIG_OABI_COMPAT)
@@ -198,9 +223,7 @@ local_restart:
 	tst	r10, #_TIF_SYSCALL_WORK		@ are we tracing syscalls?
 	bne	__sys_trace
 
-	cmp	scno, #NR_syscalls		@ check upper syscall limit
-	badr	lr, ret_fast_syscall		@ return address
-	ldrcc	pc, [tbl, scno, lsl #2]		@ call sys_* routine
+	invoke_syscall tbl, scno, r10, ret_fast_syscall
 
 	add	r1, sp, #S_OFF
 2:	cmp	scno, #(__ARM_NR_BASE - __NR_SYSCALL_BASE)
@@ -233,17 +256,16 @@ __sys_trace:
 	mov	r1, scno
 	add	r0, sp, #S_OFF
 	bl	syscall_trace_enter
-
-	badr	lr, __sys_trace_return		@ return address
-	mov	scno, r0			@ syscall number (possibly new)
-	add	r1, sp, #S_R0 + S_OFF		@ pointer to regs
-	cmp	scno, #NR_syscalls		@ check upper syscall limit
-	ldmccia	r1, {r0 - r6}			@ have to reload r0 - r6
-	stmccia	sp, {r4, r5}			@ and update the stack args
-	ldrcc	pc, [tbl, scno, lsl #2]		@ call sys_* routine
+	mov	scno, r0
+	invoke_syscall tbl, scno, r10, __sys_trace_return, reload=1
 	cmp	scno, #-1			@ skip the syscall?
 	bne	2b
 	add	sp, sp, #S_OFF			@ restore stack
+
+__sys_trace_return_nosave:
+	enable_irq_notrace
+	mov	r0, sp
+	bl	syscall_trace_exit
 	b	ret_slow_syscall
 
 __sys_trace_return:
@@ -286,6 +308,10 @@ sys_syscall:
 		bic	scno, r0, #__NR_OABI_SYSCALL_BASE
 		cmp	scno, #__NR_syscall - __NR_SYSCALL_BASE
 		cmpne	scno, #NR_syscalls	@ check range
+#ifdef CONFIG_CPU_SPECTRE
+		movhs	scno, #0
+		csdb
+#endif
 		stmloia	sp, {r5, r6}		@ shuffle args
 		movlo	r0, r1
 		movlo	r1, r2

@@ -360,6 +360,9 @@ static irqreturn_t xgbe_isr(int irq, void *data)
 			}
 		}
 
+		if (XGMAC_GET_BITS(dma_ch_isr, DMA_CH_SR, RBU))
+			pdata->ext_stats.rx_buffer_unavailable++;
+
 		/* Restart the device on a Fatal Bus Error */
 		if (XGMAC_GET_BITS(dma_ch_isr, DMA_CH_SR, FBE))
 			schedule_work(&pdata->restart_work);
@@ -384,7 +387,8 @@ static irqreturn_t xgbe_isr(int irq, void *data)
 				/* Read Tx Timestamp to clear interrupt */
 				pdata->tx_tstamp =
 					hw_if->get_tx_tstamp(pdata);
-				schedule_work(&pdata->tx_tstamp_work);
+				queue_work(pdata->dev_workqueue,
+					   &pdata->tx_tstamp_work);
 			}
 		}
 	}
@@ -450,7 +454,7 @@ static void xgbe_service_timer(unsigned long data)
 {
 	struct xgbe_prv_data *pdata = (struct xgbe_prv_data *)data;
 
-	schedule_work(&pdata->service_work);
+	queue_work(pdata->dev_workqueue, &pdata->service_work);
 
 	mod_timer(&pdata->service_timer, jiffies + HZ);
 }
@@ -873,7 +877,9 @@ static int xgbe_start(struct xgbe_prv_data *pdata)
 
 	DBGPR("-->xgbe_start\n");
 
-	hw_if->init(pdata);
+	ret = hw_if->init(pdata);
+	if (ret)
+		return ret;
 
 	ret = phy_if->phy_start(pdata);
 	if (ret)
@@ -891,7 +897,7 @@ static int xgbe_start(struct xgbe_prv_data *pdata)
 	netif_tx_start_all_queues(netdev);
 
 	xgbe_start_timers(pdata);
-	schedule_work(&pdata->service_work);
+	queue_work(pdata->dev_workqueue, &pdata->service_work);
 
 	DBGPR("<--xgbe_start\n");
 
@@ -1384,7 +1390,7 @@ static int xgbe_close(struct net_device *netdev)
 	return 0;
 }
 
-static int xgbe_xmit(struct sk_buff *skb, struct net_device *netdev)
+static netdev_tx_t xgbe_xmit(struct sk_buff *skb, struct net_device *netdev)
 {
 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
 	struct xgbe_hw_if *hw_if = &pdata->hw_if;
@@ -1393,7 +1399,7 @@ static int xgbe_xmit(struct sk_buff *skb, struct net_device *netdev)
 	struct xgbe_ring *ring;
 	struct xgbe_packet_data *packet;
 	struct netdev_queue *txq;
-	int ret;
+	netdev_tx_t ret;
 
 	DBGPR("-->xgbe_xmit: skb->len = %d\n", skb->len);
 
@@ -1622,11 +1628,17 @@ static void xgbe_poll_controller(struct net_device *netdev)
 }
 #endif /* End CONFIG_NET_POLL_CONTROLLER */
 
-static int xgbe_setup_tc(struct net_device *netdev, u8 tc)
+static int xgbe_setup_tc(struct net_device *netdev, u32 handle, __be16 proto,
+			 struct tc_to_netdev *tc_to_netdev)
 {
 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
 	unsigned int offset, queue;
-	u8 i;
+	u8 i, tc;
+
+	if (handle != TC_H_ROOT || tc_to_netdev->type != TC_SETUP_MQPRIO)
+		return -EINVAL;
+
+	tc = tc_to_netdev->tc;
 
 	if (tc && (tc != pdata->hw_feat.tc_cnt))
 		return -EINVAL;
@@ -1756,13 +1768,12 @@ static struct sk_buff *xgbe_create_skb(struct xgbe_prv_data *pdata,
 {
 	struct sk_buff *skb;
 	u8 *packet;
-	unsigned int copy_len;
 
 	skb = napi_alloc_skb(napi, rdata->rx.hdr.dma_len);
 	if (!skb)
 		return NULL;
 
-	/* Start with the header buffer which may contain just the header
+	/* Pull in the header buffer which may contain just the header
 	 * or the header plus data
 	 */
 	dma_sync_single_range_for_cpu(pdata->dev, rdata->rx.hdr.dma_base,
@@ -1771,28 +1782,47 @@ static struct sk_buff *xgbe_create_skb(struct xgbe_prv_data *pdata,
 
 	packet = page_address(rdata->rx.hdr.pa.pages) +
 		 rdata->rx.hdr.pa.pages_offset;
-	copy_len = (rdata->rx.hdr_len) ? rdata->rx.hdr_len : len;
-	copy_len = min(rdata->rx.hdr.dma_len, copy_len);
-	skb_copy_to_linear_data(skb, packet, copy_len);
-	skb_put(skb, copy_len);
-
-	len -= copy_len;
-	if (len) {
-		/* Add the remaining data as a frag */
-		dma_sync_single_range_for_cpu(pdata->dev,
-					      rdata->rx.buf.dma_base,
-					      rdata->rx.buf.dma_off,
-					      rdata->rx.buf.dma_len,
-					      DMA_FROM_DEVICE);
-
-		skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
-				rdata->rx.buf.pa.pages,
-				rdata->rx.buf.pa.pages_offset,
-				len, rdata->rx.buf.dma_len);
-		rdata->rx.buf.pa.pages = NULL;
-	}
+	skb_copy_to_linear_data(skb, packet, len);
+	skb_put(skb, len);
 
 	return skb;
+}
+
+static unsigned int xgbe_rx_buf1_len(struct xgbe_ring_data *rdata,
+				     struct xgbe_packet_data *packet)
+{
+	/* Always zero if not the first descriptor */
+	if (!XGMAC_GET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES, FIRST))
+		return 0;
+
+	/* First descriptor with split header, return header length */
+	if (rdata->rx.hdr_len)
+		return rdata->rx.hdr_len;
+
+	/* First descriptor but not the last descriptor and no split header,
+	 * so the full buffer was used
+	 */
+	if (!XGMAC_GET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES, LAST))
+		return rdata->rx.hdr.dma_len;
+
+	/* First descriptor and last descriptor and no split header, so
+	 * calculate how much of the buffer was used
+	 */
+	return min_t(unsigned int, rdata->rx.hdr.dma_len, rdata->rx.len);
+}
+
+static unsigned int xgbe_rx_buf2_len(struct xgbe_ring_data *rdata,
+				     struct xgbe_packet_data *packet,
+				     unsigned int len)
+{
+	/* Always the full buffer if not the last descriptor */
+	if (!XGMAC_GET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES, LAST))
+		return rdata->rx.buf.dma_len;
+
+	/* Last descriptor so calculate how much of the buffer was used
+	 * for the last bit of data
+	 */
+	return rdata->rx.len - len;
 }
 
 static int xgbe_tx_poll(struct xgbe_channel *channel)
@@ -1807,6 +1837,7 @@ static int xgbe_tx_poll(struct xgbe_channel *channel)
 	struct netdev_queue *txq;
 	int processed = 0;
 	unsigned int tx_packets = 0, tx_bytes = 0;
+	unsigned int cur;
 
 	DBGPR("-->xgbe_tx_poll\n");
 
@@ -1814,10 +1845,15 @@ static int xgbe_tx_poll(struct xgbe_channel *channel)
 	if (!ring)
 		return 0;
 
+	cur = ring->cur;
+
+	/* Be sure we get ring->cur before accessing descriptor data */
+	smp_rmb();
+
 	txq = netdev_get_tx_queue(netdev, channel->queue_index);
 
 	while ((processed < XGBE_TX_DESC_MAX_PROC) &&
-	       (ring->dirty != ring->cur)) {
+	       (ring->dirty != cur)) {
 		rdata = XGBE_GET_DESC_DATA(ring, ring->dirty);
 		rdesc = rdata->rdesc;
 
@@ -1871,8 +1907,8 @@ static int xgbe_rx_poll(struct xgbe_channel *channel, int budget)
 	struct napi_struct *napi;
 	struct sk_buff *skb;
 	struct skb_shared_hwtstamps *hwtstamps;
-	unsigned int incomplete, error, context_next, context;
-	unsigned int len, rdesc_len, max_len;
+	unsigned int last, error, context_next, context;
+	unsigned int len, buf1_len, buf2_len, max_len;
 	unsigned int received = 0;
 	int packet_count = 0;
 
@@ -1882,7 +1918,7 @@ static int xgbe_rx_poll(struct xgbe_channel *channel, int budget)
 	if (!ring)
 		return 0;
 
-	incomplete = 0;
+	last = 0;
 	context_next = 0;
 
 	napi = (pdata->per_channel_irq) ? &channel->napi : &pdata->napi;
@@ -1916,9 +1952,8 @@ read_again:
 		received++;
 		ring->cur++;
 
-		incomplete = XGMAC_GET_BITS(packet->attributes,
-					    RX_PACKET_ATTRIBUTES,
-					    INCOMPLETE);
+		last = XGMAC_GET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
+				      LAST);
 		context_next = XGMAC_GET_BITS(packet->attributes,
 					      RX_PACKET_ATTRIBUTES,
 					      CONTEXT_NEXT);
@@ -1927,7 +1962,7 @@ read_again:
 					 CONTEXT);
 
 		/* Earlier error, just drain the remaining data */
-		if ((incomplete || context_next) && error)
+		if ((!last || context_next) && error)
 			goto read_again;
 
 		if (error || packet->errors) {
@@ -1939,16 +1974,22 @@ read_again:
 		}
 
 		if (!context) {
-			/* Length is cumulative, get this descriptor's length */
-			rdesc_len = rdata->rx.len - len;
-			len += rdesc_len;
+			/* Get the data length in the descriptor buffers */
+			buf1_len = xgbe_rx_buf1_len(rdata, packet);
+			len += buf1_len;
+			buf2_len = xgbe_rx_buf2_len(rdata, packet, len);
+			len += buf2_len;
 
-			if (rdesc_len && !skb) {
+			if (!skb) {
 				skb = xgbe_create_skb(pdata, napi, rdata,
-						      rdesc_len);
-				if (!skb)
+						      buf1_len);
+				if (!skb) {
 					error = 1;
-			} else if (rdesc_len) {
+					goto skip_data;
+				}
+			}
+
+			if (buf2_len) {
 				dma_sync_single_range_for_cpu(pdata->dev,
 							rdata->rx.buf.dma_base,
 							rdata->rx.buf.dma_off,
@@ -1958,13 +1999,14 @@ read_again:
 				skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
 						rdata->rx.buf.pa.pages,
 						rdata->rx.buf.pa.pages_offset,
-						rdesc_len,
+						buf2_len,
 						rdata->rx.buf.dma_len);
 				rdata->rx.buf.pa.pages = NULL;
 			}
 		}
 
-		if (incomplete || context_next)
+skip_data:
+		if (!last || context_next)
 			goto read_again;
 
 		if (!skb)
@@ -2023,7 +2065,7 @@ next_packet:
 	}
 
 	/* Check if we need to save state before leaving */
-	if (received && (incomplete || context_next)) {
+	if (received && (!last || context_next)) {
 		rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
 		rdata->state_saved = 1;
 		rdata->state.skb = skb;

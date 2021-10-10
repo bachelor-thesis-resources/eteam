@@ -96,7 +96,7 @@ static int wait_for_more_packets(struct sock *sk, int *err, long *timeo_p,
 	if (error)
 		goto out_err;
 
-	if (sk->sk_receive_queue.prev != skb)
+	if (READ_ONCE(sk->sk_receive_queue.prev) != skb)
 		goto out;
 
 	/* Socket shut down? */
@@ -785,7 +785,7 @@ unsigned int datagram_poll(struct file *file, struct socket *sock,
 	if (sock_writeable(sk))
 		mask |= POLLOUT | POLLWRNORM | POLLWRBAND;
 	else
-		set_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
+		sk_set_bit(SOCKWQ_ASYNC_NOSPACE, sk);
 
 	return mask;
 }

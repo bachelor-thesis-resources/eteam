@@ -835,11 +835,11 @@ static void init_controller(struct r8a66597 *r8a66597)
 
 		r8a66597_bset(r8a66597, XCKE, SYSCFG0);
 
-		msleep(3);
+		mdelay(3);
 
 		r8a66597_bset(r8a66597, PLLC, SYSCFG0);
 
-		msleep(1);
+		mdelay(1);
 
 		r8a66597_bset(r8a66597, SCKE, SYSCFG0);
 
@@ -1193,7 +1193,7 @@ __acquires(r8a66597->lock)
 	r8a66597->ep0_req->length = 2;
 	/* AV: what happens if we get called again before that gets through? */
 	spin_unlock(&r8a66597->lock);
-	r8a66597_queue(r8a66597->gadget.ep0, r8a66597->ep0_req, GFP_KERNEL);
+	r8a66597_queue(r8a66597->gadget.ep0, r8a66597->ep0_req, GFP_ATOMIC);
 	spin_lock(&r8a66597->lock);
 }
 
@@ -1935,6 +1935,16 @@ static int r8a66597_probe(struct platform_device *pdev)
 		ep->ep.name = r8a66597_ep_name[i];
 		ep->ep.ops = &r8a66597_ep_ops;
 		usb_ep_set_maxpacket_limit(&ep->ep, 512);
+
+		if (i == 0) {
+			ep->ep.caps.type_control = true;
+		} else {
+			ep->ep.caps.type_iso = true;
+			ep->ep.caps.type_bulk = true;
+			ep->ep.caps.type_int = true;
+		}
+		ep->ep.caps.dir_in = true;
+		ep->ep.caps.dir_out = true;
 	}
 	usb_ep_set_maxpacket_limit(&r8a66597->ep[0].ep, 64);
 	r8a66597->ep[0].pipenum = 0;

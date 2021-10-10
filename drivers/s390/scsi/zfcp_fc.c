@@ -238,10 +238,6 @@ static void _zfcp_fc_incoming_rscn(struct zfcp_fsf_req *fsf_req, u32 range,
 	list_for_each_entry(port, &adapter->port_list, list) {
 		if ((port->d_id & range) == (ntoh24(page->rscn_fid) & range))
 			zfcp_fc_test_link(port);
-		if (!port->d_id)
-			zfcp_erp_port_reopen(port,
-					     ZFCP_STATUS_COMMON_ERP_FAILED,
-					     "fcrscn1");
 	}
 	read_unlock_irqrestore(&adapter->port_list_lock, flags);
 }
@@ -249,6 +245,7 @@ static void _zfcp_fc_incoming_rscn(struct zfcp_fsf_req *fsf_req, u32 range,
 static void zfcp_fc_incoming_rscn(struct zfcp_fsf_req *fsf_req)
 {
 	struct fsf_status_read_buffer *status_buffer = (void *)fsf_req->data;
+	struct zfcp_adapter *adapter = fsf_req->adapter;
 	struct fc_els_rscn *head;
 	struct fc_els_rscn_page *page;
 	u16 i;
@@ -260,6 +257,22 @@ static void zfcp_fc_incoming_rscn(struct zfcp_fsf_req *fsf_req)
 
 	/* see FC-FS */
 	no_entries = head->rscn_plen / sizeof(struct fc_els_rscn_page);
+
+	if (no_entries > 1) {
+		/* handle failed ports */
+		unsigned long flags;
+		struct zfcp_port *port;
+
+		read_lock_irqsave(&adapter->port_list_lock, flags);
+		list_for_each_entry(port, &adapter->port_list, list) {
+			if (port->d_id)
+				continue;
+			zfcp_erp_port_reopen(port,
+					     ZFCP_STATUS_COMMON_ERP_FAILED,
+					     "fcrscn1");
+		}
+		read_unlock_irqrestore(&adapter->port_list_lock, flags);
+	}
 
 	for (i = 1; i < no_entries; i++) {
 		/* skip head and start with 1st element */
@@ -508,7 +521,7 @@ static void zfcp_fc_adisc_handler(void *data)
 	/* port is good, unblock rport without going through erp */
 	zfcp_scsi_schedule_rport_register(port);
  out:
-	atomic_clear_mask(ZFCP_STATUS_PORT_LINK_TEST, &port->status);
+	atomic_andnot(ZFCP_STATUS_PORT_LINK_TEST, &port->status);
 	put_device(&port->dev);
 	kmem_cache_free(zfcp_fc_req_cache, fc_req);
 }
@@ -564,14 +577,14 @@ void zfcp_fc_link_test_work(struct work_struct *work)
 	if (atomic_read(&port->status) & ZFCP_STATUS_PORT_LINK_TEST)
 		goto out;
 
-	atomic_set_mask(ZFCP_STATUS_PORT_LINK_TEST, &port->status);
+	atomic_or(ZFCP_STATUS_PORT_LINK_TEST, &port->status);
 
 	retval = zfcp_fc_adisc(port);
 	if (retval == 0)
 		return;
 
 	/* send of ADISC was not possible */
-	atomic_clear_mask(ZFCP_STATUS_PORT_LINK_TEST, &port->status);
+	atomic_andnot(ZFCP_STATUS_PORT_LINK_TEST, &port->status);
 	zfcp_erp_port_forced_reopen(port, 0, "fcltwk1");
 
 out:
@@ -640,7 +653,7 @@ static void zfcp_fc_validate_port(struct zfcp_port *port, struct list_head *lh)
 	if (!(atomic_read(&port->status) & ZFCP_STATUS_COMMON_NOESC))
 		return;
 
-	atomic_clear_mask(ZFCP_STATUS_COMMON_NOESC, &port->status);
+	atomic_andnot(ZFCP_STATUS_COMMON_NOESC, &port->status);
 
 	if ((port->supported_classes != 0) ||
 	    !list_empty(&port->unit_list))

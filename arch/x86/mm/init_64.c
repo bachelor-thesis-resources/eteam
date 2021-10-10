@@ -56,79 +56,7 @@
 
 #include "mm_internal.h"
 
-static void ident_pmd_init(unsigned long pmd_flag, pmd_t *pmd_page,
-			   unsigned long addr, unsigned long end)
-{
-	addr &= PMD_MASK;
-	for (; addr < end; addr += PMD_SIZE) {
-		pmd_t *pmd = pmd_page + pmd_index(addr);
-
-		if (!pmd_present(*pmd))
-			set_pmd(pmd, __pmd(addr | pmd_flag));
-	}
-}
-static int ident_pud_init(struct x86_mapping_info *info, pud_t *pud_page,
-			  unsigned long addr, unsigned long end)
-{
-	unsigned long next;
-
-	for (; addr < end; addr = next) {
-		pud_t *pud = pud_page + pud_index(addr);
-		pmd_t *pmd;
-
-		next = (addr & PUD_MASK) + PUD_SIZE;
-		if (next > end)
-			next = end;
-
-		if (pud_present(*pud)) {
-			pmd = pmd_offset(pud, 0);
-			ident_pmd_init(info->pmd_flag, pmd, addr, next);
-			continue;
-		}
-		pmd = (pmd_t *)info->alloc_pgt_page(info->context);
-		if (!pmd)
-			return -ENOMEM;
-		ident_pmd_init(info->pmd_flag, pmd, addr, next);
-		set_pud(pud, __pud(__pa(pmd) | _KERNPG_TABLE));
-	}
-
-	return 0;
-}
-
-int kernel_ident_mapping_init(struct x86_mapping_info *info, pgd_t *pgd_page,
-			      unsigned long addr, unsigned long end)
-{
-	unsigned long next;
-	int result;
-	int off = info->kernel_mapping ? pgd_index(__PAGE_OFFSET) : 0;
-
-	for (; addr < end; addr = next) {
-		pgd_t *pgd = pgd_page + pgd_index(addr) + off;
-		pud_t *pud;
-
-		next = (addr & PGDIR_MASK) + PGDIR_SIZE;
-		if (next > end)
-			next = end;
-
-		if (pgd_present(*pgd)) {
-			pud = pud_offset(pgd, 0);
-			result = ident_pud_init(info, pud, addr, next);
-			if (result)
-				return result;
-			continue;
-		}
-
-		pud = (pud_t *)info->alloc_pgt_page(info->context);
-		if (!pud)
-			return -ENOMEM;
-		result = ident_pud_init(info, pud, addr, next);
-		if (result)
-			return result;
-		set_pgd(pgd, __pgd(__pa(pud) | _KERNPG_TABLE));
-	}
-
-	return 0;
-}
+#include "ident_map.c"
 
 /*
  * NOTE: pagetable_init alloc all the fixmap pagetables contiguous on the
@@ -395,6 +323,16 @@ void __init cleanup_highmap(void)
 			continue;
 		if (vaddr < (unsigned long) _text || vaddr > end)
 			set_pmd(pmd, __pmd(0));
+		else if (kaiser_enabled) {
+			/*
+			 * level2_kernel_pgt is initialized with _PAGE_GLOBAL:
+			 * clear that now.  This is not important, so long as
+			 * CR4.PGE remains clear, but it removes an anomaly.
+			 * Physical mapping setup below avoids _PAGE_GLOBAL
+			 * by use of massage_pgprot() inside pfn_pte() etc.
+			 */
+			set_pmd(pmd, pmd_clear_flags(*pmd, _PAGE_GLOBAL));
+		}
 	}
 }
 
@@ -687,11 +625,11 @@ static void  update_end_of_memory_vars(u64 start, u64 size)
  * Memory is added always to NORMAL zone. This means you will never get
  * additional DMA/DMA32 memory.
  */
-int arch_add_memory(int nid, u64 start, u64 size)
+int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
 {
 	struct pglist_data *pgdat = NODE_DATA(nid);
 	struct zone *zone = pgdat->node_zones +
-		zone_for_memory(nid, start, size, ZONE_NORMAL);
+		zone_for_memory(nid, start, size, ZONE_NORMAL, for_device);
 	unsigned long start_pfn = start >> PAGE_SHIFT;
 	unsigned long nr_pages = size >> PAGE_SHIFT;
 	int ret;
@@ -1132,7 +1070,7 @@ void mark_rodata_ro(void)
 	 * has been zapped already via cleanup_highmem().
 	 */
 	all_end = roundup((unsigned long)_brk_end, PMD_SIZE);
-	set_memory_nx(rodata_start, (all_end - rodata_start) >> PAGE_SHIFT);
+	set_memory_nx(text_end, (all_end - text_end) >> PAGE_SHIFT);
 
 	rodata_test();
 
@@ -1150,6 +1088,8 @@ void mark_rodata_ro(void)
 	free_init_pages("unused kernel",
 			(unsigned long) __va(__pa_symbol(rodata_end)),
 			(unsigned long) __va(__pa_symbol(_sdata)));
+
+	debug_checkwx();
 }
 
 #endif
@@ -1268,7 +1208,7 @@ static int __meminit vmemmap_populate_hugepages(unsigned long start,
 				/* check to see if we have contiguous blocks */
 				if (p_end != p || node_start != node) {
 					if (p_start)
-						printk(KERN_DEBUG " [%lx-%lx] PMD -> [%p-%p] on node %d\n",
+						pr_debug(" [%lx-%lx] PMD -> [%p-%p] on node %d\n",
 						       addr_start, addr_end-1, p_start, p_end-1, node_start);
 					addr_start = addr;
 					node_start = node;
@@ -1366,7 +1306,7 @@ void register_page_bootmem_memmap(unsigned long section_nr,
 void __meminit vmemmap_populate_print_last(void)
 {
 	if (p_start) {
-		printk(KERN_DEBUG " [%lx-%lx] PMD -> [%p-%p] on node %d\n",
+		pr_debug(" [%lx-%lx] PMD -> [%p-%p] on node %d\n",
 			addr_start, addr_end-1, p_start, p_end-1, node_start);
 		p_start = NULL;
 		p_end = NULL;

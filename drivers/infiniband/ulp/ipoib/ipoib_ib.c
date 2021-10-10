@@ -130,16 +130,15 @@ static struct sk_buff *ipoib_alloc_rx_skb(struct net_device *dev, int id)
 
 	buf_size = IPOIB_UD_BUF_SIZE(priv->max_ib_mtu);
 
-	skb = dev_alloc_skb(buf_size + IPOIB_ENCAP_LEN);
+	skb = dev_alloc_skb(buf_size + IPOIB_HARD_LEN);
 	if (unlikely(!skb))
 		return NULL;
 
 	/*
-	 * IB will leave a 40 byte gap for a GRH and IPoIB adds a 4 byte
-	 * header.  So we need 4 more bytes to get to 48 and align the
-	 * IP header to a multiple of 16.
+	 * the IP header will be at IPOIP_HARD_LEN + IB_GRH_BYTES, that is
+	 * 64 bytes aligned
 	 */
-	skb_reserve(skb, 4);
+	skb_reserve(skb, sizeof(struct ipoib_pseudo_header));
 
 	mapping = priv->rx_ring[id].mapping;
 	mapping[0] = ib_dma_map_single(priv->ca, skb->data, buf_size,
@@ -242,10 +241,7 @@ static void ipoib_ib_handle_rx_wc(struct net_device *dev, struct ib_wc *wc)
 	skb_pull(skb, IB_GRH_BYTES);
 
 	skb->protocol = ((struct ipoib_header *) skb->data)->proto;
-	skb_reset_mac_header(skb);
-	skb_pull(skb, IPOIB_ENCAP_LEN);
-
-	skb->truesize = SKB_TRUESIZE(skb->len);
+	skb_add_pseudo_hdr(skb);
 
 	++dev->stats.rx_packets;
 	dev->stats.rx_bytes += skb->len;
@@ -518,19 +514,19 @@ static inline int post_send(struct ipoib_dev_priv *priv,
 
 	ipoib_build_sge(priv, tx_req);
 
-	priv->tx_wr.wr_id 	     = wr_id;
-	priv->tx_wr.wr.ud.remote_qpn = qpn;
-	priv->tx_wr.wr.ud.ah 	     = address;
+	priv->tx_wr.wr.wr_id	= wr_id;
+	priv->tx_wr.remote_qpn	= qpn;
+	priv->tx_wr.ah		= address;
 
 	if (head) {
-		priv->tx_wr.wr.ud.mss	 = skb_shinfo(skb)->gso_size;
-		priv->tx_wr.wr.ud.header = head;
-		priv->tx_wr.wr.ud.hlen	 = hlen;
-		priv->tx_wr.opcode	 = IB_WR_LSO;
+		priv->tx_wr.mss		= skb_shinfo(skb)->gso_size;
+		priv->tx_wr.header	= head;
+		priv->tx_wr.hlen	= hlen;
+		priv->tx_wr.wr.opcode	= IB_WR_LSO;
 	} else
-		priv->tx_wr.opcode	 = IB_WR_SEND;
+		priv->tx_wr.wr.opcode	= IB_WR_SEND;
 
-	return ib_post_send(priv->qp, &priv->tx_wr, &bad_wr);
+	return ib_post_send(priv->qp, &priv->tx_wr.wr, &bad_wr);
 }
 
 void ipoib_send(struct net_device *dev, struct sk_buff *skb,
@@ -583,9 +579,9 @@ void ipoib_send(struct net_device *dev, struct sk_buff *skb,
 	}
 
 	if (skb->ip_summed == CHECKSUM_PARTIAL)
-		priv->tx_wr.send_flags |= IB_SEND_IP_CSUM;
+		priv->tx_wr.wr.send_flags |= IB_SEND_IP_CSUM;
 	else
-		priv->tx_wr.send_flags &= ~IB_SEND_IP_CSUM;
+		priv->tx_wr.wr.send_flags &= ~IB_SEND_IP_CSUM;
 
 	if (++priv->tx_outstanding == ipoib_sendq_size) {
 		ipoib_dbg(priv, "TX ring full, stopping kernel net queue\n");
@@ -1030,8 +1026,17 @@ static void __ipoib_ib_dev_flush(struct ipoib_dev_priv *priv,
 	}
 
 	if (level == IPOIB_FLUSH_LIGHT) {
+		int oper_up;
 		ipoib_mark_paths_invalid(dev);
+		/* Set IPoIB operation as down to prevent races between:
+		 * the flush flow which leaves MCG and on the fly joins
+		 * which can happen during that time. mcast restart task
+		 * should deal with join requests we missed.
+		 */
+		oper_up = test_and_clear_bit(IPOIB_FLAG_OPER_UP, &priv->flags);
 		ipoib_mcast_dev_flush(dev);
+		if (oper_up)
+			set_bit(IPOIB_FLAG_OPER_UP, &priv->flags);
 		ipoib_flush_ah(dev);
 	}
 
@@ -1041,8 +1046,10 @@ static void __ipoib_ib_dev_flush(struct ipoib_dev_priv *priv,
 	if (level == IPOIB_FLUSH_HEAVY) {
 		if (test_bit(IPOIB_FLAG_INITIALIZED, &priv->flags))
 			ipoib_ib_dev_stop(dev);
-		if (ipoib_ib_dev_open(dev) != 0)
+
+		if (ipoib_ib_dev_open(dev))
 			return;
+
 		if (netif_queue_stopped(dev))
 			netif_start_queue(dev);
 	}
@@ -1079,7 +1086,9 @@ void ipoib_ib_dev_flush_heavy(struct work_struct *work)
 	struct ipoib_dev_priv *priv =
 		container_of(work, struct ipoib_dev_priv, flush_heavy);
 
+	rtnl_lock();
 	__ipoib_ib_dev_flush(priv, IPOIB_FLUSH_HEAVY, 0);
+	rtnl_unlock();
 }
 
 void ipoib_ib_dev_cleanup(struct net_device *dev)

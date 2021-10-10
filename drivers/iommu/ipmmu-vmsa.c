@@ -44,7 +44,7 @@ struct ipmmu_vmsa_domain {
 	struct io_pgtable_ops *iop;
 
 	unsigned int context_id;
-	spinlock_t lock;			/* Protects mappings */
+	struct mutex mutex;			/* Protects mappings */
 };
 
 struct ipmmu_vmsa_archdata {
@@ -283,24 +283,10 @@ static void ipmmu_tlb_add_flush(unsigned long iova, size_t size, bool leaf,
 	/* The hardware doesn't support selective TLB flush. */
 }
 
-static void ipmmu_flush_pgtable(void *ptr, size_t size, void *cookie)
-{
-	unsigned long offset = (unsigned long)ptr & ~PAGE_MASK;
-	struct ipmmu_vmsa_domain *domain = cookie;
-
-	/*
-	 * TODO: Add support for coherent walk through CCI with DVM and remove
-	 * cache handling.
-	 */
-	dma_map_page(domain->mmu->dev, virt_to_page(ptr), offset, size,
-		     DMA_TO_DEVICE);
-}
-
 static struct iommu_gather_ops ipmmu_gather_ops = {
 	.tlb_flush_all = ipmmu_tlb_flush_all,
 	.tlb_add_flush = ipmmu_tlb_add_flush,
 	.tlb_sync = ipmmu_tlb_flush_all,
-	.flush_pgtable = ipmmu_flush_pgtable,
 };
 
 /* -----------------------------------------------------------------------------
@@ -309,7 +295,7 @@ static struct iommu_gather_ops ipmmu_gather_ops = {
 
 static int ipmmu_domain_init_context(struct ipmmu_vmsa_domain *domain)
 {
-	phys_addr_t ttbr;
+	u64 ttbr;
 
 	/*
 	 * Allocate the page table operations.
@@ -327,6 +313,11 @@ static int ipmmu_domain_init_context(struct ipmmu_vmsa_domain *domain)
 	domain->cfg.ias = 32;
 	domain->cfg.oas = 40;
 	domain->cfg.tlb = &ipmmu_gather_ops;
+	/*
+	 * TODO: Add support for coherent walk through CCI with DVM and remove
+	 * cache handling. For now, delegate it to the io-pgtable code.
+	 */
+	domain->cfg.iommu_dev = domain->mmu->dev;
 
 	domain->iop = alloc_io_pgtable_ops(ARM_32_LPAE_S1, &domain->cfg,
 					   domain);
@@ -381,6 +372,9 @@ static int ipmmu_domain_init_context(struct ipmmu_vmsa_domain *domain)
 
 static void ipmmu_domain_destroy_context(struct ipmmu_vmsa_domain *domain)
 {
+	if (!domain->mmu)
+		return;
+
 	/*
 	 * Disable the context. Flush the TLB as required when modifying the
 	 * context registers.
@@ -473,7 +467,7 @@ static struct iommu_domain *ipmmu_domain_alloc(unsigned type)
 	if (!domain)
 		return NULL;
 
-	spin_lock_init(&domain->lock);
+	mutex_init(&domain->mutex);
 
 	return &domain->io_domain;
 }
@@ -497,7 +491,6 @@ static int ipmmu_attach_device(struct iommu_domain *io_domain,
 	struct ipmmu_vmsa_archdata *archdata = dev->archdata.iommu;
 	struct ipmmu_vmsa_device *mmu = archdata->mmu;
 	struct ipmmu_vmsa_domain *domain = to_vmsa_domain(io_domain);
-	unsigned long flags;
 	unsigned int i;
 	int ret = 0;
 
@@ -506,7 +499,7 @@ static int ipmmu_attach_device(struct iommu_domain *io_domain,
 		return -ENXIO;
 	}
 
-	spin_lock_irqsave(&domain->lock, flags);
+	mutex_lock(&domain->mutex);
 
 	if (!domain->mmu) {
 		/* The domain hasn't been used yet, initialize it. */
@@ -522,7 +515,7 @@ static int ipmmu_attach_device(struct iommu_domain *io_domain,
 		ret = -EINVAL;
 	}
 
-	spin_unlock_irqrestore(&domain->lock, flags);
+	mutex_unlock(&domain->mutex);
 
 	if (ret < 0)
 		return ret;

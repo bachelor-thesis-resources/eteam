@@ -74,6 +74,19 @@ static const char fmt64[] = KERN_INFO \
 	"%s[%d]: bad frame in %s: %016lx nip %016lx lr %016lx\n";
 
 /*
+ * This computes a quad word aligned pointer inside the vmx_reserve array
+ * element. For historical reasons sigcontext might not be quad word aligned,
+ * but the location we write the VMX regs to must be. See the comment in
+ * sigcontext for more detail.
+ */
+#ifdef CONFIG_ALTIVEC
+static elf_vrreg_t __user *sigcontext_vmx_regs(struct sigcontext __user *sc)
+{
+	return (elf_vrreg_t __user *) (((unsigned long)sc->vmx_reserve + 15) & ~0xful);
+}
+#endif
+
+/*
  * Set up the sigcontext for the signal frame.
  */
 
@@ -90,7 +103,7 @@ static long setup_sigcontext(struct sigcontext __user *sc, struct pt_regs *regs,
 	 * v_regs pointer or not
 	 */
 #ifdef CONFIG_ALTIVEC
-	elf_vrreg_t __user *v_regs = (elf_vrreg_t __user *)(((unsigned long)sc->vmx_reserve + 15) & ~0xful);
+	elf_vrreg_t __user *v_regs = sigcontext_vmx_regs(sc);
 #endif
 	unsigned long msr = regs->msr;
 	long err = 0;
@@ -181,10 +194,8 @@ static long setup_tm_sigcontexts(struct sigcontext __user *sc,
 	 * v_regs pointer or not.
 	 */
 #ifdef CONFIG_ALTIVEC
-	elf_vrreg_t __user *v_regs = (elf_vrreg_t __user *)
-		(((unsigned long)sc->vmx_reserve + 15) & ~0xful);
-	elf_vrreg_t __user *tm_v_regs = (elf_vrreg_t __user *)
-		(((unsigned long)tm_sc->vmx_reserve + 15) & ~0xful);
+	elf_vrreg_t __user *v_regs = sigcontext_vmx_regs(sc);
+	elf_vrreg_t __user *tm_v_regs = sigcontext_vmx_regs(tm_sc);
 #endif
 	unsigned long msr = regs->msr;
 	long err = 0;
@@ -427,6 +438,10 @@ static long restore_tm_sigcontexts(struct pt_regs *regs,
 
 	/* get MSR separately, transfer the LE bit if doing signal return */
 	err |= __get_user(msr, &sc->gp_regs[PT_MSR]);
+	/* Don't allow reserved mode. */
+	if (MSR_TM_RESV(msr))
+		return -EINVAL;
+
 	/* pull in MSR TM from user context */
 	regs->msr = (regs->msr & ~MSR_TS_MASK) | (msr & MSR_TS_MASK);
 
@@ -447,8 +462,10 @@ static long restore_tm_sigcontexts(struct pt_regs *regs,
 	err |= __get_user(current->thread.ckpt_regs.ccr,
 			  &sc->gp_regs[PT_CCR]);
 
+	/* Don't allow userspace to set the trap value */
+	regs->trap = 0;
+
 	/* These regs are not checkpointed; they can go in 'regs'. */
-	err |= __get_user(regs->trap, &sc->gp_regs[PT_TRAP]);
 	err |= __get_user(regs->dar, &sc->gp_regs[PT_DAR]);
 	err |= __get_user(regs->dsisr, &sc->gp_regs[PT_DSISR]);
 	err |= __get_user(regs->result, &sc->gp_regs[PT_RESULT]);
@@ -674,12 +691,31 @@ int sys_rt_sigreturn(unsigned long r3, unsigned long r4, unsigned long r5,
 	if (__copy_from_user(&set, &uc->uc_sigmask, sizeof(set)))
 		goto badframe;
 	set_current_blocked(&set);
+
 #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+	/*
+	 * If there is a transactional state then throw it away.
+	 * The purpose of a sigreturn is to destroy all traces of the
+	 * signal frame, this includes any transactional state created
+	 * within in. We only check for suspended as we can never be
+	 * active in the kernel, we are active, there is nothing better to
+	 * do than go ahead and Bad Thing later.
+	 * The cause is not important as there will never be a
+	 * recheckpoint so it's not user visible.
+	 */
+	if (MSR_TM_SUSPENDED(mfmsr()))
+		tm_reclaim_current(0);
+
 	if (__get_user(msr, &uc->uc_mcontext.gp_regs[PT_MSR]))
 		goto badframe;
 	if (MSR_TM_ACTIVE(msr)) {
 		/* We recheckpoint on return. */
 		struct ucontext __user *uc_transact;
+
+		/* Trying to start TM on non TM system */
+		if (!cpu_has_feature(CPU_FTR_TM))
+			goto badframe;
+
 		if (__get_user(uc_transact, &uc->uc_link))
 			goto badframe;
 		if (restore_tm_sigcontexts(regs, &uc->uc_mcontext,

@@ -1,3 +1,5 @@
+/* License: GPL */
+
 #include <linux/mutex.h>
 #include <linux/socket.h>
 #include <linux/skbuff.h>
@@ -8,6 +10,7 @@
 #include <linux/kernel.h>
 #include <linux/tcp.h>
 #include <linux/workqueue.h>
+#include <linux/nospec.h>
 
 #include <linux/inet_diag.h>
 #include <linux/sock_diag.h>
@@ -223,6 +226,7 @@ static int __sock_diag_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 
 	if (req->sdiag_family >= AF_MAX)
 		return -EINVAL;
+	req->sdiag_family = array_index_nospec(req->sdiag_family, AF_MAX);
 
 	if (sock_diag_handlers[req->sdiag_family] == NULL)
 		request_module("net-pf-%d-proto-%d-type-%d", PF_NETLINK,
@@ -287,7 +291,7 @@ static int sock_diag_bind(struct net *net, int group)
 	case SKNLGRP_INET6_UDP_DESTROY:
 		if (!sock_diag_handlers[AF_INET6])
 			request_module("net-pf-%d-proto-%d-type-%d", PF_NETLINK,
-				       NETLINK_SOCK_DIAG, AF_INET);
+				       NETLINK_SOCK_DIAG, AF_INET6);
 		break;
 	}
 	return 0;
@@ -323,14 +327,4 @@ static int __init sock_diag_init(void)
 	BUG_ON(!broadcast_wq);
 	return register_pernet_subsys(&diag_net_ops);
 }
-
-static void __exit sock_diag_exit(void)
-{
-	unregister_pernet_subsys(&diag_net_ops);
-	destroy_workqueue(broadcast_wq);
-}
-
-module_init(sock_diag_init);
-module_exit(sock_diag_exit);
-MODULE_LICENSE("GPL");
-MODULE_ALIAS_NET_PF_PROTO(PF_NETLINK, NETLINK_SOCK_DIAG);
+device_initcall(sock_diag_init);

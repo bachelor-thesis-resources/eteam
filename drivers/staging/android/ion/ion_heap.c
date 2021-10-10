@@ -38,7 +38,7 @@ void *ion_heap_map_kernel(struct ion_heap *heap,
 	struct page **tmp = pages;
 
 	if (!pages)
-		return NULL;
+		return ERR_PTR(-ENOMEM);
 
 	if (buffer->flags & ION_FLAG_CACHED)
 		pgprot = PAGE_KERNEL;
@@ -56,7 +56,7 @@ void *ion_heap_map_kernel(struct ion_heap *heap,
 	vaddr = vmap(pages, npages, VM_MAP, pgprot);
 	vfree(pages);
 
-	if (vaddr == NULL)
+	if (!vaddr)
 		return ERR_PTR(-ENOMEM);
 
 	return vaddr;
@@ -105,12 +105,12 @@ int ion_heap_map_user(struct ion_heap *heap, struct ion_buffer *buffer,
 
 static int ion_heap_clear_pages(struct page **pages, int num, pgprot_t pgprot)
 {
-	void *addr = vm_map_ram(pages, num, -1, pgprot);
+	void *addr = vmap(pages, num, VM_MAP, pgprot);
 
 	if (!addr)
 		return -ENOMEM;
 	memset(addr, 0, PAGE_SIZE * num);
-	vm_unmap_ram(addr, num);
+	vunmap(addr);
 
 	return 0;
 }
@@ -352,6 +352,7 @@ struct ion_heap *ion_heap_create(struct ion_platform_heap *heap_data)
 	heap->id = heap_data->id;
 	return heap;
 }
+EXPORT_SYMBOL(ion_heap_create);
 
 void ion_heap_destroy(struct ion_heap *heap)
 {
@@ -379,3 +380,4 @@ void ion_heap_destroy(struct ion_heap *heap)
 		       heap->type);
 	}
 }
+EXPORT_SYMBOL(ion_heap_destroy);

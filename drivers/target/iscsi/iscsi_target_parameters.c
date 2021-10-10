@@ -208,7 +208,7 @@ int iscsi_create_default_params(struct iscsi_param_list **param_list_ptr)
 	if (!pl) {
 		pr_err("Unable to allocate memory for"
 				" struct iscsi_param_list.\n");
-		return -1 ;
+		return -ENOMEM;
 	}
 	INIT_LIST_HEAD(&pl->param_list);
 	INIT_LIST_HEAD(&pl->extra_response_list);
@@ -407,6 +407,7 @@ int iscsi_create_default_params(struct iscsi_param_list **param_list_ptr)
 			TYPERANGE_UTF8, USE_INITIAL_ONLY);
 	if (!param)
 		goto out;
+
 	/*
 	 * Extra parameters for ISER from RFC-5046
 	 */
@@ -496,9 +497,9 @@ int iscsi_set_keys_to_negotiate(
 		} else if (!strcmp(param->name, SESSIONTYPE)) {
 			SET_PSTATE_NEGOTIATE(param);
 		} else if (!strcmp(param->name, IFMARKER)) {
-			SET_PSTATE_NEGOTIATE(param);
+			SET_PSTATE_REJECT(param);
 		} else if (!strcmp(param->name, OFMARKER)) {
-			SET_PSTATE_NEGOTIATE(param);
+			SET_PSTATE_REJECT(param);
 		} else if (!strcmp(param->name, IFMARKINT)) {
 			SET_PSTATE_REJECT(param);
 		} else if (!strcmp(param->name, OFMARKINT)) {
@@ -577,7 +578,7 @@ int iscsi_copy_param_list(
 	param_list = kzalloc(sizeof(struct iscsi_param_list), GFP_KERNEL);
 	if (!param_list) {
 		pr_err("Unable to allocate memory for struct iscsi_param_list.\n");
-		return -1;
+		return -ENOMEM;
 	}
 	INIT_LIST_HEAD(&param_list->param_list);
 	INIT_LIST_HEAD(&param_list->extra_response_list);
@@ -628,7 +629,7 @@ int iscsi_copy_param_list(
 
 err_out:
 	iscsi_release_param_list(param_list);
-	return -1;
+	return -ENOMEM;
 }
 
 static void iscsi_release_extra_responses(struct iscsi_param_list *param_list)
@@ -728,7 +729,7 @@ static int iscsi_add_notunderstood_response(
 	if (!extra_response) {
 		pr_err("Unable to allocate memory for"
 			" struct iscsi_extra_response.\n");
-		return -1;
+		return -ENOMEM;
 	}
 	INIT_LIST_HEAD(&extra_response->er_list);
 
@@ -763,7 +764,8 @@ static int iscsi_check_for_auth_key(char *key)
 	return 0;
 }
 
-static void iscsi_check_proposer_for_optional_reply(struct iscsi_param *param)
+static void iscsi_check_proposer_for_optional_reply(struct iscsi_param *param,
+						    bool keys_workaround)
 {
 	if (IS_TYPE_BOOL_AND(param)) {
 		if (!strcmp(param->value, NO))
@@ -771,35 +773,31 @@ static void iscsi_check_proposer_for_optional_reply(struct iscsi_param *param)
 	} else if (IS_TYPE_BOOL_OR(param)) {
 		if (!strcmp(param->value, YES))
 			SET_PSTATE_REPLY_OPTIONAL(param);
-		 /*
-		  * Required for gPXE iSCSI boot client
-		  */
-		if (!strcmp(param->name, IMMEDIATEDATA))
-			SET_PSTATE_REPLY_OPTIONAL(param);
+
+		if (keys_workaround) {
+			/*
+			 * Required for gPXE iSCSI boot client
+			 */
+			if (!strcmp(param->name, IMMEDIATEDATA))
+				SET_PSTATE_REPLY_OPTIONAL(param);
+		}
 	} else if (IS_TYPE_NUMBER(param)) {
 		if (!strcmp(param->name, MAXRECVDATASEGMENTLENGTH))
 			SET_PSTATE_REPLY_OPTIONAL(param);
-		/*
-		 * The GlobalSAN iSCSI Initiator for MacOSX does
-		 * not respond to MaxBurstLength, FirstBurstLength,
-		 * DefaultTime2Wait or DefaultTime2Retain parameter keys.
-		 * So, we set them to 'reply optional' here, and assume the
-		 * the defaults from iscsi_parameters.h if the initiator
-		 * is not RFC compliant and the keys are not negotiated.
-		 */
-		if (!strcmp(param->name, MAXBURSTLENGTH))
-			SET_PSTATE_REPLY_OPTIONAL(param);
-		if (!strcmp(param->name, FIRSTBURSTLENGTH))
-			SET_PSTATE_REPLY_OPTIONAL(param);
-		if (!strcmp(param->name, DEFAULTTIME2WAIT))
-			SET_PSTATE_REPLY_OPTIONAL(param);
-		if (!strcmp(param->name, DEFAULTTIME2RETAIN))
-			SET_PSTATE_REPLY_OPTIONAL(param);
-		/*
-		 * Required for gPXE iSCSI boot client
-		 */
-		if (!strcmp(param->name, MAXCONNECTIONS))
-			SET_PSTATE_REPLY_OPTIONAL(param);
+
+		if (keys_workaround) {
+			/*
+			 * Required for Mellanox Flexboot PXE boot ROM
+			 */
+			if (!strcmp(param->name, FIRSTBURSTLENGTH))
+				SET_PSTATE_REPLY_OPTIONAL(param);
+
+			/*
+			 * Required for gPXE iSCSI boot client
+			 */
+			if (!strcmp(param->name, MAXCONNECTIONS))
+				SET_PSTATE_REPLY_OPTIONAL(param);
+		}
 	} else if (IS_PHASE_DECLARATIVE(param))
 		SET_PSTATE_REPLY_OPTIONAL(param);
 }
@@ -1369,7 +1367,7 @@ int iscsi_decode_text_input(
 	tmpbuf = kzalloc(length + 1, GFP_KERNEL);
 	if (!tmpbuf) {
 		pr_err("Unable to allocate %u + 1 bytes for tmpbuf.\n", length);
-		return -1;
+		return -ENOMEM;
 	}
 
 	memcpy(tmpbuf, textbuf, length);
@@ -1436,7 +1434,8 @@ int iscsi_encode_text_output(
 	u8 sender,
 	char *textbuf,
 	u32 *length,
-	struct iscsi_param_list *param_list)
+	struct iscsi_param_list *param_list,
+	bool keys_workaround)
 {
 	char *output_buf = NULL;
 	struct iscsi_extra_response *er;
@@ -1472,7 +1471,8 @@ int iscsi_encode_text_output(
 			*length += 1;
 			output_buf = textbuf + *length;
 			SET_PSTATE_PROPOSER(param);
-			iscsi_check_proposer_for_optional_reply(param);
+			iscsi_check_proposer_for_optional_reply(param,
+							        keys_workaround);
 			pr_debug("Sending key: %s=%s\n",
 				param->name, param->value);
 		}

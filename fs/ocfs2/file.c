@@ -105,8 +105,11 @@ static int ocfs2_file_open(struct inode *inode, struct file *file)
 			      file->f_path.dentry->d_name.len,
 			      file->f_path.dentry->d_name.name, mode);
 
-	if (file->f_mode & FMODE_WRITE)
-		dquot_initialize(inode);
+	if (file->f_mode & FMODE_WRITE) {
+		status = dquot_initialize(inode);
+		if (status)
+			goto leave;
+	}
 
 	spin_lock(&oi->ip_lock);
 
@@ -805,7 +808,7 @@ static int ocfs2_write_zero_page(struct inode *inode, u64 abs_from,
 	/* We know that zero_from is block aligned */
 	for (block_start = zero_from; block_start < zero_to;
 	     block_start = block_end) {
-		block_end = block_start + (1 << inode->i_blkbits);
+		block_end = block_start + i_blocksize(inode);
 
 		/*
 		 * block_start is block-aligned.  Bump it by one to force
@@ -1127,6 +1130,7 @@ out:
 int ocfs2_setattr(struct dentry *dentry, struct iattr *attr)
 {
 	int status = 0, size_change;
+	int inode_locked = 0;
 	struct inode *inode = d_inode(dentry);
 	struct super_block *sb = inode->i_sb;
 	struct ocfs2_super *osb = OCFS2_SB(sb);
@@ -1151,12 +1155,15 @@ int ocfs2_setattr(struct dentry *dentry, struct iattr *attr)
 	if (!(attr->ia_valid & OCFS2_VALID_ATTRS))
 		return 0;
 
-	status = inode_change_ok(inode, attr);
+	status = setattr_prepare(dentry, attr);
 	if (status)
 		return status;
 
-	if (is_quota_modification(inode, attr))
-		dquot_initialize(inode);
+	if (is_quota_modification(inode, attr)) {
+		status = dquot_initialize(inode);
+		if (status)
+			return status;
+	}
 	size_change = S_ISREG(inode->i_mode) && attr->ia_valid & ATTR_SIZE;
 	if (size_change) {
 		status = ocfs2_rw_lock(inode, 1);
@@ -1172,6 +1179,7 @@ int ocfs2_setattr(struct dentry *dentry, struct iattr *attr)
 			mlog_errno(status);
 		goto bail_unlock_rw;
 	}
+	inode_locked = 1;
 
 	if (size_change) {
 		status = inode_newsize_ok(inode, attr->ia_size);
@@ -1209,8 +1217,8 @@ int ocfs2_setattr(struct dentry *dentry, struct iattr *attr)
 		    && OCFS2_HAS_RO_COMPAT_FEATURE(sb,
 		    OCFS2_FEATURE_RO_COMPAT_USRQUOTA)) {
 			transfer_to[USRQUOTA] = dqget(sb, make_kqid_uid(attr->ia_uid));
-			if (!transfer_to[USRQUOTA]) {
-				status = -ESRCH;
+			if (IS_ERR(transfer_to[USRQUOTA])) {
+				status = PTR_ERR(transfer_to[USRQUOTA]);
 				goto bail_unlock;
 			}
 		}
@@ -1218,8 +1226,8 @@ int ocfs2_setattr(struct dentry *dentry, struct iattr *attr)
 		    && OCFS2_HAS_RO_COMPAT_FEATURE(sb,
 		    OCFS2_FEATURE_RO_COMPAT_GRPQUOTA)) {
 			transfer_to[GRPQUOTA] = dqget(sb, make_kqid_gid(attr->ia_gid));
-			if (!transfer_to[GRPQUOTA]) {
-				status = -ESRCH;
+			if (IS_ERR(transfer_to[GRPQUOTA])) {
+				status = PTR_ERR(transfer_to[GRPQUOTA]);
 				goto bail_unlock;
 			}
 		}
@@ -1252,23 +1260,28 @@ int ocfs2_setattr(struct dentry *dentry, struct iattr *attr)
 bail_commit:
 	ocfs2_commit_trans(osb, handle);
 bail_unlock:
-	ocfs2_inode_unlock(inode, 1);
+	if (status) {
+		ocfs2_inode_unlock(inode, 1);
+		inode_locked = 0;
+	}
 bail_unlock_rw:
 	if (size_change)
 		ocfs2_rw_unlock(inode, 1);
 bail:
-	brelse(bh);
 
 	/* Release quota pointers in case we acquired them */
 	for (qtype = 0; qtype < OCFS2_MAXQUOTAS; qtype++)
 		dqput(transfer_to[qtype]);
 
 	if (!status && attr->ia_valid & ATTR_MODE) {
-		status = posix_acl_chmod(inode, inode->i_mode);
+		status = ocfs2_acl_chmod(inode, bh);
 		if (status < 0)
 			mlog_errno(status);
 	}
+	if (inode_locked)
+		ocfs2_inode_unlock(inode, 1);
 
+	brelse(bh);
 	return status;
 }
 
@@ -1523,7 +1536,8 @@ static int ocfs2_zero_partial_clusters(struct inode *inode,
 				       u64 start, u64 len)
 {
 	int ret = 0;
-	u64 tmpend, end = start + len;
+	u64 tmpend = 0;
+	u64 end = start + len;
 	struct ocfs2_super *osb = OCFS2_SB(inode->i_sb);
 	unsigned int csize = osb->s_clustersize;
 	handle_t *handle;
@@ -1555,18 +1569,31 @@ static int ocfs2_zero_partial_clusters(struct inode *inode,
 	}
 
 	/*
-	 * We want to get the byte offset of the end of the 1st cluster.
+	 * If start is on a cluster boundary and end is somewhere in another
+	 * cluster, we have not COWed the cluster starting at start, unless
+	 * end is also within the same cluster. So, in this case, we skip this
+	 * first call to ocfs2_zero_range_for_truncate() truncate and move on
+	 * to the next one.
 	 */
-	tmpend = (u64)osb->s_clustersize + (start & ~(osb->s_clustersize - 1));
-	if (tmpend > end)
-		tmpend = end;
+	if ((start & (csize - 1)) != 0) {
+		/*
+		 * We want to get the byte offset of the end of the 1st
+		 * cluster.
+		 */
+		tmpend = (u64)osb->s_clustersize +
+			(start & ~(osb->s_clustersize - 1));
+		if (tmpend > end)
+			tmpend = end;
 
-	trace_ocfs2_zero_partial_clusters_range1((unsigned long long)start,
-						 (unsigned long long)tmpend);
+		trace_ocfs2_zero_partial_clusters_range1(
+			(unsigned long long)start,
+			(unsigned long long)tmpend);
 
-	ret = ocfs2_zero_range_for_truncate(inode, handle, start, tmpend);
-	if (ret)
-		mlog_errno(ret);
+		ret = ocfs2_zero_range_for_truncate(inode, handle, start,
+						    tmpend);
+		if (ret)
+			mlog_errno(ret);
+	}
 
 	if (tmpend < end) {
 		/*
@@ -2256,8 +2283,6 @@ static ssize_t ocfs2_file_write_iter(struct kiocb *iocb,
 	ssize_t written = 0;
 	ssize_t ret;
 	size_t count = iov_iter_count(from), orig_count;
-	loff_t old_size;
-	u32 old_clusters;
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file_inode(file);
 	struct ocfs2_super *osb = OCFS2_SB(inode->i_sb);
@@ -2265,6 +2290,8 @@ static ssize_t ocfs2_file_write_iter(struct kiocb *iocb,
 			       OCFS2_MOUNT_COHERENCY_BUFFERED);
 	int unaligned_dio = 0;
 	int dropped_dio = 0;
+	int append_write = ((iocb->ki_pos + count) >=
+			i_size_read(inode) ? 1 : 0);
 
 	trace_ocfs2_file_aio_write(inode, file, file->f_path.dentry,
 		(unsigned long long)OCFS2_I(inode)->ip_blkno,
@@ -2284,8 +2311,9 @@ relock:
 	/*
 	 * Concurrent O_DIRECT writes are allowed with
 	 * mount_option "coherency=buffered".
+	 * For append write, we must take rw EX.
 	 */
-	rw_level = (!direct_io || full_coherency);
+	rw_level = (!direct_io || full_coherency || append_write);
 
 	ret = ocfs2_rw_lock(inode, rw_level);
 	if (ret < 0) {
@@ -2358,13 +2386,6 @@ relock:
 		ocfs2_iocb_set_unaligned_aio(iocb);
 	}
 
-	/*
-	 * To later detect whether a journal commit for sync writes is
-	 * necessary, we sample i_size, and cluster count here.
-	 */
-	old_size = i_size_read(inode);
-	old_clusters = OCFS2_I(inode)->ip_clusters;
-
 	/* communicate with ocfs2_dio_end_io */
 	ocfs2_iocb_set_rw_locked(iocb, rw_level);
 
@@ -2410,7 +2431,7 @@ relock:
 	}
 
 no_sync:
-	if (unaligned_dio) {
+	if (unaligned_dio && ocfs2_iocb_is_unaligned_aio(iocb)) {
 		ocfs2_iocb_clear_unaligned_aio(iocb);
 		mutex_unlock(&OCFS2_I(inode)->ip_unaligned_aio);
 	}

@@ -194,6 +194,7 @@ config CHR_DEV_SCH
 config SCSI_ENCLOSURE
 	tristate "SCSI Enclosure Support"
 	depends on SCSI && ENCLOSURE_SERVICES
+	depends on m || SCSI_SAS_ATTRS != m
 	help
 	  Enclosures are devices sitting on or in SCSI backplanes that
 	  manage devices.  If you have a disk cage, the chances are that
@@ -241,13 +242,6 @@ config SCSI_SCAN_ASYNC
 	  The SCSI subsystem can probe for devices while the rest of the
 	  system continues booting, and even probe devices on different
 	  busses in parallel, leading to a significant speed-up.
-
-	  If you have built SCSI as modules, enabling this option can
-	  be a problem as the devices may not have been found by the
-	  time your system expects them to have been.  You can load the
-	  scsi_wait_scan module to ensure that all scans have completed.
-	  If you build your SCSI drivers into the kernel, then everything
-	  will work fine if you say Y here.
 
 	  You can override this choice by specifying "scsi_mod.scan=sync"
 	  or async on the kernel's command line.
@@ -345,6 +339,7 @@ source "drivers/scsi/cxgbi/Kconfig"
 source "drivers/scsi/bnx2i/Kconfig"
 source "drivers/scsi/bnx2fc/Kconfig"
 source "drivers/scsi/be2iscsi/Kconfig"
+source "drivers/scsi/cxlflash/Kconfig"
 
 config SGIWD93_SCSI
 	tristate "SGI WD93C93 SCSI Driver"
@@ -370,6 +365,7 @@ config SCSI_HPSA
 	tristate "HP Smart Array SCSI driver"
 	depends on PCI && SCSI
 	select CHECK_SIGNATURE
+	select SCSI_SAS_ATTRS
 	help
 	  This driver supports HP Smart Array Controllers (circa 2009).
 	  It is a SCSI alternative to the cciss driver, which is a block
@@ -505,6 +501,7 @@ config SCSI_ADVANSYS
 	tristate "AdvanSys SCSI support"
 	depends on SCSI
 	depends on ISA || EISA || PCI
+	depends on ISA_DMA_API || !ISA
 	help
 	  This is a driver for all SCSI host adapters manufactured by
 	  AdvanSys. It is documented in the kernel source in
@@ -540,7 +537,6 @@ config SCSI_ARCMSR
 
 source "drivers/scsi/esas2r/Kconfig"
 source "drivers/scsi/megaraid/Kconfig.megaraid"
-source "drivers/scsi/mpt2sas/Kconfig"
 source "drivers/scsi/mpt3sas/Kconfig"
 source "drivers/scsi/ufs/Kconfig"
 
@@ -850,6 +846,23 @@ config SCSI_IBMVSCSI
 	  To compile this driver as a module, choose M here: the
 	  module will be called ibmvscsi.
 
+config SCSI_IBMVSCSIS
+	tristate "IBM Virtual SCSI Server support"
+	depends on PPC_PSERIES && TARGET_CORE && SCSI && PCI
+	help
+	  This is the IBM POWER Virtual SCSI Target Server
+	  This driver uses the SRP protocol for communication betwen servers
+	  guest and/or the host that run on the same server.
+	  More information on VSCSI protocol can be found at www.power.org
+
+	  The userspace configuration needed to initialize the driver can be
+	  be found here:
+
+	  https://github.com/powervm/ibmvscsis/wiki/Configuration
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called ibmvscsis.
+
 config SCSI_IBMVFC
 	tristate "IBM Virtual FC support"
 	depends on PPC_PSERIES && SCSI
@@ -1018,7 +1031,7 @@ config SCSI_SNI_53C710
 
 config 53C700_LE_ON_BE
 	bool
-	depends on SCSI_LASI700
+	depends on SCSI_LASI700 || SCSI_SNI_53C710
 	default y
 
 config SCSI_STEX
@@ -1642,7 +1655,7 @@ config ATARI_SCSI_RESET_BOOT
 
 config MAC_SCSI
 	tristate "Macintosh NCR5380 SCSI"
-	depends on MAC && SCSI=y
+	depends on MAC && SCSI
 	select SCSI_SPI_ATTRS
 	help
 	  This is the NCR 5380 SCSI controller included on most of the 68030

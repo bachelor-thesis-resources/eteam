@@ -148,6 +148,13 @@ typedef __u32			xfs_nlink_t;
 #define SYNCHRONIZE()	barrier()
 #define __return_address __builtin_return_address(0)
 
+/*
+ * Return the address of a label.  Use barrier() so that the optimizer
+ * won't reorder code to refactor the error jumpouts into a single
+ * return, which throws off the reported address.
+ */
+#define __this_address	({ __label__ __here; __here: barrier(); &&__here; })
+
 #define XFS_PROJID_DEFAULT	0
 #define MAXPATHLEN	1024
 
@@ -170,6 +177,13 @@ struct xfs_kobj {
 	struct kobject		kobject;
 	struct completion	complete;
 };
+
+struct xstats {
+	struct xfsstats __percpu	*xs_stats;
+	struct xfs_kobj			xs_kobj;
+};
+
+extern struct xstats xfsstats;
 
 /* Kernel uid/gid conversion. These are used to convert to/from the on disk
  * uid_t/gid_t types to the kuid_t/kgid_t types that the kernel uses internally.
@@ -362,7 +376,14 @@ static inline __uint64_t howmany_64(__uint64_t x, __uint32_t y)
 #endif /* DEBUG */
 
 #ifdef CONFIG_XFS_RT
-#define XFS_IS_REALTIME_INODE(ip) ((ip)->i_d.di_flags & XFS_DIFLAG_REALTIME)
+
+/*
+ * make sure we ignore the inode flag if the filesystem doesn't have a
+ * configured realtime device.
+ */
+#define XFS_IS_REALTIME_INODE(ip)			\
+	(((ip)->i_d.di_flags & XFS_DIFLAG_REALTIME) &&	\
+	 (ip)->i_mount->m_rtdev_targp)
 #else
 #define XFS_IS_REALTIME_INODE(ip) (0)
 #endif

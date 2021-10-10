@@ -40,6 +40,9 @@
 #include "hw-me-regs.h"
 #include "hw-me.h"
 
+static bool disable_msi;
+module_param(disable_msi, bool, 0);
+
 /* mei_pci_tbl - PCI Device ID Table */
 static const struct pci_device_id mei_me_pci_tbl[] = {
 	{MEI_PCI_DEVICE(MEI_DEV_ID_82946GZ, mei_me_legacy_cfg)},
@@ -81,6 +84,18 @@ static const struct pci_device_id mei_me_pci_tbl[] = {
 	{MEI_PCI_DEVICE(MEI_DEV_ID_LPT_HR, mei_me_pch8_sps_cfg)},
 	{MEI_PCI_DEVICE(MEI_DEV_ID_WPT_LP, mei_me_pch8_cfg)},
 	{MEI_PCI_DEVICE(MEI_DEV_ID_WPT_LP_2, mei_me_pch8_cfg)},
+
+	{MEI_PCI_DEVICE(MEI_DEV_ID_SPT, mei_me_pch8_cfg)},
+	{MEI_PCI_DEVICE(MEI_DEV_ID_SPT_2, mei_me_pch8_cfg)},
+	{MEI_PCI_DEVICE(MEI_DEV_ID_SPT_H, mei_me_pch8_sps_cfg)},
+	{MEI_PCI_DEVICE(MEI_DEV_ID_SPT_H_2, mei_me_pch8_sps_cfg)},
+	{MEI_PCI_DEVICE(MEI_DEV_ID_LBG, mei_me_pch8_cfg)},
+
+	{MEI_PCI_DEVICE(MEI_DEV_ID_KBP, mei_me_pch8_cfg)},
+	{MEI_PCI_DEVICE(MEI_DEV_ID_KBP_2, mei_me_pch8_cfg)},
+
+	{MEI_PCI_DEVICE(MEI_DEV_ID_BXT_M, mei_me_pch8_cfg)},
+	{MEI_PCI_DEVICE(MEI_DEV_ID_APL_I, mei_me_pch8_cfg)},
 
 	/* required last entry */
 	{0, }
@@ -128,6 +143,7 @@ static int mei_me_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	const struct mei_cfg *cfg = (struct mei_cfg *)(ent->driver_data);
 	struct mei_device *dev;
 	struct mei_me_hw *hw;
+	unsigned int irqflags;
 	int err;
 
 
@@ -177,20 +193,16 @@ static int mei_me_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		err = -ENOMEM;
 		goto free_device;
 	}
-	pci_enable_msi(pdev);
+	if (!disable_msi)
+		pci_enable_msi(pdev);
 
 	 /* request and enable interrupt */
-	if (pci_dev_msi_enabled(pdev))
-		err = request_threaded_irq(pdev->irq,
-			NULL,
-			mei_me_irq_thread_handler,
-			IRQF_ONESHOT, KBUILD_MODNAME, dev);
-	else
-		err = request_threaded_irq(pdev->irq,
+	irqflags = pci_dev_msi_enabled(pdev) ? IRQF_ONESHOT : IRQF_SHARED;
+
+	err = request_threaded_irq(pdev->irq,
 			mei_me_irq_quick_handler,
 			mei_me_irq_thread_handler,
-			IRQF_SHARED, KBUILD_MODNAME, dev);
-
+			irqflags, KBUILD_MODNAME, dev);
 	if (err) {
 		dev_err(&pdev->dev, "request_threaded_irq failure. irq = %d\n",
 		       pdev->irq);
@@ -222,8 +234,11 @@ static int mei_me_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (!pci_dev_run_wake(pdev))
 		mei_me_set_pm_domain(dev);
 
-	if (mei_pg_is_enabled(dev))
+	if (mei_pg_is_enabled(dev)) {
 		pm_runtime_put_noidle(&pdev->dev);
+		if (hw->d0i3_supported)
+			pm_runtime_allow(&pdev->dev);
+	}
 
 	dev_dbg(&pdev->dev, "initialization successful.\n");
 
@@ -319,6 +334,7 @@ static int mei_me_pci_resume(struct device *device)
 {
 	struct pci_dev *pdev = to_pci_dev(device);
 	struct mei_device *dev;
+	unsigned int irqflags;
 	int err;
 
 	dev = pci_get_drvdata(pdev);
@@ -327,17 +343,13 @@ static int mei_me_pci_resume(struct device *device)
 
 	pci_enable_msi(pdev);
 
+	irqflags = pci_dev_msi_enabled(pdev) ? IRQF_ONESHOT : IRQF_SHARED;
+
 	/* request and enable interrupt */
-	if (pci_dev_msi_enabled(pdev))
-		err = request_threaded_irq(pdev->irq,
-			NULL,
-			mei_me_irq_thread_handler,
-			IRQF_ONESHOT, KBUILD_MODNAME, dev);
-	else
-		err = request_threaded_irq(pdev->irq,
+	err = request_threaded_irq(pdev->irq,
 			mei_me_irq_quick_handler,
 			mei_me_irq_thread_handler,
-			IRQF_SHARED, KBUILD_MODNAME, dev);
+			irqflags, KBUILD_MODNAME, dev);
 
 	if (err) {
 		dev_err(&pdev->dev, "request_threaded_irq failed: irq = %d.\n",

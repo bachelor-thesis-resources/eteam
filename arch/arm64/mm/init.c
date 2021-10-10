@@ -37,6 +37,7 @@
 
 #include <asm/fixmap.h>
 #include <asm/memory.h>
+#include <asm/numa.h>
 #include <asm/sections.h>
 #include <asm/setup.h>
 #include <asm/sizes.h>
@@ -77,6 +78,21 @@ static phys_addr_t max_zone_dma_phys(void)
 	return min(offset + (1ULL << 32), memblock_end_of_DRAM());
 }
 
+#ifdef CONFIG_NUMA
+
+static void __init zone_sizes_init(unsigned long min, unsigned long max)
+{
+	unsigned long max_zone_pfns[MAX_NR_ZONES]  = {0};
+
+	if (IS_ENABLED(CONFIG_ZONE_DMA))
+		max_zone_pfns[ZONE_DMA] = PFN_DOWN(max_zone_dma_phys());
+	max_zone_pfns[ZONE_NORMAL] = max;
+
+	free_area_init_nodes(max_zone_pfns);
+}
+
+#else
+
 static void __init zone_sizes_init(unsigned long min, unsigned long max)
 {
 	struct memblock_region *reg;
@@ -86,10 +102,10 @@ static void __init zone_sizes_init(unsigned long min, unsigned long max)
 	memset(zone_size, 0, sizeof(zone_size));
 
 	/* 4GB maximum for 32-bit only capable devices */
-	if (IS_ENABLED(CONFIG_ZONE_DMA)) {
-		max_dma = PFN_DOWN(arm64_dma_phys_limit);
-		zone_size[ZONE_DMA] = max_dma - min;
-	}
+#ifdef CONFIG_ZONE_DMA
+	max_dma = PFN_DOWN(arm64_dma_phys_limit);
+	zone_size[ZONE_DMA] = max_dma - min;
+#endif
 	zone_size[ZONE_NORMAL] = max - max_dma;
 
 	memcpy(zhole_size, zone_size, sizeof(zhole_size));
@@ -101,11 +117,12 @@ static void __init zone_sizes_init(unsigned long min, unsigned long max)
 		if (start >= max)
 			continue;
 
-		if (IS_ENABLED(CONFIG_ZONE_DMA) && start < max_dma) {
+#ifdef CONFIG_ZONE_DMA
+		if (start < max_dma) {
 			unsigned long dma_end = min(end, max_dma);
 			zhole_size[ZONE_DMA] -= dma_end - start;
 		}
-
+#endif
 		if (end > max_dma) {
 			unsigned long normal_end = min(end, max);
 			unsigned long normal_start = max(start, max_dma);
@@ -116,10 +133,16 @@ static void __init zone_sizes_init(unsigned long min, unsigned long max)
 	free_area_init_node(0, zone_size, min, zhole_size);
 }
 
+#endif /* CONFIG_NUMA */
+
 #ifdef CONFIG_HAVE_ARCH_PFN_VALID
 int pfn_valid(unsigned long pfn)
 {
-	return memblock_is_memory(pfn << PAGE_SHIFT);
+	phys_addr_t addr = pfn << PAGE_SHIFT;
+
+	if ((addr >> PAGE_SHIFT) != pfn)
+		return 0;
+	return memblock_is_memory(addr);
 }
 EXPORT_SYMBOL(pfn_valid);
 #endif
@@ -132,10 +155,15 @@ static void arm64_memory_present(void)
 static void arm64_memory_present(void)
 {
 	struct memblock_region *reg;
+	int nid = 0;
 
-	for_each_memblock(memory, reg)
-		memory_present(0, memblock_region_memory_base_pfn(reg),
-			       memblock_region_memory_end_pfn(reg));
+	for_each_memblock(memory, reg) {
+#ifdef CONFIG_NUMA
+		nid = reg->nid;
+#endif
+		memory_present(nid, memblock_region_memory_base_pfn(reg),
+				memblock_region_memory_end_pfn(reg));
+	}
 }
 #endif
 
@@ -177,10 +205,10 @@ void __init arm64_memblock_init(void)
 		arm64_dma_phys_limit = max_zone_dma_phys();
 	else
 		arm64_dma_phys_limit = PHYS_MASK + 1;
+	high_memory = __va(memblock_end_of_DRAM() - 1) + 1;
 	dma_contiguous_reserve(arm64_dma_phys_limit);
 
 	memblock_allow_resize();
-	memblock_dump_all();
 }
 
 void __init bootmem_init(void)
@@ -192,6 +220,9 @@ void __init bootmem_init(void)
 
 	early_memtest(min << PAGE_SHIFT, max << PAGE_SHIFT);
 
+	max_pfn = max_low_pfn = max;
+
+	arm64_numa_init();
 	/*
 	 * Sparsemem tries to allocate bootmem in memory_present(), so must be
 	 * done after the fixed reservations.
@@ -200,9 +231,6 @@ void __init bootmem_init(void)
 
 	sparse_init();
 	zone_sizes_init(min, max);
-
-	high_memory = __va((max << PAGE_SHIFT) - 1) + 1;
-	max_pfn = max_low_pfn = max;
 }
 
 #ifndef CONFIG_SPARSEMEM_VMEMMAP
@@ -298,6 +326,9 @@ void __init mem_init(void)
 #define MLK_ROUNDUP(b, t) b, t, DIV_ROUND_UP(((t) - (b)), SZ_1K)
 
 	pr_notice("Virtual kernel memory layout:\n"
+#ifdef CONFIG_KASAN
+		  "    kasan   : 0x%16lx - 0x%16lx   (%6ld GB)\n"
+#endif
 		  "    vmalloc : 0x%16lx - 0x%16lx   (%6ld GB)\n"
 #ifdef CONFIG_SPARSEMEM_VMEMMAP
 		  "    vmemmap : 0x%16lx - 0x%16lx   (%6ld GB maximum)\n"
@@ -310,10 +341,13 @@ void __init mem_init(void)
 		  "      .init : 0x%p" " - 0x%p" "   (%6ld KB)\n"
 		  "      .text : 0x%p" " - 0x%p" "   (%6ld KB)\n"
 		  "      .data : 0x%p" " - 0x%p" "   (%6ld KB)\n",
+#ifdef CONFIG_KASAN
+		  MLG(KASAN_SHADOW_START, KASAN_SHADOW_END),
+#endif
 		  MLG(VMALLOC_START, VMALLOC_END),
 #ifdef CONFIG_SPARSEMEM_VMEMMAP
-		  MLG((unsigned long)vmemmap,
-		      (unsigned long)vmemmap + VMEMMAP_SIZE),
+		  MLG(VMEMMAP_START,
+		      VMEMMAP_START + VMEMMAP_SIZE),
 		  MLM((unsigned long)virt_to_page(PAGE_OFFSET),
 		      (unsigned long)virt_to_page(high_memory)),
 #endif
@@ -358,9 +392,9 @@ void free_initmem(void)
 
 #ifdef CONFIG_BLK_DEV_INITRD
 
-static int keep_initrd;
+static int keep_initrd __initdata;
 
-void free_initrd_mem(unsigned long start, unsigned long end)
+void __init free_initrd_mem(unsigned long start, unsigned long end)
 {
 	if (!keep_initrd)
 		free_reserved_area((void *)start, (void *)end, 0, "initrd");

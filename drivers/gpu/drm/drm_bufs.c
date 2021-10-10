@@ -36,6 +36,8 @@
 #include <drm/drmP.h>
 #include "drm_legacy.h"
 
+#include <linux/nospec.h>
+
 static struct drm_map_list *drm_find_matching_map(struct drm_device *dev,
 						  struct drm_local_map *map)
 {
@@ -582,7 +584,7 @@ static void drm_cleanup_buf_error(struct drm_device * dev,
 	}
 }
 
-#if __OS_HAS_AGP
+#if IS_ENABLED(CONFIG_AGP)
 /**
  * Add AGP buffers for DMA transfers.
  *
@@ -756,7 +758,7 @@ int drm_legacy_addbufs_agp(struct drm_device *dev,
 	return 0;
 }
 EXPORT_SYMBOL(drm_legacy_addbufs_agp);
-#endif				/* __OS_HAS_AGP */
+#endif /* CONFIG_AGP */
 
 int drm_legacy_addbufs_pci(struct drm_device *dev,
 			   struct drm_buf_desc *request)
@@ -1145,7 +1147,7 @@ int drm_legacy_addbufs(struct drm_device *dev, void *data,
 	if (!drm_core_check_feature(dev, DRIVER_HAVE_DMA))
 		return -EINVAL;
 
-#if __OS_HAS_AGP
+#if IS_ENABLED(CONFIG_AGP)
 	if (request->flags & _DRM_AGP_BUFFER)
 		ret = drm_legacy_addbufs_agp(dev, request);
 	else
@@ -1332,6 +1334,7 @@ int drm_legacy_freebufs(struct drm_device *dev, void *data,
 				  idx, dma->buf_count - 1);
 			return -EINVAL;
 		}
+		idx = array_index_nospec(idx, dma->buf_count);
 		buf = dma->buflist[idx];
 		if (buf->file_priv != file_priv) {
 			DRM_ERROR("Process %d freeing buffer not owned\n",

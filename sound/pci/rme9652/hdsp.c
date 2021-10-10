@@ -30,6 +30,7 @@
 #include <linux/math64.h>
 #include <linux/vmalloc.h>
 #include <linux/io.h>
+#include <linux/nospec.h>
 
 #include <sound/core.h>
 #include <sound/control.h>
@@ -1526,7 +1527,7 @@ static struct snd_rawmidi_ops snd_hdsp_midi_input =
 
 static int snd_hdsp_create_midi (struct snd_card *card, struct hdsp *hdsp, int id)
 {
-	char buf[32];
+	char buf[40];
 
 	hdsp->midi[id].id = id;
 	hdsp->midi[id].rmidi = NULL;
@@ -1537,7 +1538,7 @@ static int snd_hdsp_create_midi (struct snd_card *card, struct hdsp *hdsp, int i
 	hdsp->midi[id].pending = 0;
 	spin_lock_init (&hdsp->midi[id].lock);
 
-	sprintf (buf, "%s MIDI %d", card->shortname, id+1);
+	snprintf(buf, sizeof(buf), "%s MIDI %d", card->shortname, id + 1);
 	if (snd_rawmidi_new (card, buf, id, 1, 1, &hdsp->midi[id].rmidi) < 0)
 		return -1;
 
@@ -2806,7 +2807,8 @@ static int snd_hdsp_get_adat_sync_check(struct snd_kcontrol *kcontrol, struct sn
 	struct hdsp *hdsp = snd_kcontrol_chip(kcontrol);
 
 	offset = ucontrol->id.index - 1;
-	snd_BUG_ON(offset < 0);
+	if (snd_BUG_ON(offset < 0))
+		return -EINVAL;
 
 	switch (hdsp->io_type) {
 	case Digiface:
@@ -2878,7 +2880,7 @@ static int snd_hdsp_get_dds_offset(struct snd_kcontrol *kcontrol, struct snd_ctl
 {
 	struct hdsp *hdsp = snd_kcontrol_chip(kcontrol);
 
-	ucontrol->value.enumerated.item[0] = hdsp_dds_offset(hdsp);
+	ucontrol->value.integer.value[0] = hdsp_dds_offset(hdsp);
 	return 0;
 }
 
@@ -2890,7 +2892,7 @@ static int snd_hdsp_put_dds_offset(struct snd_kcontrol *kcontrol, struct snd_ctl
 
 	if (!snd_hdsp_use_is_exclusive(hdsp))
 		return -EBUSY;
-	val = ucontrol->value.enumerated.item[0];
+	val = ucontrol->value.integer.value[0];
 	spin_lock_irq(&hdsp->lock);
 	if (val != hdsp_dds_offset(hdsp))
 		change = (hdsp_set_dds_offset(hdsp, val) == 0) ? 1 : 0;
@@ -4064,15 +4066,16 @@ static int snd_hdsp_channel_info(struct snd_pcm_substream *substream,
 				    struct snd_pcm_channel_info *info)
 {
 	struct hdsp *hdsp = snd_pcm_substream_chip(substream);
-	int mapped_channel;
+	unsigned int channel = info->channel;
 
-	if (snd_BUG_ON(info->channel >= hdsp->max_channels))
+	if (snd_BUG_ON(channel >= hdsp->max_channels))
+		return -EINVAL;
+	channel = array_index_nospec(channel, hdsp->max_channels);
+
+	if (hdsp->channel_map[channel] < 0)
 		return -EINVAL;
 
-	if ((mapped_channel = hdsp->channel_map[info->channel]) < 0)
-		return -EINVAL;
-
-	info->offset = mapped_channel * HDSP_CHANNEL_BUFFER_BYTES;
+	info->offset = hdsp->channel_map[channel] * HDSP_CHANNEL_BUFFER_BYTES;
 	info->first = 0;
 	info->step = 32;
 	return 0;
@@ -5111,6 +5114,7 @@ static int hdsp_request_fw_loader(struct hdsp *hdsp)
 		dev_err(hdsp->card->dev,
 			"too short firmware size %d (expected %d)\n",
 			   (int)fw->size, HDSP_FIRMWARE_SIZE);
+		release_firmware(fw);
 		return -EINVAL;
 	}
 

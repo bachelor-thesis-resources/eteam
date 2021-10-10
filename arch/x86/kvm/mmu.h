@@ -50,28 +50,14 @@ static inline u64 rsvd_bits(int s, int e)
 	return ((1ULL << (e - s + 1)) - 1) << s;
 }
 
-int kvm_mmu_get_spte_hierarchy(struct kvm_vcpu *vcpu, u64 addr, u64 sptes[4]);
 void kvm_mmu_set_mmio_spte_mask(u64 mmio_mask);
 
-/*
- * Return values of handle_mmio_page_fault_common:
- * RET_MMIO_PF_EMULATE: it is a real mmio page fault, emulate the instruction
- *			directly.
- * RET_MMIO_PF_INVALID: invalid spte is detected then let the real page
- *			fault path update the mmio spte.
- * RET_MMIO_PF_RETRY: let CPU fault again on the address.
- * RET_MMIO_PF_BUG: bug is detected.
- */
-enum {
-	RET_MMIO_PF_EMULATE = 1,
-	RET_MMIO_PF_INVALID = 2,
-	RET_MMIO_PF_RETRY = 0,
-	RET_MMIO_PF_BUG = -1
-};
+void
+reset_shadow_zero_bits_mask(struct kvm_vcpu *vcpu, struct kvm_mmu *context);
 
-int handle_mmio_page_fault_common(struct kvm_vcpu *vcpu, u64 addr, bool direct);
 void kvm_init_shadow_mmu(struct kvm_vcpu *vcpu);
 void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly);
+bool kvm_can_do_async_pf(struct kvm_vcpu *vcpu);
 
 static inline unsigned int kvm_mmu_available_pages(struct kvm *kvm)
 {
@@ -172,4 +158,11 @@ static inline bool permission_fault(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
 
 void kvm_mmu_invalidate_zap_all_pages(struct kvm *kvm);
 void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end);
+
+void kvm_mmu_gfn_disallow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
+void kvm_mmu_gfn_allow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
+
+int kvm_mmu_post_init_vm(struct kvm *kvm);
+void kvm_mmu_pre_destroy_vm(struct kvm *kvm);
+
 #endif

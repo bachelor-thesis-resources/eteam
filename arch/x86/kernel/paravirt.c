@@ -19,7 +19,8 @@
 */
 
 #include <linux/errno.h>
-#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/export.h>
 #include <linux/efi.h>
 #include <linux/bcd.h>
 #include <linux/highmem.h>
@@ -41,18 +42,26 @@
 #include <asm/timer.h>
 #include <asm/special_insns.h>
 
-/* nop stub */
-void _paravirt_nop(void)
-{
-}
+/*
+ * nop stub, which must not clobber anything *including the stack* to
+ * avoid confusing the entry prologues.
+ */
+extern void _paravirt_nop(void);
+asm (".pushsection .entry.text, \"ax\"\n"
+     ".global _paravirt_nop\n"
+     "_paravirt_nop:\n\t"
+     "ret\n\t"
+     ".size _paravirt_nop, . - _paravirt_nop\n\t"
+     ".type _paravirt_nop, @function\n\t"
+     ".popsection");
 
 /* identity function, which can be inlined */
-u32 _paravirt_ident_32(u32 x)
+u32 notrace _paravirt_ident_32(u32 x)
 {
 	return x;
 }
 
-u64 _paravirt_ident_64(u64 x)
+u64 notrace _paravirt_ident_64(u64 x)
 {
 	return x;
 }
@@ -89,10 +98,12 @@ unsigned paravirt_patch_call(void *insnbuf,
 	struct branch *b = insnbuf;
 	unsigned long delta = (unsigned long)target - (addr+5);
 
-	if (tgt_clobbers & ~site_clobbers)
-		return len;	/* target would clobber too much for this site */
-	if (len < 5)
+	if (len < 5) {
+#ifdef CONFIG_RETPOLINE
+		WARN_ONCE("Failing to patch indirect CALL in %ps\n", (void *)addr);
+#endif
 		return len;	/* call too long for patch site */
+	}
 
 	b->opcode = 0xe8; /* call */
 	b->delta = delta;
@@ -107,8 +118,12 @@ unsigned paravirt_patch_jmp(void *insnbuf, const void *target,
 	struct branch *b = insnbuf;
 	unsigned long delta = (unsigned long)target - (addr+5);
 
-	if (len < 5)
+	if (len < 5) {
+#ifdef CONFIG_RETPOLINE
+		WARN_ONCE("Failing to patch indirect JMP in %ps\n", (void *)addr);
+#endif
 		return len;	/* call too long for patch site */
+	}
 
 	b->opcode = 0xe9;	/* jmp */
 	b->delta = delta;
@@ -154,9 +169,6 @@ unsigned paravirt_patch_default(u8 type, u16 clobbers, void *insnbuf,
 		ret = paravirt_patch_ident_64(insnbuf, len);
 
 	else if (type == PARAVIRT_PATCH(pv_cpu_ops.iret) ||
-#ifdef CONFIG_X86_32
-		 type == PARAVIRT_PATCH(pv_cpu_ops.irq_enable_sysexit) ||
-#endif
 		 type == PARAVIRT_PATCH(pv_cpu_ops.usergs_sysret32) ||
 		 type == PARAVIRT_PATCH(pv_cpu_ops.usergs_sysret64))
 		/* If operation requires a jmp, then jmp */
@@ -212,7 +224,6 @@ static u64 native_steal_clock(int cpu)
 
 /* These are in entry.S */
 extern void native_iret(void);
-extern void native_irq_enable_sysexit(void);
 extern void native_usergs_sysret32(void);
 extern void native_usergs_sysret64(void);
 
@@ -351,9 +362,7 @@ __visible struct pv_cpu_ops pv_cpu_ops = {
 	.wbinvd = native_wbinvd,
 	.read_msr = native_read_msr_safe,
 	.write_msr = native_write_msr_safe,
-	.read_tsc = native_read_tsc,
 	.read_pmc = native_read_pmc,
-	.read_tscp = native_read_tscp,
 	.load_tr_desc = native_load_tr_desc,
 	.set_ldt = native_set_ldt,
 	.load_gdt = native_load_gdt,
@@ -373,9 +382,6 @@ __visible struct pv_cpu_ops pv_cpu_ops = {
 
 	.load_sp0 = native_load_sp0,
 
-#if defined(CONFIG_X86_32)
-	.irq_enable_sysexit = native_irq_enable_sysexit,
-#endif
 #ifdef CONFIG_X86_64
 #ifdef CONFIG_IA32_EMULATION
 	.usergs_sysret32 = native_usergs_sysret32,

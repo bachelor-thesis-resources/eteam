@@ -12,6 +12,7 @@
 #include <asm/efi.h>
 #include <asm/setup.h>
 #include <asm/desc.h>
+#include <asm/bootparam_utils.h>
 
 #include "../string.h"
 #include "eboot.h"
@@ -364,7 +365,8 @@ __setup_efi_pci32(efi_pci_io_protocol_32 *pci, struct pci_setup_rom **__rom)
 	if (status != EFI_SUCCESS)
 		goto free_struct;
 
-	memcpy(rom->romdata, pci->romimage, pci->romsize);
+	memcpy(rom->romdata, (void *)(unsigned long)pci->romimage,
+	       pci->romsize);
 	return status;
 
 free_struct:
@@ -470,7 +472,8 @@ __setup_efi_pci64(efi_pci_io_protocol_64 *pci, struct pci_setup_rom **__rom)
 	if (status != EFI_SUCCESS)
 		goto free_struct;
 
-	memcpy(rom->romdata, pci->romimage, pci->romsize);
+	memcpy(rom->romdata, (void *)(unsigned long)pci->romimage,
+	       pci->romsize);
 	return status;
 
 free_struct:
@@ -624,7 +627,7 @@ setup_pixel_info(struct screen_info *si, u32 pixels_per_scan_line,
 static efi_status_t
 __gop_query32(struct efi_graphics_output_protocol_32 *gop32,
 	      struct efi_graphics_output_mode_info **info,
-	      unsigned long *size, u32 *fb_base)
+	      unsigned long *size, u64 *fb_base)
 {
 	struct efi_graphics_output_protocol_mode_32 *mode;
 	efi_status_t status;
@@ -650,7 +653,8 @@ setup_gop32(struct screen_info *si, efi_guid_t *proto,
 	unsigned long nr_gops;
 	u16 width, height;
 	u32 pixels_per_scan_line;
-	u32 fb_base;
+	u32 ext_lfb_base;
+	u64 fb_base;
 	struct efi_pixel_bitmask pixel_info;
 	int pixel_format;
 	efi_status_t status;
@@ -667,6 +671,7 @@ setup_gop32(struct screen_info *si, efi_guid_t *proto,
 		bool conout_found = false;
 		void *dummy = NULL;
 		u32 h = handles[i];
+		u64 current_fb_base;
 
 		status = efi_call_early(handle_protocol, h,
 					proto, (void **)&gop32);
@@ -678,7 +683,7 @@ setup_gop32(struct screen_info *si, efi_guid_t *proto,
 		if (status == EFI_SUCCESS)
 			conout_found = true;
 
-		status = __gop_query32(gop32, &info, &size, &fb_base);
+		status = __gop_query32(gop32, &info, &size, &current_fb_base);
 		if (status == EFI_SUCCESS && (!first_gop || conout_found)) {
 			/*
 			 * Systems that use the UEFI Console Splitter may
@@ -692,6 +697,7 @@ setup_gop32(struct screen_info *si, efi_guid_t *proto,
 			pixel_format = info->pixel_format;
 			pixel_info = info->pixel_information;
 			pixels_per_scan_line = info->pixels_per_scan_line;
+			fb_base = current_fb_base;
 
 			/*
 			 * Once we've found a GOP supporting ConOut,
@@ -713,6 +719,13 @@ setup_gop32(struct screen_info *si, efi_guid_t *proto,
 	si->lfb_width = width;
 	si->lfb_height = height;
 	si->lfb_base = fb_base;
+
+	ext_lfb_base = (u64)(unsigned long)fb_base >> 32;
+	if (ext_lfb_base) {
+		si->capabilities |= VIDEO_CAPABILITY_64BIT_BASE;
+		si->ext_lfb_base = ext_lfb_base;
+	}
+
 	si->pages = 1;
 
 	setup_pixel_info(si, pixels_per_scan_line, pixel_info, pixel_format);
@@ -727,7 +740,7 @@ out:
 static efi_status_t
 __gop_query64(struct efi_graphics_output_protocol_64 *gop64,
 	      struct efi_graphics_output_mode_info **info,
-	      unsigned long *size, u32 *fb_base)
+	      unsigned long *size, u64 *fb_base)
 {
 	struct efi_graphics_output_protocol_mode_64 *mode;
 	efi_status_t status;
@@ -753,7 +766,8 @@ setup_gop64(struct screen_info *si, efi_guid_t *proto,
 	unsigned long nr_gops;
 	u16 width, height;
 	u32 pixels_per_scan_line;
-	u32 fb_base;
+	u32 ext_lfb_base;
+	u64 fb_base;
 	struct efi_pixel_bitmask pixel_info;
 	int pixel_format;
 	efi_status_t status;
@@ -770,6 +784,7 @@ setup_gop64(struct screen_info *si, efi_guid_t *proto,
 		bool conout_found = false;
 		void *dummy = NULL;
 		u64 h = handles[i];
+		u64 current_fb_base;
 
 		status = efi_call_early(handle_protocol, h,
 					proto, (void **)&gop64);
@@ -781,7 +796,7 @@ setup_gop64(struct screen_info *si, efi_guid_t *proto,
 		if (status == EFI_SUCCESS)
 			conout_found = true;
 
-		status = __gop_query64(gop64, &info, &size, &fb_base);
+		status = __gop_query64(gop64, &info, &size, &current_fb_base);
 		if (status == EFI_SUCCESS && (!first_gop || conout_found)) {
 			/*
 			 * Systems that use the UEFI Console Splitter may
@@ -795,6 +810,7 @@ setup_gop64(struct screen_info *si, efi_guid_t *proto,
 			pixel_format = info->pixel_format;
 			pixel_info = info->pixel_information;
 			pixels_per_scan_line = info->pixels_per_scan_line;
+			fb_base = current_fb_base;
 
 			/*
 			 * Once we've found a GOP supporting ConOut,
@@ -816,6 +832,13 @@ setup_gop64(struct screen_info *si, efi_guid_t *proto,
 	si->lfb_width = width;
 	si->lfb_height = height;
 	si->lfb_base = fb_base;
+
+	ext_lfb_base = (u64)(unsigned long)fb_base >> 32;
+	if (ext_lfb_base) {
+		si->capabilities |= VIDEO_CAPABILITY_64BIT_BASE;
+		si->ext_lfb_base = ext_lfb_base;
+	}
+
 	si->pages = 1;
 
 	setup_pixel_info(si, pixels_per_scan_line, pixel_info, pixel_format);
@@ -826,6 +849,56 @@ setup_gop64(struct screen_info *si, efi_guid_t *proto,
 out:
 	return status;
 }
+
+static int get_secure_boot(void)
+{
+	u8 sb, setup, moksbstate;
+	unsigned long datasize = sizeof(sb);
+	u32 attr;
+	efi_guid_t var_guid = EFI_GLOBAL_VARIABLE_GUID;
+	efi_status_t status;
+
+	status = efi_early->call((unsigned long)sys_table->runtime->get_variable,
+				L"SecureBoot", &var_guid, NULL, &datasize, &sb);
+
+	if (status != EFI_SUCCESS)
+		return 0;
+
+	if (sb == 0)
+		return 0;
+
+
+	status = efi_early->call((unsigned long)sys_table->runtime->get_variable,
+				L"SetupMode", &var_guid, NULL, &datasize,
+				&setup);
+
+	if (status != EFI_SUCCESS)
+		return 0;
+
+	if (setup == 1)
+		return 0;
+
+	/* See if a user has put shim into insecure_mode.  If so, and the variable
+	 * doesn't have the runtime attribute set, we might as well honor that.
+	 */
+	var_guid = EFI_SHIM_LOCK_GUID;
+	status = efi_early->call((unsigned long)sys_table->runtime->get_variable,
+				L"MokSBState", &var_guid, &attr, &datasize,
+				&moksbstate);
+
+	/* If it fails, we don't care why.  Default to secure */
+	if (status != EFI_SUCCESS)
+		return EFI_SECURE_BOOT;
+
+	if (!(attr & EFI_VARIABLE_RUNTIME_ACCESS)) {
+		if (moksbstate == 1) {
+			return EFI_MOKSBSTATE_DISABLED;
+		}
+	}
+
+	return EFI_SECURE_BOOT;
+}
+
 
 /*
  * See if we have Graphics Output Protocol
@@ -1041,7 +1114,6 @@ void setup_graphics(struct boot_params *boot_params)
 struct boot_params *make_boot_params(struct efi_config *c)
 {
 	struct boot_params *boot_params;
-	struct sys_desc_table *sdt;
 	struct apm_bios_info *bi;
 	struct setup_header *hdr;
 	struct efi_info *efi;
@@ -1089,7 +1161,6 @@ struct boot_params *make_boot_params(struct efi_config *c)
 	hdr = &boot_params->hdr;
 	efi = &boot_params->efi_info;
 	bi = &boot_params->apm_bios_info;
-	sdt = &boot_params->sys_desc_table;
 
 	/* Copy the second sector to boot_params */
 	memcpy(&hdr->jump, image->image_base + 512, 512);
@@ -1117,8 +1188,6 @@ struct boot_params *make_boot_params(struct efi_config *c)
 
 	/* Clear APM BIOS info */
 	memset(bi, 0, sizeof(*bi));
-
-	memset(sdt, 0, sizeof(*sdt));
 
 	status = efi_parse_options(cmdline_ptr);
 	if (status != EFI_SUCCESS)
@@ -1415,6 +1484,10 @@ struct boot_params *efi_main(struct efi_config *c,
 		setup_boot_services64(efi_early);
 	else
 		setup_boot_services32(efi_early);
+
+	sanitize_boot_params(boot_params);
+
+	boot_params->secure_boot = get_secure_boot();
 
 	setup_graphics(boot_params);
 

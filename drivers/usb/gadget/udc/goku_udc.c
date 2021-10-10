@@ -990,6 +990,35 @@ static int goku_get_frame(struct usb_gadget *_gadget)
 	return -EOPNOTSUPP;
 }
 
+static struct usb_ep *goku_match_ep(struct usb_gadget *g,
+		struct usb_endpoint_descriptor *desc,
+		struct usb_ss_ep_comp_descriptor *ep_comp)
+{
+	struct goku_udc	*dev = to_goku_udc(g);
+	struct usb_ep *ep;
+
+	switch (usb_endpoint_type(desc)) {
+	case USB_ENDPOINT_XFER_INT:
+		/* single buffering is enough */
+		ep = &dev->ep[3].ep;
+		if (usb_gadget_ep_match_desc(g, ep, desc, ep_comp))
+			return ep;
+		break;
+	case USB_ENDPOINT_XFER_BULK:
+		if (usb_endpoint_dir_in(desc)) {
+			/* DMA may be available */
+			ep = &dev->ep[2].ep;
+			if (usb_gadget_ep_match_desc(g, ep, desc, ep_comp))
+				return ep;
+		}
+		break;
+	default:
+		/* nothing */ ;
+	}
+
+	return NULL;
+}
+
 static int goku_udc_start(struct usb_gadget *g,
 		struct usb_gadget_driver *driver);
 static int goku_udc_stop(struct usb_gadget *g);
@@ -998,6 +1027,7 @@ static const struct usb_gadget_ops goku_ops = {
 	.get_frame	= goku_get_frame,
 	.udc_start	= goku_udc_start,
 	.udc_stop	= goku_udc_stop,
+	.match_ep	= goku_match_ep,
 	// no remote wakeup
 	// not selfpowered
 };
@@ -1257,6 +1287,14 @@ static void udc_reinit (struct goku_udc *dev)
 		INIT_LIST_HEAD (&ep->queue);
 
 		ep_reset(NULL, ep);
+
+		if (i == 0)
+			ep->ep.caps.type_control = true;
+		else
+			ep->ep.caps.type_bulk = true;
+
+		ep->ep.caps.dir_in = true;
+		ep->ep.caps.dir_out = true;
 	}
 
 	dev->ep[0].reg_mode = NULL;
@@ -1735,6 +1773,7 @@ static int goku_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto err;
 	}
 
+	pci_set_drvdata(pdev, dev);
 	spin_lock_init(&dev->lock);
 	dev->pdev = pdev;
 	dev->gadget.ops = &goku_ops;
@@ -1768,7 +1807,6 @@ static int goku_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 	dev->regs = (struct goku_udc_regs __iomem *) base;
 
-	pci_set_drvdata(pdev, dev);
 	INFO(dev, "%s\n", driver_desc);
 	INFO(dev, "version: " DRIVER_VERSION " %s\n", dmastr());
 	INFO(dev, "irq %d, pci mem %p\n", pdev->irq, base);

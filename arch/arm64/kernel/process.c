@@ -44,6 +44,7 @@
 #include <linux/hw_breakpoint.h>
 #include <linux/personality.h>
 #include <linux/notifier.h>
+#include <trace/events/power.h>
 
 #include <asm/compat.h>
 #include <asm/cacheflush.h>
@@ -75,8 +76,10 @@ void arch_cpu_idle(void)
 	 * This should do all the clock switching and wait for interrupt
 	 * tricks
 	 */
+	trace_cpu_idle_rcuidle(1, smp_processor_id());
 	cpu_do_idle();
 	local_irq_enable();
+	trace_cpu_idle_rcuidle(PWR_EVENT_EXIT, smp_processor_id());
 }
 
 #ifdef CONFIG_HOTPLUG_CPU
@@ -247,6 +250,15 @@ int copy_thread(unsigned long clone_flags, unsigned long stack_start,
 	struct pt_regs *childregs = task_pt_regs(p);
 
 	memset(&p->thread.cpu_context, 0, sizeof(struct cpu_context));
+
+	/*
+	 * In case p was allocated the same task_struct pointer as some
+	 * other recently-exited task, make sure p is disassociated from
+	 * any cpu that may have run that now-exited task recently.
+	 * Otherwise we could erroneously skip reloading the FPSIMD
+	 * registers for p.
+	 */
+	fpsimd_flush_task_state(p);
 
 	if (likely(!(p->flags & PF_KTHREAD))) {
 		*childregs = *current_pt_regs();

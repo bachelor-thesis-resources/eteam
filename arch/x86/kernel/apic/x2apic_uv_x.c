@@ -12,7 +12,7 @@
 #include <linux/proc_fs.h>
 #include <linux/threads.h>
 #include <linux/kernel.h>
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/string.h>
 #include <linux/ctype.h>
 #include <linux/sched.h>
@@ -248,7 +248,6 @@ static int uv_wakeup_secondary(int phys_apicid, unsigned long start_rip)
 	    APIC_DM_STARTUP;
 	uv_write_global_mmr64(pnode, UVH_IPI_INT, val);
 
-	atomic_set(&init_deasserted, 1);
 	return 0;
 }
 
@@ -414,7 +413,6 @@ static struct apic __refdata apic_x2apic_uv_x = {
 	.send_IPI_self			= uv_send_IPI_self,
 
 	.wakeup_secondary_cpu		= uv_wakeup_secondary,
-	.wait_for_init_deassert		= false,
 	.inquire_remote_apic		= NULL,
 
 	.read				= native_apic_msr_read,
@@ -650,9 +648,9 @@ static __init void map_mmioh_high_uv3(int index, int min_pnode, int max_pnode)
 				l = li;
 			}
 			addr1 = (base << shift) +
-				f * (unsigned long)(1 << m_io);
+				f * (1ULL << m_io);
 			addr2 = (base << shift) +
-				(l + 1) * (unsigned long)(1 << m_io);
+				(l + 1) * (1ULL << m_io);
 			pr_info("UV: %s[%03d..%03d] NASID 0x%04x ADDR 0x%016lx - 0x%016lx\n",
 				id, fi, li, lnasid, addr1, addr2);
 			if (max_io < l)

@@ -117,6 +117,7 @@ struct dw_spi {
 	size_t			len;
 	void			*tx;
 	void			*tx_end;
+	spinlock_t		buf_lock;
 	void			*rx;
 	void			*rx_end;
 	int			dma_mapped;
@@ -223,6 +224,12 @@ static inline void spi_reset_chip(struct dw_spi *dws)
 	spi_enable_chip(dws, 0);
 	spi_mask_intr(dws, 0xff);
 	spi_enable_chip(dws, 1);
+}
+
+static inline void spi_shutdown_chip(struct dw_spi *dws)
+{
+	spi_enable_chip(dws, 0);
+	spi_set_clk(dws, 0);
 }
 
 /*

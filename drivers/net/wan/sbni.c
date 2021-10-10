@@ -1358,6 +1358,8 @@ sbni_ioctl( struct net_device  *dev,  struct ifreq  *ifr,  int  cmd )
 		if( !slave_dev  ||  !(slave_dev->flags & IFF_UP) ) {
 			netdev_err(dev, "trying to enslave non-active device %s\n",
 				   slave_name);
+			if (slave_dev)
+				dev_put(slave_dev);
 			return  -EPERM;
 		}
 
@@ -1462,8 +1464,8 @@ set_multicast_list( struct net_device  *dev )
 
 
 #ifdef MODULE
-module_param_array(io, int, NULL, 0);
-module_param_array(irq, int, NULL, 0);
+module_param_hw_array(io, int, ioport, NULL, 0);
+module_param_hw_array(irq, int, irq, NULL, 0);
 module_param_array(baud, int, NULL, 0);
 module_param_array(rxl, int, NULL, 0);
 module_param_array(mac, int, NULL, 0);

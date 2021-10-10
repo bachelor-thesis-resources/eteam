@@ -2376,6 +2376,9 @@ static void dce6_program_watermarks(struct radeon_device *rdev,
 		c.full = dfixed_div(c, a);
 		priority_b_mark = dfixed_trunc(c);
 		priority_b_cnt |= priority_b_mark & PRIORITY_MARK_MASK;
+
+		/* Save number of lines the linebuffer leads before the scanout */
+		radeon_crtc->lb_vblank_lead_lines = DIV_ROUND_UP(lb_size, mode->crtc_hdisplay);
 	}
 
 	/* select wm A */
@@ -6010,8 +6013,8 @@ static int si_irq_init(struct radeon_device *rdev)
 	}
 
 	/* setup interrupt control */
-	/* set dummy read address to ring address */
-	WREG32(INTERRUPT_CNTL2, rdev->ih.gpu_addr >> 8);
+	/* set dummy read address to dummy page address */
+	WREG32(INTERRUPT_CNTL2, rdev->dummy_page.addr >> 8);
 	interrupt_cntl = RREG32(INTERRUPT_CNTL);
 	/* IH_DUMMY_RD_OVERRIDE=0 - dummy read disabled with msi, enabled without msi
 	 * IH_DUMMY_RD_OVERRIDE=1 - dummy read controlled by IH_DUMMY_RD_EN
@@ -6332,7 +6335,7 @@ static inline void si_irq_ack(struct radeon_device *rdev)
 		WREG32(DC_HPD5_INT_CONTROL, tmp);
 	}
 	if (rdev->irq.stat_regs.evergreen.disp_int_cont5 & DC_HPD6_INTERRUPT) {
-		tmp = RREG32(DC_HPD5_INT_CONTROL);
+		tmp = RREG32(DC_HPD6_INT_CONTROL);
 		tmp |= DC_HPDx_INT_ACK;
 		WREG32(DC_HPD6_INT_CONTROL, tmp);
 	}
@@ -6363,7 +6366,7 @@ static inline void si_irq_ack(struct radeon_device *rdev)
 		WREG32(DC_HPD5_INT_CONTROL, tmp);
 	}
 	if (rdev->irq.stat_regs.evergreen.disp_int_cont5 & DC_HPD6_RX_INTERRUPT) {
-		tmp = RREG32(DC_HPD5_INT_CONTROL);
+		tmp = RREG32(DC_HPD6_INT_CONTROL);
 		tmp |= DC_HPDx_RX_INT_ACK;
 		WREG32(DC_HPD6_INT_CONTROL, tmp);
 	}
@@ -6848,7 +6851,7 @@ restart_ih:
 	if (queue_dp)
 		schedule_work(&rdev->dp_work);
 	if (queue_hotplug)
-		schedule_work(&rdev->hotplug_work);
+		schedule_delayed_work(&rdev->hotplug_work, 0);
 	if (queue_thermal && rdev->pm.dpm_enabled)
 		schedule_work(&rdev->pm.dpm.thermal.work);
 	rdev->ih.rptr = rptr;

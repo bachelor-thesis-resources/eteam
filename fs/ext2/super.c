@@ -131,7 +131,10 @@ static void ext2_put_super (struct super_block * sb)
 
 	dquot_disable(sb, -1, DQUOT_USAGE_ENABLED | DQUOT_LIMITS_ENABLED);
 
-	ext2_xattr_put_super(sb);
+	if (sbi->s_mb_cache) {
+		ext2_xattr_destroy_cache(sbi->s_mb_cache);
+		sbi->s_mb_cache = NULL;
+	}
 	if (!(sb->s_flags & MS_RDONLY)) {
 		struct ext2_super_block *es = sbi->s_es;
 
@@ -192,6 +195,9 @@ static void init_once(void *foo)
 	init_rwsem(&ei->xattr_sem);
 #endif
 	mutex_init(&ei->truncate_mutex);
+#ifdef CONFIG_FS_DAX
+	init_rwsem(&ei->dax_sem);
+#endif
 	inode_init_once(&ei->vfs_inode);
 }
 
@@ -566,6 +572,8 @@ static int parse_options(char *options, struct super_block *sb)
 			/* Fall through */
 		case Opt_dax:
 #ifdef CONFIG_FS_DAX
+			ext2_msg(sb, KERN_WARNING,
+		"DAX enabled. Warning: EXPERIMENTAL, use at your own risk");
 			set_opt(sbi->s_mount_opt, DAX);
 #else
 			ext2_msg(sb, KERN_INFO, "dax option not supported");
@@ -716,7 +724,8 @@ static loff_t ext2_max_size(int bits)
 {
 	loff_t res = EXT2_NDIR_BLOCKS;
 	int meta_blocks;
-	loff_t upper_limit;
+	unsigned int upper_limit;
+	unsigned int ppb = 1 << (bits-2);
 
 	/* This is calculated to be the largest file size for a
 	 * dense, file such that the total number of
@@ -730,24 +739,34 @@ static loff_t ext2_max_size(int bits)
 	/* total blocks in file system block size */
 	upper_limit >>= (bits - 9);
 
-
-	/* indirect blocks */
-	meta_blocks = 1;
-	/* double indirect blocks */
-	meta_blocks += 1 + (1LL << (bits-2));
-	/* tripple indirect blocks */
-	meta_blocks += 1 + (1LL << (bits-2)) + (1LL << (2*(bits-2)));
-
-	upper_limit -= meta_blocks;
-	upper_limit <<= bits;
-
+	/* Compute how many blocks we can address by block tree */
 	res += 1LL << (bits-2);
 	res += 1LL << (2*(bits-2));
 	res += 1LL << (3*(bits-2));
-	res <<= bits;
-	if (res > upper_limit)
-		res = upper_limit;
+	/* Does block tree limit file size? */
+	if (res < upper_limit)
+		goto check_lfs;
 
+	res = upper_limit;
+	/* How many metadata blocks are needed for addressing upper_limit? */
+	upper_limit -= EXT2_NDIR_BLOCKS;
+	/* indirect blocks */
+	meta_blocks = 1;
+	upper_limit -= ppb;
+	/* double indirect blocks */
+	if (upper_limit < ppb * ppb) {
+		meta_blocks += 1 + DIV_ROUND_UP(upper_limit, ppb);
+		res -= meta_blocks;
+		goto check_lfs;
+	}
+	meta_blocks += 1 + ppb;
+	upper_limit -= ppb * ppb;
+	/* tripple indirect blocks for the rest */
+	meta_blocks += 1 + DIV_ROUND_UP(upper_limit, ppb) +
+		DIV_ROUND_UP(upper_limit, ppb*ppb);
+	res -= meta_blocks;
+check_lfs:
+	res <<= bits;
 	if (res > MAX_LFS_FILESIZE)
 		res = MAX_LFS_FILESIZE;
 
@@ -1035,9 +1054,9 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 
 	if (EXT2_BLOCKS_PER_GROUP(sb) == 0)
 		goto cantfind_ext2;
- 	sbi->s_groups_count = ((le32_to_cpu(es->s_blocks_count) -
- 				le32_to_cpu(es->s_first_data_block) - 1)
- 					/ EXT2_BLOCKS_PER_GROUP(sb)) + 1;
+	sbi->s_groups_count = ((le32_to_cpu(es->s_blocks_count) -
+				le32_to_cpu(es->s_first_data_block) - 1)
+					/ EXT2_BLOCKS_PER_GROUP(sb)) + 1;
 	db_count = (sbi->s_groups_count + EXT2_DESC_PER_BLOCK(sb) - 1) /
 		   EXT2_DESC_PER_BLOCK(sb);
 	sbi->s_group_desc = kmalloc (db_count * sizeof (struct buffer_head *), GFP_KERNEL);
@@ -1099,6 +1118,14 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 		ext2_msg(sb, KERN_ERR, "error: insufficient memory");
 		goto failed_mount3;
 	}
+
+#ifdef CONFIG_EXT2_FS_XATTR
+	sbi->s_mb_cache = ext2_xattr_create_cache();
+	if (!sbi->s_mb_cache) {
+		ext2_msg(sb, KERN_ERR, "Failed to create an mb_cache");
+		goto failed_mount3;
+	}
+#endif
 	/*
 	 * set up enough so that it can read an inode
 	 */
@@ -1144,6 +1171,8 @@ cantfind_ext2:
 			sb->s_id);
 	goto failed_mount;
 failed_mount3:
+	if (sbi->s_mb_cache)
+		ext2_xattr_destroy_cache(sbi->s_mb_cache);
 	percpu_counter_destroy(&sbi->s_freeblocks_counter);
 	percpu_counter_destroy(&sbi->s_freeinodes_counter);
 	percpu_counter_destroy(&sbi->s_dirs_counter);
@@ -1550,20 +1579,17 @@ MODULE_ALIAS_FS("ext2");
 
 static int __init init_ext2_fs(void)
 {
-	int err = init_ext2_xattr();
-	if (err)
-		return err;
+	int err;
+
 	err = init_inodecache();
 	if (err)
-		goto out1;
+		return err;
         err = register_filesystem(&ext2_fs_type);
 	if (err)
 		goto out;
 	return 0;
 out:
 	destroy_inodecache();
-out1:
-	exit_ext2_xattr();
 	return err;
 }
 
@@ -1571,7 +1597,6 @@ static void __exit exit_ext2_fs(void)
 {
 	unregister_filesystem(&ext2_fs_type);
 	destroy_inodecache();
-	exit_ext2_xattr();
 }
 
 MODULE_AUTHOR("Remy Card and others");

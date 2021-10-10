@@ -44,7 +44,7 @@
 	std	r0,0(r1);					\
 	ptesync;						\
 	ld	r0,0(r1);					\
-1:	cmp	cr0,r0,r0;					\
+1:	cmpd	cr0,r0,r0;					\
 	bne	1b;						\
 	IDLE_INST;						\
 	b	.
@@ -277,8 +277,9 @@ ALT_FTR_SECTION_END_NESTED_IFSET(CPU_FTR_ARCH_207S, 66);		\
 	ld	r2,PACATOC(r13);					\
 	ld	r1,PACAR1(r13);						\
 	std	r3,ORIG_GPR3(r1);	/* Save original r3 */		\
-	li	r0,OPAL_HANDLE_HMI;	/* Pass opal token argument*/	\
-	bl	opal_call_realmode;					\
+	li	r3,0;			/* NULL argument */		\
+	bl	hmi_exception_realmode;					\
+	nop;								\
 	ld	r3,ORIG_GPR3(r1);	/* Restore original r3 */	\
 20:	nop;
 

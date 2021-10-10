@@ -28,6 +28,9 @@
 #include <linux/slab.h>
 #include <linux/times.h>
 #include <linux/uio.h>
+#include <linux/fd.h>
+#include <linux/raid/md_u.h>
+#include <linux/mtio.h>
 #include <asm/uaccess.h>
 
 #include <scsi/scsi.h>
@@ -182,6 +185,9 @@ static void blk_set_cmd_filter_defaults(struct blk_cmd_filter *filter)
 	__set_bit(WRITE_16, filter->write_ok);
 	__set_bit(WRITE_LONG, filter->write_ok);
 	__set_bit(WRITE_LONG_2, filter->write_ok);
+	__set_bit(WRITE_SAME, filter->write_ok);
+	__set_bit(WRITE_SAME_16, filter->write_ok);
+	__set_bit(WRITE_SAME_32, filter->write_ok);
 	__set_bit(ERASE, filter->write_ok);
 	__set_bit(GPCMD_MODE_SELECT_10, filter->write_ok);
 	__set_bit(MODE_SELECT, filter->write_ok);
@@ -444,7 +450,7 @@ int sg_scsi_ioctl(struct request_queue *q, struct gendisk *disk, fmode_t mode,
 
 	}
 
-	rq = blk_get_request(q, in_len ? WRITE : READ, __GFP_WAIT);
+	rq = blk_get_request(q, in_len ? WRITE : READ, __GFP_RECLAIM);
 	if (IS_ERR(rq)) {
 		err = PTR_ERR(rq);
 		goto error_free_buffer;
@@ -495,7 +501,7 @@ int sg_scsi_ioctl(struct request_queue *q, struct gendisk *disk, fmode_t mode,
 		break;
 	}
 
-	if (bytes && blk_rq_map_kern(q, rq, buffer, bytes, __GFP_WAIT)) {
+	if (bytes && blk_rq_map_kern(q, rq, buffer, bytes, __GFP_RECLAIM)) {
 		err = DRIVER_ERROR << 24;
 		goto error;
 	}
@@ -536,7 +542,7 @@ static int __blk_send_generic(struct request_queue *q, struct gendisk *bd_disk,
 	struct request *rq;
 	int err;
 
-	rq = blk_get_request(q, WRITE, __GFP_WAIT);
+	rq = blk_get_request(q, WRITE, __GFP_RECLAIM);
 	if (IS_ERR(rq))
 		return PTR_ERR(rq);
 	blk_rq_set_block_pc(rq);
@@ -705,8 +711,17 @@ int scsi_verify_blk_ioctl(struct block_device *bd, unsigned int cmd)
 	case SG_GET_RESERVED_SIZE:
 	case SG_SET_RESERVED_SIZE:
 	case SG_EMULATED_HOST:
+	case BLKFLSBUF:
+	case BLKROSET:
 		return 0;
 	case CDROM_GET_CAPABILITY:
+	case CDROM_DRIVE_STATUS:
+	case FDGETPRM:
+	case RAID_VERSION:
+	case MTIOCGET:
+#ifdef CONFIG_COMPAT
+	case 0x801c6d02:        /* MTIOCGET32 */
+#endif
 		/* Keep this until we remove the printk below.  udev sends it
 		 * and we do not want to spam dmesg about it.   CD-ROMs do
 		 * not have partitions, so we get here only for disks.

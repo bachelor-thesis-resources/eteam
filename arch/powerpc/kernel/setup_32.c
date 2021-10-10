@@ -38,6 +38,7 @@
 #include <asm/udbg.h>
 #include <asm/mmu_context.h>
 #include <asm/epapr_hcalls.h>
+#include <asm/code-patching.h>
 
 #define DBG(fmt...)
 
@@ -109,12 +110,17 @@ notrace unsigned long __init early_init(unsigned long dt_ptr)
  * This is called very early on the boot process, after a minimal
  * MMU environment has been set up but before MMU_init is called.
  */
+extern unsigned int memset_nocache_branch; /* Insn to be replaced by NOP */
+
 notrace void __init machine_init(u64 dt_ptr)
 {
 	lockdep_init();
 
 	/* Enable early debugging if any specified (see udbg.h) */
 	udbg_early_init();
+
+	patch_instruction((unsigned int *)&memcpy, PPC_INST_NOP);
+	patch_instruction(&memset_nocache_branch, PPC_INST_NOP);
 
 	/* Do some early initialization based on the flat device tree */
 	early_init_devtree(__va(dt_ptr));
@@ -293,9 +299,6 @@ void __init setup_arch(char **cmdline_p)
 	if (cpu_has_feature(CPU_FTR_UNIFIED_ID_CACHE))
 		ucache_bsize = icache_bsize = dcache_bsize;
 
-	if (ppc_md.panic)
-		setup_panic();
-
 	init_mm.start_code = (unsigned long)_stext;
 	init_mm.end_code = (unsigned long) _etext;
 	init_mm.end_data = (unsigned long) _edata;
@@ -315,6 +318,9 @@ void __init setup_arch(char **cmdline_p)
 	if (ppc_md.setup_arch)
 		ppc_md.setup_arch();
 	if ( ppc_md.progress ) ppc_md.progress("arch: exit", 0x3eab);
+
+	setup_barrier_nospec();
+	setup_spectre_v2();
 
 	paging_init();
 

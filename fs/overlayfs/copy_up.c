@@ -22,9 +22,10 @@
 
 int ovl_copy_xattr(struct dentry *old, struct dentry *new)
 {
-	ssize_t list_size, size;
-	char *buf, *name, *value;
-	int error;
+	ssize_t list_size, size, value_size = 0;
+	char *buf, *name, *value = NULL;
+	int error = 0;
+	size_t slen;
 
 	if (!old->d_inode->i_op->getxattr ||
 	    !new->d_inode->i_op->getxattr)
@@ -41,29 +42,51 @@ int ovl_copy_xattr(struct dentry *old, struct dentry *new)
 	if (!buf)
 		return -ENOMEM;
 
-	error = -ENOMEM;
-	value = kmalloc(XATTR_SIZE_MAX, GFP_KERNEL);
-	if (!value)
-		goto out;
-
 	list_size = vfs_listxattr(old, buf, list_size);
 	if (list_size <= 0) {
 		error = list_size;
-		goto out_free_value;
+		goto out;
 	}
 
-	for (name = buf; name < (buf + list_size); name += strlen(name) + 1) {
-		size = vfs_getxattr(old, name, value, XATTR_SIZE_MAX);
-		if (size <= 0) {
-			error = size;
-			goto out_free_value;
+	for (name = buf; list_size; name += slen) {
+		slen = strnlen(name, list_size) + 1;
+
+		/* underlying fs providing us with an broken xattr list? */
+		if (WARN_ON(slen > list_size)) {
+			error = -EIO;
+			break;
 		}
+		list_size -= slen;
+
+		if (ovl_is_private_xattr(name))
+			continue;
+retry:
+		size = vfs_getxattr(old, name, value, value_size);
+		if (size == -ERANGE)
+			size = vfs_getxattr(old, name, NULL, 0);
+
+		if (size < 0) {
+			error = size;
+			break;
+		}
+
+		if (size > value_size) {
+			void *new;
+
+			new = krealloc(value, size, GFP_KERNEL);
+			if (!new) {
+				error = -ENOMEM;
+				break;
+			}
+			value = new;
+			value_size = size;
+			goto retry;
+		}
+
 		error = vfs_setxattr(new, name, value, size, 0);
 		if (error)
-			goto out_free_value;
+			break;
 	}
-
-out_free_value:
 	kfree(value);
 out:
 	kfree(buf);
@@ -81,11 +104,11 @@ static int ovl_copy_up_data(struct path *old, struct path *new, loff_t len)
 	if (len == 0)
 		return 0;
 
-	old_file = ovl_path_open(old, O_RDONLY);
+	old_file = ovl_path_open(old, O_LARGEFILE | O_RDONLY);
 	if (IS_ERR(old_file))
 		return PTR_ERR(old_file);
 
-	new_file = ovl_path_open(new, O_WRONLY);
+	new_file = ovl_path_open(new, O_LARGEFILE | O_WRONLY);
 	if (IS_ERR(new_file)) {
 		error = PTR_ERR(new_file);
 		goto out_fput;
@@ -116,6 +139,8 @@ static int ovl_copy_up_data(struct path *old, struct path *new, loff_t len)
 		len -= bytes;
 	}
 
+	if (!error)
+		error = vfs_fsync(new_file, 0);
 	fput(new_file);
 out_fput:
 	fput(old_file);
@@ -172,10 +197,19 @@ int ovl_set_attr(struct dentry *upperdentry, struct kstat *stat)
 {
 	int err = 0;
 
+	/*
+	 * For the most part we want to set the mode bits before setting
+	 * the user, otherwise the current context might lack permission
+	 * for setting the mode. However for sxid/sticky bits we want
+	 * the operation to fail if the current user isn't privileged
+	 * towards the resulting inode. So we first set the mode but
+	 * exclude the sxid/sticky bits, then set the user, then set the
+	 * mode again if any of the sxid/sticky bits are set.
+	 */
 	if (!S_ISLNK(stat->mode)) {
 		struct iattr attr = {
 			.ia_valid = ATTR_MODE,
-			.ia_mode = stat->mode,
+			.ia_mode = stat->mode & ~(S_ISUID|S_ISGID|S_ISVTX),
 		};
 		err = notify_change(upperdentry, &attr, NULL);
 	}
@@ -187,6 +221,14 @@ int ovl_set_attr(struct dentry *upperdentry, struct kstat *stat)
 		};
 		err = notify_change(upperdentry, &attr, NULL);
 	}
+	if (!err && !S_ISLNK(stat->mode) &&
+	    (stat->mode & (S_ISUID|S_ISGID|S_ISVTX))) {
+		struct iattr attr = {
+			.ia_valid = ATTR_MODE,
+			.ia_mode = stat->mode,
+		};
+		err = notify_change(upperdentry, &attr, NULL);
+	}
 	if (!err)
 		ovl_set_timestamps(upperdentry, stat);
 
@@ -195,8 +237,7 @@ int ovl_set_attr(struct dentry *upperdentry, struct kstat *stat)
 
 static int ovl_copy_up_locked(struct dentry *workdir, struct dentry *upperdir,
 			      struct dentry *dentry, struct path *lowerpath,
-			      struct kstat *stat, struct iattr *attr,
-			      const char *link)
+			      struct kstat *stat, const char *link)
 {
 	struct inode *wdir = workdir->d_inode;
 	struct inode *udir = upperdir->d_inode;
@@ -240,8 +281,6 @@ static int ovl_copy_up_locked(struct dentry *workdir, struct dentry *upperdir,
 
 	mutex_lock(&newdentry->d_inode->i_mutex);
 	err = ovl_set_attr(newdentry, stat);
-	if (!err && attr)
-		err = notify_change(newdentry, attr, NULL);
 	mutex_unlock(&newdentry->d_inode->i_mutex);
 	if (err)
 		goto out_cleanup;
@@ -267,7 +306,7 @@ out:
 
 out_cleanup:
 	ovl_cleanup(wdir, newdentry);
-	goto out;
+	goto out2;
 }
 
 /*
@@ -286,8 +325,7 @@ out_cleanup:
  * that point the file will have already been copied up anyway.
  */
 int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
-		    struct path *lowerpath, struct kstat *stat,
-		    struct iattr *attr)
+		    struct path *lowerpath, struct kstat *stat)
 {
 	struct dentry *workdir = ovl_workdir(dentry);
 	int err;
@@ -296,14 +334,21 @@ int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
 	struct dentry *upperdir;
 	struct dentry *upperdentry;
 	const struct cred *old_cred;
-	struct cred *override_cred;
 	char *link = NULL;
 
 	if (WARN_ON(!workdir))
 		return -EROFS;
 
+	err = ovl_dentry_root_may(dentry, lowerpath, MAY_READ);
+	if (err)
+		return err;
+
 	ovl_path_upper(parent, &parentpath);
 	upperdir = parentpath.dentry;
+
+	err = ovl_dentry_root_may(dentry, &parentpath, MAY_WRITE);
+	if (err)
+		return err;
 
 	err = vfs_getattr(&parentpath, &pstat);
 	if (err)
@@ -315,28 +360,7 @@ int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
 			return PTR_ERR(link);
 	}
 
-	err = -ENOMEM;
-	override_cred = prepare_creds();
-	if (!override_cred)
-		goto out_free_link;
-
-	override_cred->fsuid = stat->uid;
-	override_cred->fsgid = stat->gid;
-	/*
-	 * CAP_SYS_ADMIN for copying up extended attributes
-	 * CAP_DAC_OVERRIDE for create
-	 * CAP_FOWNER for chmod, timestamp update
-	 * CAP_FSETID for chmod
-	 * CAP_CHOWN for chown
-	 * CAP_MKNOD for mknod
-	 */
-	cap_raise(override_cred->cap_effective, CAP_SYS_ADMIN);
-	cap_raise(override_cred->cap_effective, CAP_DAC_OVERRIDE);
-	cap_raise(override_cred->cap_effective, CAP_FOWNER);
-	cap_raise(override_cred->cap_effective, CAP_FSETID);
-	cap_raise(override_cred->cap_effective, CAP_CHOWN);
-	cap_raise(override_cred->cap_effective, CAP_MKNOD);
-	old_cred = override_creds(override_cred);
+	old_cred = ovl_override_creds(dentry->d_sb);
 
 	err = -EIO;
 	if (lock_rename(workdir, upperdir) != NULL) {
@@ -345,30 +369,21 @@ int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
 	}
 	upperdentry = ovl_dentry_upper(dentry);
 	if (upperdentry) {
-		unlock_rename(workdir, upperdir);
+		/* Raced with another copy-up?  Nothing to do, then... */
 		err = 0;
-		/* Raced with another copy-up?  Do the setattr here */
-		if (attr) {
-			mutex_lock(&upperdentry->d_inode->i_mutex);
-			err = notify_change(upperdentry, attr, NULL);
-			mutex_unlock(&upperdentry->d_inode->i_mutex);
-		}
-		goto out_put_cred;
+		goto out_unlock;
 	}
 
 	err = ovl_copy_up_locked(workdir, upperdir, dentry, lowerpath,
-				 stat, attr, link);
+				 stat, link);
 	if (!err) {
 		/* Restore timestamps on parent (best effort) */
 		ovl_set_timestamps(upperdir, &pstat);
 	}
 out_unlock:
 	unlock_rename(workdir, upperdir);
-out_put_cred:
 	revert_creds(old_cred);
-	put_cred(override_cred);
 
-out_free_link:
 	if (link)
 		free_page((unsigned long) link);
 
@@ -406,7 +421,7 @@ int ovl_copy_up(struct dentry *dentry)
 		ovl_path_lower(next, &lowerpath);
 		err = vfs_getattr(&lowerpath, &stat);
 		if (!err)
-			err = ovl_copy_up_one(parent, next, &lowerpath, &stat, NULL);
+			err = ovl_copy_up_one(parent, next, &lowerpath, &stat);
 
 		dput(parent);
 		dput(next);

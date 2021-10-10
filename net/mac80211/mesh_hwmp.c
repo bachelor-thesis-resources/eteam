@@ -19,15 +19,6 @@
 
 #define MAX_PREQ_QUEUE_LEN	64
 
-/* Destination only */
-#define MP_F_DO	0x1
-/* Reply and forward */
-#define MP_F_RF	0x2
-/* Unknown Sequence Number */
-#define MP_F_USN    0x01
-/* Reason code Present */
-#define MP_F_RCODE  0x02
-
 static void mesh_queue_preq(struct mesh_path *, u8);
 
 static inline u32 u32_field_get(const u8 *preq_elem, int offset, bool ae)
@@ -79,6 +70,12 @@ static inline u16 u16_field_get(const u8 *preq_elem, int offset, bool ae)
 #define MSEC_TO_TU(x) (x*1000/1024)
 #define SN_GT(x, y) ((s32)(y - x) < 0)
 #define SN_LT(x, y) ((s32)(x - y) < 0)
+#define MAX_SANE_SN_DELTA 32
+
+static inline u32 SN_DELTA(u32 x, u32 y)
+{
+	return x >= y ? x - y : y - x;
+}
 
 #define net_traversal_jiffies(s) \
 	msecs_to_jiffies(s->u.mesh.mshcfg.dot11MeshHWMPnetDiameterTraversalTime)
@@ -279,15 +276,10 @@ int mesh_path_error_tx(struct ieee80211_sub_if_data *sdata,
 	*pos++ = ttl;
 	/* number of destinations */
 	*pos++ = 1;
-	/*
-	 * flags bit, bit 1 is unset if we know the sequence number and
-	 * bit 2 is set if we have a reason code
+	/* Flags field has AE bit only as defined in
+	 * sec 8.4.2.117 IEEE802.11-2012
 	 */
 	*pos = 0;
-	if (!target_sn)
-		*pos |= MP_F_USN;
-	if (target_rcode)
-		*pos |= MP_F_RCODE;
 	pos++;
 	memcpy(pos, target, ETH_ALEN);
 	pos += ETH_ALEN;
@@ -316,8 +308,9 @@ void ieee80211s_update_metric(struct ieee80211_local *local,
 	failed = !(txinfo->flags & IEEE80211_TX_STAT_ACK);
 
 	/* moving average, scaled to 100 */
-	sta->fail_avg = ((80 * sta->fail_avg + 5) / 100 + 20 * failed);
-	if (sta->fail_avg > 95)
+	sta->mesh->fail_avg =
+		((80 * sta->mesh->fail_avg + 5) / 100 + 20 * failed);
+	if (sta->mesh->fail_avg > 95)
 		mesh_plink_broken(sta);
 }
 
@@ -333,15 +326,15 @@ static u32 airtime_link_metric_get(struct ieee80211_local *local,
 	u32 tx_time, estimated_retx;
 	u64 result;
 
-	if (sta->fail_avg >= 100)
+	if (sta->mesh->fail_avg >= 100)
 		return MAX_METRIC;
 
-	sta_set_rate_info_tx(sta, &sta->last_tx_rate, &rinfo);
+	sta_set_rate_info_tx(sta, &sta->tx_stats.last_rate, &rinfo);
 	rate = cfg80211_calculate_bitrate(&rinfo);
 	if (WARN_ON(!rate))
 		return MAX_METRIC;
 
-	err = (sta->fail_avg << ARITH_SHIFT) / 100;
+	err = (sta->mesh->fail_avg << ARITH_SHIFT) / 100;
 
 	/* bitrate is in units of 100 Kbps, while we need rate in units of
 	 * 1Mbps. This will be corrected on tx_time computation.
@@ -441,6 +434,26 @@ static u32 hwmp_route_info_get(struct ieee80211_sub_if_data *sdata,
 					process = false;
 					fresh_info = false;
 				}
+			} else if (!(mpath->flags & MESH_PATH_ACTIVE)) {
+				bool have_sn, newer_sn, bounced;
+
+				have_sn = mpath->flags & MESH_PATH_SN_VALID;
+				newer_sn = have_sn && SN_GT(orig_sn, mpath->sn);
+				bounced = have_sn &&
+					  (SN_DELTA(orig_sn, mpath->sn) >
+							MAX_SANE_SN_DELTA);
+
+				if (!have_sn || newer_sn) {
+					/* if SN is newer than what we had
+					 * then we can take it */;
+				} else if (bounced) {
+					/* if SN is way different than what
+					 * we had then assume the other side
+					 * rebooted or restarted */;
+				} else {
+					process = false;
+					fresh_info = false;
+				}
 			}
 		} else {
 			mpath = mesh_path_add(sdata, orig_addr);
@@ -517,7 +530,7 @@ static void hwmp_preq_frame_process(struct ieee80211_sub_if_data *sdata,
 	const u8 *target_addr, *orig_addr;
 	const u8 *da;
 	u8 target_flags, ttl, flags;
-	u32 orig_sn, target_sn, lifetime, target_metric;
+	u32 orig_sn, target_sn, lifetime, target_metric = 0;
 	bool reply = false;
 	bool forward = true;
 	bool root_is_gate;
@@ -539,6 +552,10 @@ static void hwmp_preq_frame_process(struct ieee80211_sub_if_data *sdata,
 		forward = false;
 		reply = true;
 		target_metric = 0;
+
+		if (SN_GT(target_sn, ifmsh->sn))
+			ifmsh->sn = target_sn;
+
 		if (time_after(jiffies, ifmsh->last_sn_update +
 					net_traversal_jiffies(sdata)) ||
 		    time_before(jiffies, ifmsh->last_sn_update)) {
@@ -570,15 +587,13 @@ static void hwmp_preq_frame_process(struct ieee80211_sub_if_data *sdata,
 					SN_LT(mpath->sn, target_sn)) {
 				mpath->sn = target_sn;
 				mpath->flags |= MESH_PATH_SN_VALID;
-			} else if ((!(target_flags & MP_F_DO)) &&
+			} else if ((!(target_flags & IEEE80211_PREQ_TO_FLAG)) &&
 					(mpath->flags & MESH_PATH_ACTIVE)) {
 				reply = true;
 				target_metric = mpath->metric;
 				target_sn = mpath->sn;
-				if (target_flags & MP_F_RF)
-					target_flags |= MP_F_DO;
-				else
-					forward = false;
+				/* Case E2 of sec 13.10.9.3 IEEE 802.11-2012*/
+				target_flags |= IEEE80211_PREQ_TO_FLAG;
 			}
 		}
 		rcu_read_unlock();
@@ -736,9 +751,12 @@ static void hwmp_perr_frame_process(struct ieee80211_sub_if_data *sdata,
 		if (mpath->flags & MESH_PATH_ACTIVE &&
 		    ether_addr_equal(ta, sta->sta.addr) &&
 		    (!(mpath->flags & MESH_PATH_SN_VALID) ||
-		    SN_GT(target_sn, mpath->sn))) {
+		    SN_GT(target_sn, mpath->sn)  || target_sn == 0)) {
 			mpath->flags &= ~MESH_PATH_ACTIVE;
-			mpath->sn = target_sn;
+			if (target_sn != 0)
+				mpath->sn = target_sn;
+			else
+				mpath->sn += 1;
 			spin_unlock_bh(&mpath->state_lock);
 			if (!ifmsh->mshcfg.dot11MeshForwarding)
 				goto endperr;
@@ -762,7 +780,7 @@ static void hwmp_rann_frame_process(struct ieee80211_sub_if_data *sdata,
 	struct mesh_path *mpath;
 	u8 ttl, flags, hopcount;
 	const u8 *orig_addr;
-	u32 orig_sn, metric, metric_txsta, interval;
+	u32 orig_sn, new_metric, orig_metric, last_hop_metric, interval;
 	bool root_is_gate;
 
 	ttl = rann->rann_ttl;
@@ -773,7 +791,7 @@ static void hwmp_rann_frame_process(struct ieee80211_sub_if_data *sdata,
 	interval = le32_to_cpu(rann->rann_interval);
 	hopcount = rann->rann_hopcount;
 	hopcount++;
-	metric = le32_to_cpu(rann->rann_metric);
+	orig_metric = le32_to_cpu(rann->rann_metric);
 
 	/*  Ignore our own RANNs */
 	if (ether_addr_equal(orig_addr, sdata->vif.addr))
@@ -790,7 +808,10 @@ static void hwmp_rann_frame_process(struct ieee80211_sub_if_data *sdata,
 		return;
 	}
 
-	metric_txsta = airtime_link_metric_get(local, sta);
+	last_hop_metric = airtime_link_metric_get(local, sta);
+	new_metric = orig_metric + last_hop_metric;
+	if (new_metric < orig_metric)
+		new_metric = MAX_METRIC;
 
 	mpath = mesh_path_lookup(sdata, orig_addr);
 	if (!mpath) {
@@ -803,7 +824,7 @@ static void hwmp_rann_frame_process(struct ieee80211_sub_if_data *sdata,
 	}
 
 	if (!(SN_LT(mpath->sn, orig_sn)) &&
-	    !(mpath->sn == orig_sn && metric < mpath->rann_metric)) {
+	    !(mpath->sn == orig_sn && new_metric < mpath->rann_metric)) {
 		rcu_read_unlock();
 		return;
 	}
@@ -821,7 +842,7 @@ static void hwmp_rann_frame_process(struct ieee80211_sub_if_data *sdata,
 	}
 
 	mpath->sn = orig_sn;
-	mpath->rann_metric = metric + metric_txsta;
+	mpath->rann_metric = new_metric;
 	mpath->is_root = true;
 	/* Recording RANNs sender address to send individually
 	 * addressed PREQs destined for root mesh STA */
@@ -841,7 +862,7 @@ static void hwmp_rann_frame_process(struct ieee80211_sub_if_data *sdata,
 		mesh_path_sel_frame_tx(MPATH_RANN, flags, orig_addr,
 				       orig_sn, 0, NULL, 0, broadcast_addr,
 				       hopcount, ttl, interval,
-				       metric + metric_txsta, 0, sdata);
+				       new_metric, 0, sdata);
 	}
 
 	rcu_read_unlock();
@@ -862,7 +883,7 @@ void mesh_rx_path_sel_frame(struct ieee80211_sub_if_data *sdata,
 
 	rcu_read_lock();
 	sta = sta_info_get(sdata, mgmt->sa);
-	if (!sta || sta->plink_state != NL80211_PLINK_ESTAB) {
+	if (!sta || sta->mesh->plink_state != NL80211_PLINK_ESTAB) {
 		rcu_read_unlock();
 		return;
 	}
@@ -974,7 +995,7 @@ void mesh_path_start_discovery(struct ieee80211_sub_if_data *sdata)
 	struct ieee80211_if_mesh *ifmsh = &sdata->u.mesh;
 	struct mesh_preq_queue *preq_node;
 	struct mesh_path *mpath;
-	u8 ttl, target_flags;
+	u8 ttl, target_flags = 0;
 	const u8 *da;
 	u32 lifetime;
 
@@ -1033,9 +1054,9 @@ void mesh_path_start_discovery(struct ieee80211_sub_if_data *sdata)
 	}
 
 	if (preq_node->flags & PREQ_Q_F_REFRESH)
-		target_flags = MP_F_DO;
+		target_flags |= IEEE80211_PREQ_TO_FLAG;
 	else
-		target_flags = MP_F_RF;
+		target_flags &= ~IEEE80211_PREQ_TO_FLAG;
 
 	spin_unlock_bh(&mpath->state_lock);
 	da = (mpath->is_root) ? mpath->rann_snd_addr : broadcast_addr;
@@ -1091,7 +1112,8 @@ int mesh_nexthop_resolve(struct ieee80211_sub_if_data *sdata,
 		}
 	}
 
-	if (!(mpath->flags & MESH_PATH_RESOLVING))
+	if (!(mpath->flags & MESH_PATH_RESOLVING) &&
+	    mesh_path_sel_is_hwmp(sdata))
 		mesh_queue_preq(mpath, PREQ_Q_F_START);
 
 	if (skb_queue_len(&mpath->frame_queue) >= MESH_FRAME_QUEUE_LEN)
@@ -1176,7 +1198,9 @@ void mesh_path_timer(unsigned long data)
 		spin_unlock_bh(&mpath->state_lock);
 		mesh_queue_preq(mpath, 0);
 	} else {
-		mpath->flags = 0;
+		mpath->flags &= ~(MESH_PATH_RESOLVING |
+				  MESH_PATH_RESOLVED |
+				  MESH_PATH_REQ_QUEUED);
 		mpath->exp_time = jiffies;
 		spin_unlock_bh(&mpath->state_lock);
 		if (!mpath->is_gate && mesh_gate_num(sdata) > 0) {

@@ -610,8 +610,8 @@ err_out_regions:
 #ifdef CONFIG_PCI
 	if (pdev)
 		pci_release_regions(pdev);
-#endif
 err_out:
+#endif
 	if (pdev)
 		pci_disable_device(pdev);
 	return rc;
@@ -791,7 +791,6 @@ static void tlan_get_drvinfo(struct net_device *dev,
 			sizeof(info->bus_info));
 	else
 		strlcpy(info->bus_info, "EISA",	sizeof(info->bus_info));
-	info->eedump_len = TLAN_EEPROM_SIZE;
 }
 
 static int tlan_get_eeprom_len(struct net_device *dev)

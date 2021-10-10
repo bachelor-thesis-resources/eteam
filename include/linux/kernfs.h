@@ -152,6 +152,8 @@ struct kernfs_syscall_ops {
 	int (*rmdir)(struct kernfs_node *kn);
 	int (*rename)(struct kernfs_node *kn, struct kernfs_node *new_parent,
 		      const char *new_name);
+	int (*show_path)(struct seq_file *sf, struct kernfs_node *kn,
+			 struct kernfs_root *root);
 };
 
 struct kernfs_root {
@@ -266,8 +268,10 @@ static inline bool kernfs_ns_enabled(struct kernfs_node *kn)
 }
 
 int kernfs_name(struct kernfs_node *kn, char *buf, size_t buflen);
-char * __must_check kernfs_path(struct kernfs_node *kn, char *buf,
-				size_t buflen);
+size_t kernfs_path_len(struct kernfs_node *kn);
+int kernfs_path_from_node(struct kernfs_node *root_kn, struct kernfs_node *kn,
+			  char *buf, size_t buflen);
+char *kernfs_path(struct kernfs_node *kn, char *buf, size_t buflen);
 void pr_cont_kernfs_name(struct kernfs_node *kn);
 void pr_cont_kernfs_path(struct kernfs_node *kn);
 struct kernfs_node *kernfs_get_parent(struct kernfs_node *kn);
@@ -280,6 +284,8 @@ struct kernfs_node *kernfs_node_from_dentry(struct dentry *dentry);
 struct kernfs_root *kernfs_root_from_sb(struct super_block *sb);
 struct inode *kernfs_get_inode(struct super_block *sb, struct kernfs_node *kn);
 
+struct dentry *kernfs_node_dentry(struct kernfs_node *kn,
+				  struct super_block *sb);
 struct kernfs_root *kernfs_create_root(struct kernfs_syscall_ops *scops,
 				       unsigned int flags, void *priv);
 void kernfs_destroy_root(struct kernfs_root *root);
@@ -332,8 +338,11 @@ static inline bool kernfs_ns_enabled(struct kernfs_node *kn)
 static inline int kernfs_name(struct kernfs_node *kn, char *buf, size_t buflen)
 { return -ENOSYS; }
 
-static inline char * __must_check kernfs_path(struct kernfs_node *kn, char *buf,
-					      size_t buflen)
+static inline size_t kernfs_path_len(struct kernfs_node *kn)
+{ return 0; }
+
+static inline char *kernfs_path(struct kernfs_node *kn, char *buf,
+				size_t buflen)
 { return NULL; }
 
 static inline void pr_cont_kernfs_name(struct kernfs_node *kn) { }

@@ -64,14 +64,22 @@
 #include <linux/binfmts.h>
 #include <linux/sched/sysctl.h>
 #include <linux/kexec.h>
+#include <linux/bpf.h>
+#include <linux/efi.h>
+#include <linux/mount.h>
+
+#include "../lib/kstrtox.h"
 
 #include <asm/uaccess.h>
+#include <linux/mutex.h>
 #include <asm/processor.h>
 
 #ifdef CONFIG_X86
+#include <asm/msr.h>
 #include <asm/nmi.h>
 #include <asm/stacktrace.h>
 #include <asm/io.h>
+#include <asm/spec-ctrl.h>
 #endif
 #ifdef CONFIG_SPARC
 #include <asm/setup.h>
@@ -102,6 +110,9 @@ extern int core_uses_pid;
 extern char core_pattern[];
 extern unsigned int core_pipe_limit;
 #endif
+#ifdef CONFIG_USER_NS
+extern int unprivileged_userns_clone;
+#endif
 extern int pid_max;
 extern int pid_max_min, pid_max_max;
 extern int percpu_pagelist_fraction;
@@ -123,7 +134,9 @@ static int zero;
 static int __maybe_unused one = 1;
 static int __maybe_unused two = 2;
 static int __maybe_unused four = 4;
+static unsigned long zero_ul;
 static unsigned long one_ul = 1;
+static unsigned long long_max = LONG_MAX;
 static int one_hundred = 100;
 #ifdef CONFIG_PRINTK
 static int ten_thousand = 10000;
@@ -172,7 +185,7 @@ extern int no_unaligned_warning;
 #define SYSCTL_WRITES_WARN	 0
 #define SYSCTL_WRITES_STRICT	 1
 
-static int sysctl_writes_strict = SYSCTL_WRITES_WARN;
+static int sysctl_writes_strict = SYSCTL_WRITES_STRICT;
 
 static int proc_do_cad_pid(struct ctl_table *table, int write,
 		  void __user *buffer, size_t *lenp, loff_t *ppos);
@@ -190,6 +203,123 @@ static int proc_dointvec_minmax_coredump(struct ctl_table *table, int write,
 #ifdef CONFIG_COREDUMP
 static int proc_dostring_coredump(struct ctl_table *table, int write,
 		void __user *buffer, size_t *lenp, loff_t *ppos);
+#endif
+
+#ifdef CONFIG_X86
+/* Mutex to serialize IBPB and IBRS runtime control changes */
+DEFINE_MUTEX(ubuntu_spec_ctrl_mutex);
+
+unsigned int ibpb_enabled = 0;
+EXPORT_SYMBOL(ibpb_enabled);   /* Required in some modules */
+
+static unsigned int __ibpb_enabled = 0;   /* procfs shadow variable */
+
+int set_ibpb_enabled(unsigned int val)
+{
+	int error = 0;
+	unsigned int prev = ibpb_enabled;
+
+	mutex_lock(&ubuntu_spec_ctrl_mutex);
+
+	/* Only enable/disable IBPB if the CPU supports it */
+	if (boot_cpu_has(X86_FEATURE_USE_IBPB)) {
+		ibpb_enabled = val;
+		if (ibpb_enabled != prev)
+			pr_info("Spectre V2 : mitigation: %s "
+				"Indirect Branch Prediction Barrier\n",
+				ibpb_enabled ? "Enabling kernel" : "Disabling kernel");
+	} else {
+		ibpb_enabled = 0;
+		if (val) {
+			/* IBPB is not supported but we try to turn it on */
+			error = -EINVAL;
+		}
+	}
+
+	/* Update the shadow variable */
+	__ibpb_enabled = ibpb_enabled;
+
+	mutex_unlock(&ubuntu_spec_ctrl_mutex);
+
+	return error;
+}
+
+static int ibpb_enabled_handler(struct ctl_table *table, int write,
+				void __user *buffer, size_t *lenp,
+				loff_t *ppos)
+{
+	int error;
+
+	error = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+	if (error)
+		return error;
+
+	return set_ibpb_enabled(__ibpb_enabled);
+}
+
+unsigned int ibrs_enabled = 0;
+EXPORT_SYMBOL(ibrs_enabled);   /* Required in some modules */
+
+static unsigned int __ibrs_enabled = 0;   /* procfs shadow variable */
+
+int set_ibrs_enabled(unsigned int val)
+{
+	int error = 0;
+	unsigned int cpu;
+	unsigned int prev = ibrs_enabled;
+
+	mutex_lock(&ubuntu_spec_ctrl_mutex);
+
+	/* Only enable/disable IBRS if the CPU supports it */
+	if (boot_cpu_has(X86_FEATURE_USE_IBRS_FW)) {
+		ibrs_enabled = val;
+		if (ibrs_enabled != prev)
+			pr_info("Spectre V2 : mitigation: %s "
+				"Indirect Branch Restricted Speculation\n",
+				ibrs_enabled == 2 ? "Enabling kernel+user" :
+				ibrs_enabled ? "Enabling kernel" : "Disabling");
+
+		if (ibrs_enabled == 0) {
+			/* Always disable IBRS */
+			u64 val = x86_spec_ctrl_base;
+
+			for_each_online_cpu(cpu)
+				wrmsrl_on_cpu(cpu, MSR_IA32_SPEC_CTRL, val);
+		} else if (ibrs_enabled == 2) {
+			/* Always enable IBRS, even in user space */
+			u64 val = x86_spec_ctrl_base | SPEC_CTRL_IBRS;
+
+			for_each_online_cpu(cpu)
+				wrmsrl_on_cpu(cpu, MSR_IA32_SPEC_CTRL, val);
+		}
+	} else {
+		ibrs_enabled = 0;
+		if (val) {
+			/* IBRS is not supported but we try to turn it on */
+			error = -EINVAL;
+		}
+	}
+
+	/* Update the shadow variable */
+	__ibrs_enabled = ibrs_enabled;
+
+	mutex_unlock(&ubuntu_spec_ctrl_mutex);
+
+	return error;
+}
+
+static int ibrs_enabled_handler(struct ctl_table *table, int write,
+                               void __user *buffer, size_t *lenp,
+                               loff_t *ppos)
+{
+	int error;
+
+	error = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+	if (error)
+		return error;
+
+	return set_ibrs_enabled(__ibrs_enabled);
+}
 #endif
 
 #ifdef CONFIG_MAGIC_SYSRQ
@@ -275,7 +405,37 @@ static int min_extfrag_threshold;
 static int max_extfrag_threshold = 1000;
 #endif
 
+static unsigned int secure_boot_enabled;
+int secure_boot_proc_handler(struct ctl_table *table, int write,
+	void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	secure_boot_enabled = efi_enabled(EFI_SECURE_BOOT);
+	return proc_dointvec(table, write, buffer, lenp, ppos);
+}
+
+static unsigned int moksbstate_disabled;
+int moksbstate_disabled_proc_handler(struct ctl_table *table, int write,
+	void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	moksbstate_disabled = efi_enabled(EFI_MOKSBSTATE_DISABLED);
+	return proc_dointvec(table, write, buffer, lenp, ppos);
+}
+
 static struct ctl_table kern_table[] = {
+	{
+		.procname   = "secure_boot",
+		.data       = &secure_boot_enabled,
+		.maxlen     = sizeof(unsigned int),
+		.mode       = 0444,
+		.proc_handler   = secure_boot_proc_handler,
+	},
+	{
+		.procname   = "moksbstate_disabled",
+		.data       = &moksbstate_disabled,
+		.maxlen     = sizeof(unsigned int),
+		.mode       = 0444,
+		.proc_handler   = moksbstate_disabled_proc_handler,
+	},
 	{
 		.procname	= "sched_child_runs_first",
 		.data		= &sysctl_sched_child_runs_first,
@@ -340,7 +500,8 @@ static struct ctl_table kern_table[] = {
 		.data		= &sysctl_sched_time_avg,
 		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &one,
 	},
 	{
 		.procname	= "sched_shares_window_ns",
@@ -407,7 +568,7 @@ static struct ctl_table kern_table[] = {
 	},
 	{
 		.procname	= "sched_rr_timeslice_ms",
-		.data		= &sched_rr_timeslice,
+		.data		= &sysctl_sched_rr_timeslice,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= sched_rr_handler,
@@ -477,6 +638,15 @@ static struct ctl_table kern_table[] = {
 		.procname	= "core_pipe_limit",
 		.data		= &core_pipe_limit,
 		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+#endif
+#ifdef CONFIG_USER_NS
+	{
+		.procname	= "unprivileged_userns_clone",
+		.data		= &unprivileged_userns_clone,
+		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
 	},
@@ -621,7 +791,7 @@ static struct ctl_table kern_table[] = {
 		.proc_handler	= proc_dointvec,
 	},
 #endif
-#ifdef CONFIG_KEXEC
+#ifdef CONFIG_KEXEC_CORE
 	{
 		.procname	= "kexec_load_disabled",
 		.data		= &kexec_load_disabled,
@@ -887,10 +1057,30 @@ static struct ctl_table kern_table[] = {
 		.extra1		= &zero,
 		.extra2		= &one,
 	},
+#ifdef CONFIG_HARDLOCKUP_DETECTOR
+	{
+		.procname	= "hardlockup_panic",
+		.data		= &hardlockup_panic,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+#endif
 #ifdef CONFIG_SMP
 	{
 		.procname	= "softlockup_all_cpu_backtrace",
 		.data		= &sysctl_softlockup_all_cpu_backtrace,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+	{
+		.procname	= "hardlockup_all_cpu_backtrace",
+		.data		= &sysctl_hardlockup_all_cpu_backtrace,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
@@ -1137,6 +1327,40 @@ static struct ctl_table kern_table[] = {
 		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
 		.proc_handler	= timer_migration_handler,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+#endif
+#ifdef CONFIG_BPF_SYSCALL
+	{
+		.procname	= "unprivileged_bpf_disabled",
+		.data		= &sysctl_unprivileged_bpf_disabled,
+		.maxlen		= sizeof(sysctl_unprivileged_bpf_disabled),
+		.mode		= 0644,
+		/* only handle a transition from default "0" to "1" */
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &one,
+		.extra2		= &one,
+	},
+#endif
+#ifdef CONFIG_X86
+	{
+		.procname       = "ibrs_enabled",
+		.data           = &__ibrs_enabled,
+		.maxlen         = sizeof(unsigned int),
+		.mode           = 0644,
+		.proc_handler   = ibrs_enabled_handler,
+		.extra1         = &zero,
+		.extra2         = &two,
+	},
+	{
+		.procname	= "ibpb_enabled",
+		.data		= &__ibpb_enabled,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler   = ibpb_enabled_handler,
+		.extra1		= &zero,
+		.extra2		= &one,
 	},
 #endif
 	{ }
@@ -1318,7 +1542,7 @@ static struct ctl_table vm_table[] = {
 		.procname	= "drop_caches",
 		.data		= &sysctl_drop_caches,
 		.maxlen		= sizeof(int),
-		.mode		= 0644,
+		.mode		= 0200,
 		.proc_handler	= drop_caches_sysctl_handler,
 		.extra1		= &one,
 		.extra2		= &four,
@@ -1566,6 +1790,8 @@ static struct ctl_table fs_table[] = {
 		.maxlen		= sizeof(files_stat.max_files),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,
+		.extra1		= &zero_ul,
+		.extra2		= &long_max,
 	},
 	{
 		.procname	= "nr_open",
@@ -1679,6 +1905,24 @@ static struct ctl_table fs_table[] = {
 		.extra2		= &one,
 	},
 	{
+		.procname	= "protected_fifos",
+		.data		= &sysctl_protected_fifos,
+		.maxlen		= sizeof(int),
+		.mode		= 0600,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &two,
+	},
+	{
+		.procname	= "protected_regular",
+		.data		= &sysctl_protected_regular,
+		.maxlen		= sizeof(int),
+		.mode		= 0600,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &two,
+	},
+	{
 		.procname	= "suid_dumpable",
 		.data		= &suid_dumpable,
 		.maxlen		= sizeof(int),
@@ -1701,6 +1945,28 @@ static struct ctl_table fs_table[] = {
 		.mode		= 0644,
 		.proc_handler	= &pipe_proc_fn,
 		.extra1		= &pipe_min_size,
+	},
+	{
+		.procname	= "pipe-user-pages-hard",
+		.data		= &pipe_user_pages_hard,
+		.maxlen		= sizeof(pipe_user_pages_hard),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "pipe-user-pages-soft",
+		.data		= &pipe_user_pages_soft,
+		.maxlen		= sizeof(pipe_user_pages_soft),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "mount-max",
+		.data		= &sysctl_mount_max,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &one,
 	},
 	{ }
 };
@@ -1871,6 +2137,41 @@ static void proc_skip_char(char **buf, size_t *size, const char v)
 	}
 }
 
+/**
+ * strtoul_lenient - parse an ASCII formatted integer from a buffer and only
+ *                   fail on overflow
+ *
+ * @cp: kernel buffer containing the string to parse
+ * @endp: pointer to store the trailing characters
+ * @base: the base to use
+ * @res: where the parsed integer will be stored
+ *
+ * In case of success 0 is returned and @res will contain the parsed integer,
+ * @endp will hold any trailing characters.
+ * This function will fail the parse on overflow. If there wasn't an overflow
+ * the function will defer the decision what characters count as invalid to the
+ * caller.
+ */
+static int strtoul_lenient(const char *cp, char **endp, unsigned int base,
+			   unsigned long *res)
+{
+	unsigned long long result;
+	unsigned int rv;
+
+	cp = _parse_integer_fixup_radix(cp, &base);
+	rv = _parse_integer(cp, base, &result);
+	if ((rv & KSTRTOX_OVERFLOW) || (result != (unsigned long)result))
+		return -ERANGE;
+
+	cp += rv;
+
+	if (endp)
+		*endp = (char *)cp;
+
+	*res = (unsigned long)result;
+	return 0;
+}
+
 #define TMPBUFLEN 22
 /**
  * proc_get_long - reads an ASCII formatted integer from a user buffer
@@ -1914,7 +2215,8 @@ static int proc_get_long(char **buf, size_t *size,
 	if (!isdigit(*p))
 		return -EINVAL;
 
-	*val = simple_strtoul(p, &p, 0);
+	if (strtoul_lenient(p, &p, 0, val))
+		return -EINVAL;
 
 	len = p - tmp;
 
@@ -1995,11 +2297,29 @@ static int do_proc_dointvec_conv(bool *negp, unsigned long *lvalp,
 		int val = *valp;
 		if (val < 0) {
 			*negp = true;
-			*lvalp = (unsigned long)-val;
+			*lvalp = -(unsigned long)val;
 		} else {
 			*negp = false;
 			*lvalp = (unsigned long)val;
 		}
+	}
+	return 0;
+}
+
+static int do_proc_douintvec_conv(bool *negp, unsigned long *lvalp,
+				 int *valp,
+				 int write, void *data)
+{
+	if (write) {
+		if (*negp)
+			return -EINVAL;
+		if (*lvalp > UINT_MAX)
+			return -EINVAL;
+		*valp = *lvalp;
+	} else {
+		unsigned int val = *valp;
+		*negp = false;
+		*lvalp = (unsigned long)val;
 	}
 	return 0;
 }
@@ -2131,8 +2451,27 @@ static int do_proc_dointvec(struct ctl_table *table, int write,
 int proc_dointvec(struct ctl_table *table, int write,
 		     void __user *buffer, size_t *lenp, loff_t *ppos)
 {
-    return do_proc_dointvec(table,write,buffer,lenp,ppos,
-		    	    NULL,NULL);
+	return do_proc_dointvec(table, write, buffer, lenp, ppos, NULL, NULL);
+}
+
+/**
+ * proc_douintvec - read a vector of unsigned integers
+ * @table: the sysctl table
+ * @write: %TRUE if this is a write to the sysctl file
+ * @buffer: the user buffer
+ * @lenp: the size of the user buffer
+ * @ppos: file position
+ *
+ * Reads/writes up to table->maxlen/sizeof(unsigned int) unsigned integer
+ * values from/to the user buffer, treated as an ASCII string.
+ *
+ * Returns 0 on success.
+ */
+int proc_douintvec(struct ctl_table *table, int write,
+		     void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	return do_proc_dointvec(table, write, buffer, lenp, ppos,
+				do_proc_douintvec_conv, NULL);
 }
 
 /*
@@ -2192,7 +2531,16 @@ static int do_proc_dointvec_minmax_conv(bool *negp, unsigned long *lvalp,
 {
 	struct do_proc_dointvec_minmax_conv_param *param = data;
 	if (write) {
-		int val = *negp ? -*lvalp : *lvalp;
+		int val;
+		if (*negp) {
+			if (*lvalp > (unsigned long) INT_MAX + 1)
+				return -EINVAL;
+			val = -*lvalp;
+		} else {
+			if (*lvalp > (unsigned long) INT_MAX)
+				return -EINVAL;
+			val = *lvalp;
+		}
 		if ((param->min && *param->min > val) ||
 		    (param->max && *param->max < val))
 			return -EINVAL;
@@ -2201,7 +2549,7 @@ static int do_proc_dointvec_minmax_conv(bool *negp, unsigned long *lvalp,
 		int val = *valp;
 		if (val < 0) {
 			*negp = true;
-			*lvalp = (unsigned long)-val;
+			*lvalp = -(unsigned long)val;
 		} else {
 			*negp = false;
 			*lvalp = (unsigned long)val;
@@ -2333,8 +2681,11 @@ static int __do_proc_doulongvec_minmax(void *data, struct ctl_table *table, int 
 				break;
 			if (neg)
 				continue;
-			if ((min && val < *min) || (max && val > *max))
-				continue;
+			val = convmul * val / convdiv;
+			if ((min && val < *min) || (max && val > *max)) {
+				err = -EINVAL;
+				break;
+			}
 			*i = val;
 		} else {
 			val = convdiv * (*i) / convmul;
@@ -2436,7 +2787,7 @@ static int do_proc_dointvec_jiffies_conv(bool *negp, unsigned long *lvalp,
 		unsigned long lval;
 		if (val < 0) {
 			*negp = true;
-			lval = (unsigned long)-val;
+			lval = -(unsigned long)val;
 		} else {
 			*negp = false;
 			lval = (unsigned long)val;
@@ -2459,7 +2810,7 @@ static int do_proc_dointvec_userhz_jiffies_conv(bool *negp, unsigned long *lvalp
 		unsigned long lval;
 		if (val < 0) {
 			*negp = true;
-			lval = (unsigned long)-val;
+			lval = -(unsigned long)val;
 		} else {
 			*negp = false;
 			lval = (unsigned long)val;
@@ -2484,7 +2835,7 @@ static int do_proc_dointvec_ms_jiffies_conv(bool *negp, unsigned long *lvalp,
 		unsigned long lval;
 		if (val < 0) {
 			*negp = true;
-			lval = (unsigned long)-val;
+			lval = -(unsigned long)val;
 		} else {
 			*negp = false;
 			lval = (unsigned long)val;
@@ -2745,6 +3096,12 @@ int proc_dointvec(struct ctl_table *table, int write,
 	return -ENOSYS;
 }
 
+int proc_douintvec(struct ctl_table *table, int write,
+		  void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	return -ENOSYS;
+}
+
 int proc_dointvec_minmax(struct ctl_table *table, int write,
 		    void __user *buffer, size_t *lenp, loff_t *ppos)
 {
@@ -2790,6 +3147,7 @@ int proc_doulongvec_ms_jiffies_minmax(struct ctl_table *table, int write,
  * exception granted :-)
  */
 EXPORT_SYMBOL(proc_dointvec);
+EXPORT_SYMBOL(proc_douintvec);
 EXPORT_SYMBOL(proc_dointvec_jiffies);
 EXPORT_SYMBOL(proc_dointvec_minmax);
 EXPORT_SYMBOL(proc_dointvec_userhz_jiffies);

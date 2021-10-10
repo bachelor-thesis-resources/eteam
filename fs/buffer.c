@@ -999,7 +999,7 @@ grow_dev_page(struct block_device *bdev, sector_t block,
 	int ret = 0;		/* Will call free_more_memory() */
 	gfp_t gfp_mask;
 
-	gfp_mask = (mapping_gfp_mask(inode->i_mapping) & ~__GFP_FS) | gfp;
+	gfp_mask = mapping_gfp_constraint(inode->i_mapping, ~__GFP_FS) | gfp;
 
 	/*
 	 * XXX: __getblk_slow() can not really deal with failure and
@@ -2298,7 +2298,7 @@ static int cont_expand_zero(struct file *file, struct address_space *mapping,
 			    loff_t pos, loff_t *bytes)
 {
 	struct inode *inode = mapping->host;
-	unsigned blocksize = 1 << inode->i_blkbits;
+	unsigned int blocksize = i_blocksize(inode);
 	struct page *page;
 	void *fsdata;
 	pgoff_t index, curidx;
@@ -2378,8 +2378,8 @@ int cont_write_begin(struct file *file, struct address_space *mapping,
 			get_block_t *get_block, loff_t *bytes)
 {
 	struct inode *inode = mapping->host;
-	unsigned blocksize = 1 << inode->i_blkbits;
-	unsigned zerofrom;
+	unsigned int blocksize = i_blocksize(inode);
+	unsigned int zerofrom;
 	int err;
 
 	err = cont_expand_zero(file, mapping, pos, bytes);
@@ -2420,9 +2420,9 @@ EXPORT_SYMBOL(block_commit_write);
  * unlock the page.
  *
  * Direct callers of this function should protect against filesystem freezing
- * using sb_start_write() - sb_end_write() functions.
+ * using sb_start_pagefault() - sb_end_pagefault() functions.
  */
-int __block_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf,
+int block_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf,
 			 get_block_t get_block)
 {
 	struct page *page = vmf->page;
@@ -2458,26 +2458,6 @@ int __block_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf,
 out_unlock:
 	unlock_page(page);
 	return ret;
-}
-EXPORT_SYMBOL(__block_page_mkwrite);
-
-int block_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf,
-		   get_block_t get_block)
-{
-	int ret;
-	struct super_block *sb = file_inode(vma->vm_file)->i_sb;
-
-	sb_start_pagefault(sb);
-
-	/*
-	 * Update file times before taking page lock. We may end up failing the
-	 * fault so this update may be superfluous but who really cares...
-	 */
-	file_update_time(vma->vm_file);
-
-	ret = __block_page_mkwrite(vma, vmf, get_block);
-	sb_end_pagefault(sb);
-	return block_page_mkwrite_return(ret);
 }
 EXPORT_SYMBOL(block_page_mkwrite);
 
@@ -2761,7 +2741,7 @@ int nobh_truncate_page(struct address_space *mapping,
 	struct buffer_head map_bh;
 	int err;
 
-	blocksize = 1 << inode->i_blkbits;
+	blocksize = i_blocksize(inode);
 	length = offset & (blocksize - 1);
 
 	/* Block boundary? Nothing to do */
@@ -2839,7 +2819,7 @@ int block_truncate_page(struct address_space *mapping,
 	struct buffer_head *bh;
 	int err;
 
-	blocksize = 1 << inode->i_blkbits;
+	blocksize = i_blocksize(inode);
 	length = offset & (blocksize - 1);
 
 	/* Block boundary? Nothing to do */
@@ -2951,20 +2931,20 @@ sector_t generic_block_bmap(struct address_space *mapping, sector_t block,
 	struct inode *inode = mapping->host;
 	tmp.b_state = 0;
 	tmp.b_blocknr = 0;
-	tmp.b_size = 1 << inode->i_blkbits;
+	tmp.b_size = i_blocksize(inode);
 	get_block(inode, block, &tmp, 0);
 	return tmp.b_blocknr;
 }
 EXPORT_SYMBOL(generic_block_bmap);
 
-static void end_bio_bh_io_sync(struct bio *bio, int err)
+static void end_bio_bh_io_sync(struct bio *bio)
 {
 	struct buffer_head *bh = bio->bi_private;
 
-	if (unlikely (test_bit(BIO_QUIET,&bio->bi_flags)))
+	if (unlikely(bio_flagged(bio, BIO_QUIET)))
 		set_bit(BH_Quiet, &bh->b_state);
 
-	bh->b_end_io(bh, test_bit(BIO_UPTODATE, &bio->bi_flags));
+	bh->b_end_io(bh, !bio->bi_error);
 	bio_put(bio);
 }
 
@@ -3004,6 +2984,13 @@ void guard_bio_eod(int rw, struct bio *bio)
 
 	/* Uhhuh. We've got a bio that straddles the device size! */
 	truncated_bytes = bio->bi_iter.bi_size - (maxsector << 9);
+
+	/*
+	 * The bio contains more than one segment which spans EOD, just return
+	 * and let IO layer turn it into an EIO
+	 */
+	if (truncated_bytes > bvec->bv_len)
+		return;
 
 	/* Truncate the bio.. */
 	bio->bi_iter.bi_size -= truncated_bytes;
@@ -3046,12 +3033,9 @@ static int submit_bh_wbc(int rw, struct buffer_head *bh,
 
 	bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
 	bio->bi_bdev = bh->b_bdev;
-	bio->bi_io_vec[0].bv_page = bh->b_page;
-	bio->bi_io_vec[0].bv_len = bh->b_size;
-	bio->bi_io_vec[0].bv_offset = bh_offset(bh);
 
-	bio->bi_vcnt = 1;
-	bio->bi_iter.bi_size = bh->b_size;
+	bio_add_page(bio, bh->b_page, bh->b_size, bh_offset(bh));
+	BUG_ON(bio->bi_iter.bi_size != bh->b_size);
 
 	bio->bi_end_io = end_bio_bh_io_sync;
 	bio->bi_private = bh;

@@ -526,24 +526,28 @@ static int gsc_src_set_fmt(struct device *dev, u32 fmt)
 			GSC_IN_CHROMA_ORDER_CRCB);
 		break;
 	case DRM_FORMAT_NV21:
+		cfg |= (GSC_IN_CHROMA_ORDER_CRCB | GSC_IN_YUV420_2P);
+		break;
 	case DRM_FORMAT_NV61:
-		cfg |= (GSC_IN_CHROMA_ORDER_CRCB |
-			GSC_IN_YUV420_2P);
+		cfg |= (GSC_IN_CHROMA_ORDER_CRCB | GSC_IN_YUV422_2P);
 		break;
 	case DRM_FORMAT_YUV422:
 		cfg |= GSC_IN_YUV422_3P;
 		break;
 	case DRM_FORMAT_YUV420:
+		cfg |= (GSC_IN_CHROMA_ORDER_CBCR | GSC_IN_YUV420_3P);
+		break;
 	case DRM_FORMAT_YVU420:
-		cfg |= GSC_IN_YUV420_3P;
+		cfg |= (GSC_IN_CHROMA_ORDER_CRCB | GSC_IN_YUV420_3P);
 		break;
 	case DRM_FORMAT_NV12:
+		cfg |= (GSC_IN_CHROMA_ORDER_CBCR | GSC_IN_YUV420_2P);
+		break;
 	case DRM_FORMAT_NV16:
-		cfg |= (GSC_IN_CHROMA_ORDER_CBCR |
-			GSC_IN_YUV420_2P);
+		cfg |= (GSC_IN_CHROMA_ORDER_CBCR | GSC_IN_YUV422_2P);
 		break;
 	default:
-		dev_err(ippdrv->dev, "inavlid target yuv order 0x%x.\n", fmt);
+		dev_err(ippdrv->dev, "invalid target yuv order 0x%x.\n", fmt);
 		return -EINVAL;
 	}
 
@@ -582,12 +586,20 @@ static int gsc_src_set_transf(struct device *dev,
 		break;
 	case EXYNOS_DRM_DEGREE_180:
 		cfg |= GSC_IN_ROT_180;
+		if (flip & EXYNOS_DRM_FLIP_VERTICAL)
+			cfg &= ~GSC_IN_ROT_XFLIP;
+		if (flip & EXYNOS_DRM_FLIP_HORIZONTAL)
+			cfg &= ~GSC_IN_ROT_YFLIP;
 		break;
 	case EXYNOS_DRM_DEGREE_270:
 		cfg |= GSC_IN_ROT_270;
+		if (flip & EXYNOS_DRM_FLIP_VERTICAL)
+			cfg &= ~GSC_IN_ROT_XFLIP;
+		if (flip & EXYNOS_DRM_FLIP_HORIZONTAL)
+			cfg &= ~GSC_IN_ROT_YFLIP;
 		break;
 	default:
-		dev_err(ippdrv->dev, "inavlid degree value %d.\n", degree);
+		dev_err(ippdrv->dev, "invalid degree value %d.\n", degree);
 		return -EINVAL;
 	}
 
@@ -713,7 +725,7 @@ static int gsc_src_set_addr(struct device *dev,
 		property->prop_id, buf_id, buf_type);
 
 	if (buf_id > GSC_MAX_SRC) {
-		dev_info(ippdrv->dev, "inavlid buf_id %d.\n", buf_id);
+		dev_info(ippdrv->dev, "invalid buf_id %d.\n", buf_id);
 		return -EINVAL;
 	}
 
@@ -792,21 +804,28 @@ static int gsc_dst_set_fmt(struct device *dev, u32 fmt)
 			GSC_OUT_CHROMA_ORDER_CRCB);
 		break;
 	case DRM_FORMAT_NV21:
-	case DRM_FORMAT_NV61:
 		cfg |= (GSC_OUT_CHROMA_ORDER_CRCB | GSC_OUT_YUV420_2P);
 		break;
+	case DRM_FORMAT_NV61:
+		cfg |= (GSC_OUT_CHROMA_ORDER_CRCB | GSC_OUT_YUV422_2P);
+		break;
 	case DRM_FORMAT_YUV422:
+		cfg |= GSC_OUT_YUV422_3P;
+		break;
 	case DRM_FORMAT_YUV420:
+		cfg |= (GSC_OUT_CHROMA_ORDER_CBCR | GSC_OUT_YUV420_3P);
+		break;
 	case DRM_FORMAT_YVU420:
-		cfg |= GSC_OUT_YUV420_3P;
+		cfg |= (GSC_OUT_CHROMA_ORDER_CRCB | GSC_OUT_YUV420_3P);
 		break;
 	case DRM_FORMAT_NV12:
+		cfg |= (GSC_OUT_CHROMA_ORDER_CBCR | GSC_OUT_YUV420_2P);
+		break;
 	case DRM_FORMAT_NV16:
-		cfg |= (GSC_OUT_CHROMA_ORDER_CBCR |
-			GSC_OUT_YUV420_2P);
+		cfg |= (GSC_OUT_CHROMA_ORDER_CBCR | GSC_OUT_YUV422_2P);
 		break;
 	default:
-		dev_err(ippdrv->dev, "inavlid target yuv order 0x%x.\n", fmt);
+		dev_err(ippdrv->dev, "invalid target yuv order 0x%x.\n", fmt);
 		return -EINVAL;
 	}
 
@@ -845,12 +864,20 @@ static int gsc_dst_set_transf(struct device *dev,
 		break;
 	case EXYNOS_DRM_DEGREE_180:
 		cfg |= GSC_IN_ROT_180;
+		if (flip & EXYNOS_DRM_FLIP_VERTICAL)
+			cfg &= ~GSC_IN_ROT_XFLIP;
+		if (flip & EXYNOS_DRM_FLIP_HORIZONTAL)
+			cfg &= ~GSC_IN_ROT_YFLIP;
 		break;
 	case EXYNOS_DRM_DEGREE_270:
 		cfg |= GSC_IN_ROT_270;
+		if (flip & EXYNOS_DRM_FLIP_VERTICAL)
+			cfg &= ~GSC_IN_ROT_XFLIP;
+		if (flip & EXYNOS_DRM_FLIP_HORIZONTAL)
+			cfg &= ~GSC_IN_ROT_YFLIP;
 		break;
 	default:
-		dev_err(ippdrv->dev, "inavlid degree value %d.\n", degree);
+		dev_err(ippdrv->dev, "invalid degree value %d.\n", degree);
 		return -EINVAL;
 	}
 
@@ -1160,7 +1187,7 @@ static int gsc_dst_set_addr(struct device *dev,
 		property->prop_id, buf_id, buf_type);
 
 	if (buf_id > GSC_MAX_DST) {
-		dev_info(ippdrv->dev, "inavlid buf_id %d.\n", buf_id);
+		dev_info(ippdrv->dev, "invalid buf_id %d.\n", buf_id);
 		return -EINVAL;
 	}
 

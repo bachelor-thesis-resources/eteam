@@ -114,7 +114,7 @@ static int mlx4_buddy_init(struct mlx4_buddy *buddy, int max_order)
 		goto err_out;
 
 	for (i = 0; i <= buddy->max_order; ++i) {
-		s = BITS_TO_LONGS(1 << (buddy->max_order - i));
+		s = BITS_TO_LONGS(1UL << (buddy->max_order - i));
 		buddy->bits[i] = kcalloc(s, sizeof (long), GFP_KERNEL | __GFP_NOWARN);
 		if (!buddy->bits[i]) {
 			buddy->bits[i] = vzalloc(s * sizeof(long));
@@ -318,7 +318,7 @@ int mlx4_mr_hw_get_mpt(struct mlx4_dev *dev, struct mlx4_mr *mmr,
 				key, NULL);
 	} else {
 		mailbox = mlx4_alloc_cmd_mailbox(dev);
-		if (IS_ERR_OR_NULL(mailbox))
+		if (IS_ERR(mailbox))
 			return PTR_ERR(mailbox);
 
 		err = mlx4_cmd_box(dev, 0, mailbox->dma, key,
@@ -366,6 +366,7 @@ int mlx4_mr_hw_write_mpt(struct mlx4_dev *dev, struct mlx4_mr *mmr,
 			container_of((void *)mpt_entry, struct mlx4_cmd_mailbox,
 				     buf);
 
+		(*mpt_entry)->lkey = 0;
 		err = mlx4_SW2HW_MPT(dev, mailbox, key);
 	}
 

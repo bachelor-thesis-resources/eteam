@@ -13,6 +13,7 @@
 #include <linux/module.h>
 #include <linux/device.h>
 #include <linux/slab.h>
+#include <linux/pmem.h>
 #include <linux/nd.h>
 #include "nd-core.h"
 #include "nd.h"
@@ -76,22 +77,107 @@ static bool is_namespace_io(struct device *dev)
 	return dev ? dev->type == &namespace_io_device_type : false;
 }
 
+static int is_uuid_busy(struct device *dev, void *data)
+{
+	u8 *uuid1 = data, *uuid2 = NULL;
+
+	if (is_namespace_pmem(dev)) {
+		struct nd_namespace_pmem *nspm = to_nd_namespace_pmem(dev);
+
+		uuid2 = nspm->uuid;
+	} else if (is_namespace_blk(dev)) {
+		struct nd_namespace_blk *nsblk = to_nd_namespace_blk(dev);
+
+		uuid2 = nsblk->uuid;
+	} else if (is_nd_btt(dev)) {
+		struct nd_btt *nd_btt = to_nd_btt(dev);
+
+		uuid2 = nd_btt->uuid;
+	} else if (is_nd_pfn(dev)) {
+		struct nd_pfn *nd_pfn = to_nd_pfn(dev);
+
+		uuid2 = nd_pfn->uuid;
+	}
+
+	if (uuid2 && memcmp(uuid1, uuid2, NSLABEL_UUID_LEN) == 0)
+		return -EBUSY;
+
+	return 0;
+}
+
+static int is_namespace_uuid_busy(struct device *dev, void *data)
+{
+	if (is_nd_pmem(dev) || is_nd_blk(dev))
+		return device_for_each_child(dev, data, is_uuid_busy);
+	return 0;
+}
+
+/**
+ * nd_is_uuid_unique - verify that no other namespace has @uuid
+ * @dev: any device on a nvdimm_bus
+ * @uuid: uuid to check
+ */
+bool nd_is_uuid_unique(struct device *dev, u8 *uuid)
+{
+	struct nvdimm_bus *nvdimm_bus = walk_to_nvdimm_bus(dev);
+
+	if (!nvdimm_bus)
+		return false;
+	WARN_ON_ONCE(!is_nvdimm_bus_locked(&nvdimm_bus->dev));
+	if (device_for_each_child(&nvdimm_bus->dev, uuid,
+				is_namespace_uuid_busy) != 0)
+		return false;
+	return true;
+}
+
+bool pmem_should_map_pages(struct device *dev)
+{
+	struct nd_region *nd_region = to_nd_region(dev->parent);
+
+	if (!IS_ENABLED(CONFIG_ZONE_DEVICE))
+		return false;
+
+	if (!test_bit(ND_REGION_PAGEMAP, &nd_region->flags))
+		return false;
+
+	if (is_nd_pfn(dev) || is_nd_btt(dev))
+		return false;
+
+#ifdef ARCH_MEMREMAP_PMEM
+	return ARCH_MEMREMAP_PMEM == MEMREMAP_WB;
+#else
+	return false;
+#endif
+}
+EXPORT_SYMBOL(pmem_should_map_pages);
+
 const char *nvdimm_namespace_disk_name(struct nd_namespace_common *ndns,
 		char *name)
 {
 	struct nd_region *nd_region = to_nd_region(ndns->dev.parent);
-	const char *suffix = "";
+	const char *suffix = NULL;
 
-	if (ndns->claim && is_nd_btt(ndns->claim))
-		suffix = "s";
+	if (ndns->claim) {
+		if (is_nd_btt(ndns->claim))
+			suffix = "s";
+		else if (is_nd_pfn(ndns->claim))
+			suffix = "m";
+		else
+			dev_WARN_ONCE(&ndns->dev, 1,
+					"unknown claim type by %s\n",
+					dev_name(ndns->claim));
+	}
 
-	if (is_namespace_pmem(&ndns->dev) || is_namespace_io(&ndns->dev))
-		sprintf(name, "pmem%d%s", nd_region->id, suffix);
-	else if (is_namespace_blk(&ndns->dev)) {
+	if (is_namespace_pmem(&ndns->dev) || is_namespace_io(&ndns->dev)) {
+		if (!suffix && pmem_should_map_pages(&ndns->dev))
+			suffix = "m";
+		sprintf(name, "pmem%d%s", nd_region->id, suffix ? suffix : "");
+	} else if (is_namespace_blk(&ndns->dev)) {
 		struct nd_namespace_blk *nsblk;
 
 		nsblk = to_nd_namespace_blk(&ndns->dev);
-		sprintf(name, "ndblk%d.%d%s", nd_region->id, nsblk->id, suffix);
+		sprintf(name, "ndblk%d.%d%s", nd_region->id, nsblk->id,
+				suffix ? suffix : "");
 	} else {
 		return NULL;
 	}
@@ -99,6 +185,26 @@ const char *nvdimm_namespace_disk_name(struct nd_namespace_common *ndns,
 	return name;
 }
 EXPORT_SYMBOL(nvdimm_namespace_disk_name);
+
+const u8 *nd_dev_to_uuid(struct device *dev)
+{
+	static const u8 null_uuid[16];
+
+	if (!dev)
+		return null_uuid;
+
+	if (is_namespace_pmem(dev)) {
+		struct nd_namespace_pmem *nspm = to_nd_namespace_pmem(dev);
+
+		return nspm->uuid;
+	} else if (is_namespace_blk(dev)) {
+		struct nd_namespace_blk *nsblk = to_nd_namespace_blk(dev);
+
+		return nsblk->uuid;
+	} else
+		return null_uuid;
+}
+EXPORT_SYMBOL(nd_dev_to_uuid);
 
 static ssize_t nstype_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
@@ -1199,7 +1305,7 @@ static umode_t namespace_visible(struct kobject *kobj,
 	if (a == &dev_attr_resource.attr) {
 		if (is_namespace_blk(dev))
 			return 0;
-		return a->mode;
+		return 0400;
 	}
 
 	if (is_namespace_pmem(dev) || is_namespace_blk(dev)) {
@@ -1235,12 +1341,22 @@ static const struct attribute_group *nd_namespace_attribute_groups[] = {
 struct nd_namespace_common *nvdimm_namespace_common_probe(struct device *dev)
 {
 	struct nd_btt *nd_btt = is_nd_btt(dev) ? to_nd_btt(dev) : NULL;
+	struct nd_pfn *nd_pfn = is_nd_pfn(dev) ? to_nd_pfn(dev) : NULL;
 	struct nd_namespace_common *ndns;
 	resource_size_t size;
 
-	if (nd_btt) {
-		ndns = nd_btt->ndns;
-		if (!ndns)
+	if (nd_btt || nd_pfn) {
+		struct device *host = NULL;
+
+		if (nd_btt) {
+			host = &nd_btt->dev;
+			ndns = nd_btt->ndns;
+		} else if (nd_pfn) {
+			host = &nd_pfn->dev;
+			ndns = nd_pfn->ndns;
+		}
+
+		if (!ndns || !host)
 			return ERR_PTR(-ENODEV);
 
 		/*
@@ -1251,12 +1367,12 @@ struct nd_namespace_common *nvdimm_namespace_common_probe(struct device *dev)
 		device_unlock(&ndns->dev);
 		if (ndns->dev.driver) {
 			dev_dbg(&ndns->dev, "is active, can't bind %s\n",
-					dev_name(&nd_btt->dev));
+					dev_name(host));
 			return ERR_PTR(-EBUSY);
 		}
-		if (dev_WARN_ONCE(&ndns->dev, ndns->claim != &nd_btt->dev,
+		if (dev_WARN_ONCE(&ndns->dev, ndns->claim != host,
 					"host (%s) vs claim (%s) mismatch\n",
-					dev_name(&nd_btt->dev),
+					dev_name(host),
 					dev_name(ndns->claim)))
 			return ERR_PTR(-ENXIO);
 	} else {
@@ -1418,6 +1534,7 @@ static int select_pmem_id(struct nd_region *nd_region, u8 *pmem_id)
 static int find_pmem_label_set(struct nd_region *nd_region,
 		struct nd_namespace_pmem *nspm)
 {
+	u64 altcookie = nd_region_interleave_set_altcookie(nd_region);
 	u64 cookie = nd_region_interleave_set_cookie(nd_region);
 	struct nd_namespace_label *nd_label;
 	u8 select_id[NSLABEL_UUID_LEN];
@@ -1426,8 +1543,10 @@ static int find_pmem_label_set(struct nd_region *nd_region,
 	int rc = -ENODEV, l;
 	u16 i;
 
-	if (cookie == 0)
+	if (cookie == 0) {
+		dev_dbg(&nd_region->dev, "invalid interleave-set-cookie\n");
 		return -ENXIO;
+	}
 
 	/*
 	 * Find a complete set of labels by uuid.  By definition we can start
@@ -1436,13 +1555,24 @@ static int find_pmem_label_set(struct nd_region *nd_region,
 	for_each_label(l, nd_label, nd_region->mapping[0].labels) {
 		u64 isetcookie = __le64_to_cpu(nd_label->isetcookie);
 
-		if (isetcookie != cookie)
-			continue;
+		if (isetcookie != cookie) {
+			dev_dbg(&nd_region->dev, "invalid cookie in label: %pUb\n",
+					nd_label->uuid);
+			if (isetcookie != altcookie)
+				continue;
 
-		for (i = 0; nd_region->ndr_mappings; i++)
-			if (!has_uuid_at_pos(nd_region, nd_label->uuid,
-						cookie, i))
-				break;
+			dev_dbg(&nd_region->dev, "valid altcookie in label: %pUb\n",
+					nd_label->uuid);
+		}
+
+		for (i = 0; nd_region->ndr_mappings; i++) {
+			if (has_uuid_at_pos(nd_region, nd_label->uuid, cookie, i))
+				continue;
+			if (has_uuid_at_pos(nd_region, nd_label->uuid, altcookie, i))
+				continue;
+			break;
+		}
+
 		if (i < nd_region->ndr_mappings) {
 			/*
 			 * Give up if we don't find an instance of a

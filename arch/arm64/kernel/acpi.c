@@ -24,10 +24,16 @@
 #include <linux/memblock.h>
 #include <linux/of_fdt.h>
 #include <linux/smp.h>
+#include <linux/serial_core.h>
 
 #include <asm/cputype.h>
 #include <asm/cpu_ops.h>
 #include <asm/smp_plat.h>
+
+#ifdef CONFIG_ACPI_APEI
+# include <linux/efi.h>
+# include <asm/pgtable.h>
+#endif
 
 int acpi_noirq = 1;		/* skip ACPI IRQ initialization */
 int acpi_disabled = 1;
@@ -136,10 +142,14 @@ static int __init acpi_fadt_sanity_check(void)
 	 */
 	if (table->revision < 5 ||
 	   (table->revision == 5 && fadt->minor_revision < 1)) {
-		pr_err("Unsupported FADT revision %d.%d, should be 5.1+\n",
+		pr_err(FW_BUG "Unsupported FADT revision %d.%d, should be 5.1+\n",
 		       table->revision, fadt->minor_revision);
-		ret = -EINVAL;
-		goto out;
+
+		if (!fadt->arm_boot_flags) {
+			ret = -EINVAL;
+			goto out;
+		}
+		pr_err("FADT has ARM boot flags set, assuming 5.1\n");
 	}
 
 	if (!(fadt->flags & ACPI_FADT_HW_REDUCED)) {
@@ -184,7 +194,7 @@ void __init acpi_boot_table_init(void)
 	 */
 	if (param_acpi_off ||
 	    (!param_acpi_force && of_scan_flat_dt(dt_scan_depth1_nodes, NULL)))
-		return;
+		goto done;
 
 	/*
 	 * ACPI is disabled at this point. Enable it in order to parse
@@ -204,29 +214,36 @@ void __init acpi_boot_table_init(void)
 		if (!param_acpi_force)
 			disable_acpi();
 	}
-}
 
-void __init acpi_gic_init(void)
-{
-	struct acpi_table_header *table;
-	acpi_status status;
-	acpi_size tbl_size;
-	int err;
-
-	if (acpi_disabled)
-		return;
-
-	status = acpi_get_table_with_size(ACPI_SIG_MADT, 0, &table, &tbl_size);
-	if (ACPI_FAILURE(status)) {
-		const char *msg = acpi_format_exception(status);
-
-		pr_err("Failed to get MADT table, %s\n", msg);
-		return;
+done:
+	if (acpi_disabled) {
+		if (earlycon_init_is_deferred)
+			early_init_dt_scan_chosen_stdout();
+	} else {
+		parse_spcr(earlycon_init_is_deferred);
 	}
-
-	err = gic_v2_acpi_init(table);
-	if (err)
-		pr_err("Failed to initialize GIC IRQ controller");
-
-	early_acpi_os_unmap_memory((char *)table, tbl_size);
 }
+
+#ifdef CONFIG_ACPI_APEI
+pgprot_t arch_apei_get_mem_attribute(phys_addr_t addr)
+{
+	/*
+	 * According to "Table 8 Map: EFI memory types to AArch64 memory
+	 * types" of UEFI 2.5 section 2.3.6.1, each EFI memory type is
+	 * mapped to a corresponding MAIR attribute encoding.
+	 * The EFI memory attribute advises all possible capabilities
+	 * of a memory region. We use the most efficient capability.
+	 */
+
+	u64 attr;
+
+	attr = efi_mem_attributes(addr);
+	if (attr & EFI_MEMORY_WB)
+		return PAGE_KERNEL;
+	if (attr & EFI_MEMORY_WT)
+		return __pgprot(PROT_NORMAL_WT);
+	if (attr & EFI_MEMORY_WC)
+		return __pgprot(PROT_NORMAL_NC);
+	return __pgprot(PROT_DEVICE_nGnRnE);
+}
+#endif

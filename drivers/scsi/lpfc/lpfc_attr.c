@@ -634,7 +634,12 @@ lpfc_issue_lip(struct Scsi_Host *shost)
 	LPFC_MBOXQ_t *pmboxq;
 	int mbxstatus = MBXERR_ERROR;
 
+	/*
+	 * If the link is offline, disabled or BLOCK_MGMT_IO
+	 * it doesn't make any sense to allow issue_lip
+	 */
 	if ((vport->fc_flag & FC_OFFLINE_MODE) ||
+	    (phba->hba_flag & LINK_DISABLED) ||
 	    (phba->sli.sli_flag & LPFC_BLOCK_MGMT_IO))
 		return -EPERM;
 
@@ -1208,6 +1213,9 @@ lpfc_get_hba_info(struct lpfc_hba *phba,
 		max_vpi = (bf_get(lpfc_mbx_rd_conf_vpi_count, rd_config) > 0) ?
 			(bf_get(lpfc_mbx_rd_conf_vpi_count, rd_config) - 1) : 0;
 
+		/* Limit the max we support */
+		if (max_vpi > LPFC_MAX_VPI)
+			max_vpi = LPFC_MAX_VPI;
 		if (mvpi)
 			*mvpi = max_vpi;
 		if (avpi)
@@ -1223,8 +1231,13 @@ lpfc_get_hba_info(struct lpfc_hba *phba,
 			*axri = pmb->un.varRdConfig.avail_xri;
 		if (mvpi)
 			*mvpi = pmb->un.varRdConfig.max_vpi;
-		if (avpi)
-			*avpi = pmb->un.varRdConfig.avail_vpi;
+		if (avpi) {
+			/* avail_vpi is only valid if link is up and ready */
+			if (phba->link_state == LPFC_HBA_READY)
+				*avpi = pmb->un.varRdConfig.avail_vpi;
+			else
+				*avpi = pmb->un.varRdConfig.max_vpi;
+		}
 	}
 
 	mempool_free(pmboxq, phba->mbox_mem_pool);
@@ -1642,8 +1655,6 @@ lpfc_##attr##_show(struct device *dev, struct device_attribute *attr, \
 	struct Scsi_Host  *shost = class_to_shost(dev);\
 	struct lpfc_vport *vport = (struct lpfc_vport *) shost->hostdata;\
 	struct lpfc_hba   *phba = vport->phba;\
-	uint val = 0;\
-	val = phba->cfg_##attr;\
 	return snprintf(buf, PAGE_SIZE, "%d\n",\
 			phba->cfg_##attr);\
 }
@@ -1808,8 +1819,6 @@ lpfc_##attr##_show(struct device *dev, struct device_attribute *attr, \
 { \
 	struct Scsi_Host  *shost = class_to_shost(dev);\
 	struct lpfc_vport *vport = (struct lpfc_vport *) shost->hostdata;\
-	uint val = 0;\
-	val = vport->cfg_##attr;\
 	return snprintf(buf, PAGE_SIZE, "%d\n", vport->cfg_##attr);\
 }
 
@@ -1835,8 +1844,6 @@ lpfc_##attr##_show(struct device *dev, struct device_attribute *attr, \
 { \
 	struct Scsi_Host  *shost = class_to_shost(dev);\
 	struct lpfc_vport *vport = (struct lpfc_vport *) shost->hostdata;\
-	uint val = 0;\
-	val = vport->cfg_##attr;\
 	return snprintf(buf, PAGE_SIZE, "%#x\n", vport->cfg_##attr);\
 }
 
@@ -3282,15 +3289,20 @@ lpfc_topology_store(struct device *dev, struct device_attribute *attr,
 
 	if (val >= 0 && val <= 6) {
 		prev_val = phba->cfg_topology;
-		phba->cfg_topology = val;
 		if (phba->cfg_link_speed == LPFC_USER_LINK_SPEED_16G &&
 			val == 4) {
 			lpfc_printf_vlog(vport, KERN_ERR, LOG_INIT,
 				"3113 Loop mode not supported at speed %d\n",
-				phba->cfg_link_speed);
-			phba->cfg_topology = prev_val;
+				val);
 			return -EINVAL;
 		}
+		if (phba->pcidev->device == PCI_DEVICE_ID_LANCER_G6_FC &&
+			val == 4) {
+			lpfc_printf_vlog(vport, KERN_ERR, LOG_INIT,
+				"3114 Loop mode not supported\n");
+			return -EINVAL;
+		}
+		phba->cfg_topology = val;
 		if (nolip)
 			return strlen(buf);
 
@@ -3731,7 +3743,8 @@ lpfc_link_speed_store(struct device *dev, struct device_attribute *attr,
 	    ((val == LPFC_USER_LINK_SPEED_4G) && !(phba->lmt & LMT_4Gb)) ||
 	    ((val == LPFC_USER_LINK_SPEED_8G) && !(phba->lmt & LMT_8Gb)) ||
 	    ((val == LPFC_USER_LINK_SPEED_10G) && !(phba->lmt & LMT_10Gb)) ||
-	    ((val == LPFC_USER_LINK_SPEED_16G) && !(phba->lmt & LMT_16Gb))) {
+	    ((val == LPFC_USER_LINK_SPEED_16G) && !(phba->lmt & LMT_16Gb)) ||
+	    ((val == LPFC_USER_LINK_SPEED_32G) && !(phba->lmt & LMT_32Gb))) {
 		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
 				"2879 lpfc_link_speed attribute cannot be set "
 				"to %d. Speed is not supported by this port.\n",
@@ -4572,19 +4585,27 @@ LPFC_ATTR_R(multi_ring_type, FC_TYPE_IP, 1,
 	     255, "Identifies TYPE for additional ring configuration");
 
 /*
-# lpfc_fdmi_on: controls FDMI support.
-#               Set                NOT Set
-#       bit 0 = FDMI support       no FDMI support
-#           LPFC_FDMI_SUPPORT just turns basic support on/off
-#       bit 1 = Register delay     no register delay  (60 seconds)
-#           LPFC_FDMI_REG_DELAY	60 sec registration delay after FDMI login
-#       bit 2 = All attributes     Use a attribute subset
-#           LPFC_FDMI_ALL_ATTRIB applies to both port and HBA attributes
-#           Port attrutes subset: 1 thru 6 OR all: 1 thru 0xd 0x101 0x102 0x103
-#           HBA attributes subset: 1 thru 0xb OR all: 1 thru 0xc
-# Value range [0,7]. Default value is 0.
+# lpfc_enable_SmartSAN: Sets up FDMI support for SmartSAN
+#       0  = SmartSAN functionality disabled (default)
+#       1  = SmartSAN functionality enabled
+# This parameter will override the value of lpfc_fdmi_on module parameter.
+# Value range is [0,1]. Default value is 0.
 */
-LPFC_VPORT_ATTR_RW(fdmi_on, 0, 0, 7, "Enable FDMI support");
+LPFC_ATTR_R(enable_SmartSAN, 0, 0, 1, "Enable SmartSAN functionality");
+
+/*
+# lpfc_fdmi_on: Controls FDMI support.
+#       0       No FDMI support (default)
+#       1       Traditional FDMI support
+#       2       Smart SAN support
+# If lpfc_enable_SmartSAN is set 1, the driver sets lpfc_fdmi_on to value 2
+# overwriting the current value.  If lpfc_enable_SmartSAN is set 0, the
+# driver uses the current value of lpfc_fdmi_on provided it has value 0 or 1.
+# A value of 2 with lpfc_enable_SmartSAN set to 0 causes the driver to
+# set lpfc_fdmi_on back to 1.
+# Value range [0,2]. Default value is 0.
+*/
+LPFC_ATTR_R(fdmi_on, 0, 0, 2, "Enable FDMI support");
 
 /*
 # Specifies the maximum number of ELS cmds we can have outstanding (for
@@ -4815,6 +4836,7 @@ struct device_attribute *lpfc_hba_attrs[] = {
 	&dev_attr_lpfc_multi_ring_rctl,
 	&dev_attr_lpfc_multi_ring_type,
 	&dev_attr_lpfc_fdmi_on,
+	&dev_attr_lpfc_enable_SmartSAN,
 	&dev_attr_lpfc_max_luns,
 	&dev_attr_lpfc_enable_npiv,
 	&dev_attr_lpfc_fcf_failover_policy,
@@ -4887,7 +4909,6 @@ struct device_attribute *lpfc_vport_attrs[] = {
 	&dev_attr_lpfc_fcp_class,
 	&dev_attr_lpfc_use_adisc,
 	&dev_attr_lpfc_first_burst_size,
-	&dev_attr_lpfc_fdmi_on,
 	&dev_attr_lpfc_max_luns,
 	&dev_attr_nport_evt_cnt,
 	&dev_attr_npiv_info,
@@ -5148,6 +5169,19 @@ lpfc_free_sysfs_attr(struct lpfc_vport *vport)
  */
 
 /**
+ * lpfc_get_host_symbolic_name - Copy symbolic name into the scsi host
+ * @shost: kernel scsi host pointer.
+ **/
+static void
+lpfc_get_host_symbolic_name(struct Scsi_Host *shost)
+{
+	struct lpfc_vport *vport = (struct lpfc_vport *)shost->hostdata;
+
+	lpfc_vport_symbolic_node_name(vport, fc_host_symbolic_name(shost),
+				      sizeof fc_host_symbolic_name(shost));
+}
+
+/**
  * lpfc_get_host_port_id - Copy the vport DID into the scsi host port id
  * @shost: kernel scsi host pointer.
  **/
@@ -5247,7 +5281,7 @@ lpfc_get_host_speed(struct Scsi_Host *shost)
 
 	spin_lock_irq(shost->host_lock);
 
-	if (lpfc_is_link_up(phba)) {
+	if ((lpfc_is_link_up(phba)) && (!(phba->hba_flag & HBA_FCOE_MODE))) {
 		switch(phba->fc_linkspeed) {
 		case LPFC_LINK_SPEED_1GHZ:
 			fc_host_speed(shost) = FC_PORTSPEED_1GBIT;
@@ -5266,6 +5300,9 @@ lpfc_get_host_speed(struct Scsi_Host *shost)
 			break;
 		case LPFC_LINK_SPEED_16GHZ:
 			fc_host_speed(shost) = FC_PORTSPEED_16GBIT;
+			break;
+		case LPFC_LINK_SPEED_32GHZ:
+			fc_host_speed(shost) = FC_PORTSPEED_32GBIT;
 			break;
 		default:
 			fc_host_speed(shost) = FC_PORTSPEED_UNKNOWN;
@@ -5681,6 +5718,8 @@ struct fc_function_template lpfc_transport_functions = {
 	.show_host_supported_fc4s = 1,
 	.show_host_supported_speeds = 1,
 	.show_host_maxframe_size = 1,
+
+	.get_host_symbolic_name = lpfc_get_host_symbolic_name,
 	.show_host_symbolic_name = 1,
 
 	/* dynamic attributes the driver supports */
@@ -5748,6 +5787,8 @@ struct fc_function_template lpfc_vport_transport_functions = {
 	.show_host_supported_fc4s = 1,
 	.show_host_supported_speeds = 1,
 	.show_host_maxframe_size = 1,
+
+	.get_host_symbolic_name = lpfc_get_host_symbolic_name,
 	.show_host_symbolic_name = 1,
 
 	/* dynamic attributes the driver supports */
@@ -5823,6 +5864,8 @@ lpfc_get_cfgparam(struct lpfc_hba *phba)
 	lpfc_enable_npiv_init(phba, lpfc_enable_npiv);
 	lpfc_fcf_failover_policy_init(phba, lpfc_fcf_failover_policy);
 	lpfc_enable_rrq_init(phba, lpfc_enable_rrq);
+	lpfc_fdmi_on_init(phba, lpfc_fdmi_on);
+	lpfc_enable_SmartSAN_init(phba, lpfc_enable_SmartSAN);
 	lpfc_use_msi_init(phba, lpfc_use_msi);
 	lpfc_fcp_imax_init(phba, lpfc_fcp_imax);
 	lpfc_fcp_cpu_map_init(phba, lpfc_fcp_cpu_map);
@@ -5843,6 +5886,15 @@ lpfc_get_cfgparam(struct lpfc_hba *phba)
 		phba->cfg_poll = 0;
 	else
 		phba->cfg_poll = lpfc_poll;
+
+	/* Ensure fdmi_on and enable_SmartSAN don't conflict */
+	if (phba->cfg_enable_SmartSAN) {
+		phba->cfg_fdmi_on = LPFC_FDMI_SMART_SAN;
+	} else {
+		if (phba->cfg_fdmi_on == LPFC_FDMI_SMART_SAN)
+			phba->cfg_fdmi_on = LPFC_FDMI_SUPPORT;
+	}
+
 	phba->cfg_soft_wwnn = 0L;
 	phba->cfg_soft_wwpn = 0L;
 	lpfc_sg_seg_cnt_init(phba, lpfc_sg_seg_cnt);
@@ -5876,7 +5928,6 @@ lpfc_get_vport_cfgparam(struct lpfc_vport *vport)
 	lpfc_use_adisc_init(vport, lpfc_use_adisc);
 	lpfc_first_burst_size_init(vport, lpfc_first_burst_size);
 	lpfc_max_scsicmpl_time_init(vport, lpfc_max_scsicmpl_time);
-	lpfc_fdmi_on_init(vport, lpfc_fdmi_on);
 	lpfc_discovery_threads_init(vport, lpfc_discovery_threads);
 	lpfc_max_luns_init(vport, lpfc_max_luns);
 	lpfc_scan_down_init(vport, lpfc_scan_down);

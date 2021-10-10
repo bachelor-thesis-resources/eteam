@@ -73,6 +73,10 @@
 #define EDID_QUIRK_FORCE_8BPC			(1 << 8)
 /* Force 12bpc */
 #define EDID_QUIRK_FORCE_12BPC			(1 << 9)
+/* Force 6bpc */
+#define EDID_QUIRK_FORCE_6BPC			(1 << 10)
+/* Force 10bpc */
+#define EDID_QUIRK_FORCE_10BPC			(1 << 11)
 
 struct detailed_mode_closure {
 	struct drm_connector *connector;
@@ -99,6 +103,12 @@ static struct edid_quirk {
 	/* Unknown Acer */
 	{ "ACR", 2423, EDID_QUIRK_FIRST_DETAILED_PREFERRED },
 
+	/* AEO model 0 reports 8 bpc, but is a 6 bpc panel */
+	{ "AEO", 0, EDID_QUIRK_FORCE_6BPC },
+
+	/* CPT panel of Asus UX303LA reports 8 bpc, but is a 6 bpc panel */
+	{ "CPT", 0x17df, EDID_QUIRK_FORCE_6BPC },
+
 	/* Belinea 10 15 55 */
 	{ "MAX", 1516, EDID_QUIRK_PREFER_LARGE_60 },
 	{ "MAX", 0x77e, EDID_QUIRK_PREFER_LARGE_60 },
@@ -111,6 +121,9 @@ static struct edid_quirk {
 	/* Funai Electronics PM36B */
 	{ "FCM", 13600, EDID_QUIRK_PREFER_LARGE_75 |
 	  EDID_QUIRK_DETAILED_IN_CM },
+
+	/* LGD panel of HP zBook 17 G2, eDP 10 bpc, but reports unknown bpc */
+	{ "LGD", 764, EDID_QUIRK_FORCE_10BPC },
 
 	/* LG Philips LCD LP154W01-A5 */
 	{ "LPL", 0, EDID_QUIRK_DETAILED_USE_MAXIMUM_SIZE },
@@ -137,8 +150,14 @@ static struct edid_quirk {
 	/* Medion MD 30217 PG */
 	{ "MED", 0x7b8, EDID_QUIRK_PREFER_LARGE_75 },
 
+	/* Lenovo G50 */
+	{ "SDC", 18514, EDID_QUIRK_FORCE_6BPC },
+
 	/* Panel in Samsung NP700G7A-S01PL notebook reports 6bpc */
 	{ "SEC", 0xd033, EDID_QUIRK_FORCE_8BPC },
+
+	/* Rotel RSX-1058 forwards sink's EDID but only does HDMI 1.1*/
+	{ "ETR", 13896, EDID_QUIRK_FORCE_8BPC },
 };
 
 /*
@@ -2044,7 +2063,7 @@ mode_in_range(const struct drm_display_mode *mode, struct edid *edid,
 static bool valid_inferred_mode(const struct drm_connector *connector,
 				const struct drm_display_mode *mode)
 {
-	struct drm_display_mode *m;
+	const struct drm_display_mode *m;
 	bool ok = false;
 
 	list_for_each_entry(m, &connector->probed_modes, head) {
@@ -2418,6 +2437,8 @@ add_cvt_modes(struct drm_connector *connector, struct edid *edid)
 	return closure.modes;
 }
 
+static void fixup_detailed_cea_mode_clock(struct drm_display_mode *mode);
+
 static void
 do_detailed_mode(struct detailed_timing *timing, void *c)
 {
@@ -2433,6 +2454,13 @@ do_detailed_mode(struct detailed_timing *timing, void *c)
 
 		if (closure->preferred)
 			newmode->type |= DRM_MODE_TYPE_PREFERRED;
+
+		/*
+		 * Detailed modes are limited to 10kHz pixel clock resolution,
+		 * so fix up anything that looks like CEA/HDMI mode, but the clock
+		 * is just slightly off.
+		 */
+		fixup_detailed_cea_mode_clock(newmode);
 
 		drm_mode_probed_add(closure->connector, newmode);
 		closure->modes++;
@@ -2529,9 +2557,9 @@ cea_mode_alternate_clock(const struct drm_display_mode *cea_mode)
 	 * and the 60Hz variant otherwise.
 	 */
 	if (cea_mode->vdisplay == 240 || cea_mode->vdisplay == 480)
-		clock = clock * 1001 / 1000;
+		clock = DIV_ROUND_CLOSEST(clock * 1001, 1000);
 	else
-		clock = DIV_ROUND_UP(clock * 1000, 1001);
+		clock = DIV_ROUND_CLOSEST(clock * 1000, 1001);
 
 	return clock;
 }
@@ -3103,6 +3131,45 @@ add_cea_modes(struct drm_connector *connector, struct edid *edid)
 	return modes;
 }
 
+static void fixup_detailed_cea_mode_clock(struct drm_display_mode *mode)
+{
+	const struct drm_display_mode *cea_mode;
+	int clock1, clock2, clock;
+	u8 mode_idx;
+	const char *type;
+
+	mode_idx = drm_match_cea_mode(mode) - 1;
+	if (mode_idx < ARRAY_SIZE(edid_cea_modes)) {
+		type = "CEA";
+		cea_mode = &edid_cea_modes[mode_idx];
+		clock1 = cea_mode->clock;
+		clock2 = cea_mode_alternate_clock(cea_mode);
+	} else {
+		mode_idx = drm_match_hdmi_mode(mode) - 1;
+		if (mode_idx < ARRAY_SIZE(edid_4k_modes)) {
+			type = "HDMI";
+			cea_mode = &edid_4k_modes[mode_idx];
+			clock1 = cea_mode->clock;
+			clock2 = hdmi_mode_alternate_clock(cea_mode);
+		} else {
+			return;
+		}
+	}
+
+	/* pick whichever is closest */
+	if (abs(mode->clock - clock1) < abs(mode->clock - clock2))
+		clock = clock1;
+	else
+		clock = clock2;
+
+	if (mode->clock == clock)
+		return;
+
+	DRM_DEBUG("detailed mode matches %s VIC %d, adjusting clock %d -> %d\n",
+		  type, mode_idx + 1, mode->clock, clock);
+	mode->clock = clock;
+}
+
 static void
 parse_hdmi_vsdb(struct drm_connector *connector, const u8 *db)
 {
@@ -3155,8 +3222,7 @@ monitor_name(struct detailed_timing *t, void *data)
  * @edid: EDID to parse
  *
  * Fill the ELD (EDID-Like Data) buffer for passing to the audio driver. The
- * Conn_Type, HDCP and Port_ID ELD fields are left for the graphics driver to
- * fill in.
+ * HDCP and Port_ID ELD fields are left for the graphics driver to fill in.
  */
 void drm_edid_to_eld(struct drm_connector *connector, struct edid *edid)
 {
@@ -3228,6 +3294,12 @@ void drm_edid_to_eld(struct drm_connector *connector, struct edid *edid)
 		}
 	}
 	eld[5] |= sad_count << 4;
+
+	if (connector->connector_type == DRM_MODE_CONNECTOR_DisplayPort ||
+	    connector->connector_type == DRM_MODE_CONNECTOR_eDP)
+		eld[DRM_ELD_SAD_COUNT_CONN_TYPE] |= DRM_ELD_CONN_TYPE_DP;
+	else
+		eld[DRM_ELD_SAD_COUNT_CONN_TYPE] |= DRM_ELD_CONN_TYPE_HDMI;
 
 	eld[DRM_ELD_BASELINE_ELD_LEN] =
 		DIV_ROUND_UP(drm_eld_calc_baseline_block_size(eld), 4);
@@ -3361,7 +3433,7 @@ EXPORT_SYMBOL(drm_edid_to_speaker_allocation);
  * the sink doesn't support audio or video.
  */
 int drm_av_sync_delay(struct drm_connector *connector,
-		      struct drm_display_mode *mode)
+		      const struct drm_display_mode *mode)
 {
 	int i = !!(mode->flags & DRM_MODE_FLAG_INTERLACE);
 	int a, v;
@@ -3396,7 +3468,6 @@ EXPORT_SYMBOL(drm_av_sync_delay);
 /**
  * drm_select_eld - select one ELD from multiple HDMI/DP sinks
  * @encoder: the encoder just changed display mode
- * @mode: the adjusted display mode
  *
  * It's possible for one encoder to be associated with multiple HDMI/DP sinks.
  * The policy is now hard coded to simply use the first HDMI/DP sink's ELD.
@@ -3404,8 +3475,7 @@ EXPORT_SYMBOL(drm_av_sync_delay);
  * Return: The connector associated with the first HDMI/DP sink that has ELD
  * attached to it.
  */
-struct drm_connector *drm_select_eld(struct drm_encoder *encoder,
-				     struct drm_display_mode *mode)
+struct drm_connector *drm_select_eld(struct drm_encoder *encoder)
 {
 	struct drm_connector *connector;
 	struct drm_device *dev = encoder->dev;
@@ -3413,7 +3483,7 @@ struct drm_connector *drm_select_eld(struct drm_encoder *encoder,
 	WARN_ON(!mutex_is_locked(&dev->mode_config.mutex));
 	WARN_ON(!drm_modeset_is_locked(&dev->mode_config.connection_mutex));
 
-	list_for_each_entry(connector, &dev->mode_config.connector_list, head)
+	drm_for_each_connector(connector, dev)
 		if (connector->encoder == encoder && connector->eld[0])
 			return connector;
 
@@ -3774,8 +3844,14 @@ int drm_add_edid_modes(struct drm_connector *connector, struct edid *edid)
 
 	drm_add_display_info(edid, &connector->display_info, connector);
 
+	if (quirks & EDID_QUIRK_FORCE_6BPC)
+		connector->display_info.bpc = 6;
+
 	if (quirks & EDID_QUIRK_FORCE_8BPC)
 		connector->display_info.bpc = 8;
+
+	if (quirks & EDID_QUIRK_FORCE_10BPC)
+		connector->display_info.bpc = 10;
 
 	if (quirks & EDID_QUIRK_FORCE_12BPC)
 		connector->display_info.bpc = 12;
@@ -3802,7 +3878,7 @@ int drm_add_modes_noedid(struct drm_connector *connector,
 	struct drm_display_mode *mode;
 	struct drm_device *dev = connector->dev;
 
-	count = sizeof(drm_dmt_modes) / sizeof(struct drm_display_mode);
+	count = ARRAY_SIZE(drm_dmt_modes);
 	if (hdisplay < 0)
 		hdisplay = 0;
 	if (vdisplay < 0)

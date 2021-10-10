@@ -110,13 +110,26 @@ static int atusb_read_reg(struct atusb *atusb, uint8_t reg)
 {
 	struct usb_device *usb_dev = atusb->usb_dev;
 	int ret;
+	uint8_t *buffer;
 	uint8_t value;
+
+	buffer = kmalloc(1, GFP_KERNEL);
+	if (!buffer)
+		return -ENOMEM;
 
 	dev_dbg(&usb_dev->dev, "atusb: reg = 0x%x\n", reg);
 	ret = atusb_control_msg(atusb, usb_rcvctrlpipe(usb_dev, 0),
 				ATUSB_REG_READ, ATUSB_REQ_FROM_DEV,
-				0, reg, &value, 1, 1000);
-	return ret >= 0 ? value : ret;
+				0, reg, buffer, 1, 1000);
+
+	if (ret >= 0) {
+		value = buffer[0];
+		kfree(buffer);
+		return value;
+	} else {
+		kfree(buffer);
+		return ret;
+	}
 }
 
 static int atusb_write_subreg(struct atusb *atusb, uint8_t reg, uint8_t mask,
@@ -517,8 +530,12 @@ static struct ieee802154_ops atusb_ops = {
 static int atusb_get_and_show_revision(struct atusb *atusb)
 {
 	struct usb_device *usb_dev = atusb->usb_dev;
-	unsigned char buffer[3];
+	unsigned char *buffer;
 	int ret;
+
+	buffer = kmalloc(3, GFP_KERNEL);
+	if (!buffer)
+		return -ENOMEM;
 
 	/* Get a couple of the ATMega Firmware values */
 	ret = atusb_control_msg(atusb, usb_rcvctrlpipe(usb_dev, 0),
@@ -535,14 +552,19 @@ static int atusb_get_and_show_revision(struct atusb *atusb)
 		dev_info(&usb_dev->dev, "Please update to version 0.2 or newer");
 	}
 
+	kfree(buffer);
 	return ret;
 }
 
 static int atusb_get_and_show_build(struct atusb *atusb)
 {
 	struct usb_device *usb_dev = atusb->usb_dev;
-	char build[ATUSB_BUILD_SIZE + 1];
+	char *build;
 	int ret;
+
+	build = kmalloc(ATUSB_BUILD_SIZE + 1, GFP_KERNEL);
+	if (!build)
+		return -ENOMEM;
 
 	ret = atusb_control_msg(atusb, usb_rcvctrlpipe(usb_dev, 0),
 				ATUSB_BUILD, ATUSB_REQ_FROM_DEV, 0, 0,
@@ -552,6 +574,7 @@ static int atusb_get_and_show_build(struct atusb *atusb)
 		dev_info(&usb_dev->dev, "Firmware: build %s\n", build);
 	}
 
+	kfree(build);
 	return ret;
 }
 
@@ -559,6 +582,7 @@ static int atusb_get_and_show_chip(struct atusb *atusb)
 {
 	struct usb_device *usb_dev = atusb->usb_dev;
 	uint8_t man_id_0, man_id_1, part_num, version_num;
+	const char *chip;
 
 	man_id_0 = atusb_read_reg(atusb, RG_MAN_ID_0);
 	man_id_1 = atusb_read_reg(atusb, RG_MAN_ID_1);
@@ -574,14 +598,22 @@ static int atusb_get_and_show_chip(struct atusb *atusb)
 			man_id_1, man_id_0);
 		goto fail;
 	}
-	if (part_num != 3 && part_num != 2) {
+
+	switch (part_num) {
+	case 2:
+		chip = "AT86RF230";
+		break;
+	case 3:
+		chip = "AT86RF231";
+		break;
+	default:
 		dev_err(&usb_dev->dev,
 			"unexpected transceiver, part 0x%02x version 0x%02x\n",
 			part_num, version_num);
 		goto fail;
 	}
 
-	dev_info(&usb_dev->dev, "ATUSB: AT86RF231 version %d\n", version_num);
+	dev_info(&usb_dev->dev, "ATUSB: %s version %d\n", chip, version_num);
 
 	return 0;
 
@@ -724,10 +756,11 @@ static void atusb_disconnect(struct usb_interface *interface)
 
 	ieee802154_unregister_hw(atusb->hw);
 
+	usb_put_dev(atusb->usb_dev);
+
 	ieee802154_free_hw(atusb->hw);
 
 	usb_set_intfdata(interface, NULL);
-	usb_put_dev(atusb->usb_dev);
 
 	pr_debug("atusb_disconnect done\n");
 }

@@ -1,3 +1,5 @@
+#include <api/fs/fs.h>
+#include <linux/err.h>
 #include "evsel.h"
 #include "tests.h"
 #include "thread_map.h"
@@ -14,6 +16,7 @@ int test__openat_syscall_event_on_all_cpus(void)
 	cpu_set_t cpu_set;
 	struct thread_map *threads = thread_map__new(-1, getpid(), UINT_MAX);
 	char sbuf[STRERR_BUFSIZE];
+	char errbuf[BUFSIZ];
 
 	if (threads == NULL) {
 		pr_debug("thread_map__new\n");
@@ -29,14 +32,10 @@ int test__openat_syscall_event_on_all_cpus(void)
 	CPU_ZERO(&cpu_set);
 
 	evsel = perf_evsel__newtp("syscalls", "sys_enter_openat");
-	if (evsel == NULL) {
-		if (tracefs_configured())
-			pr_debug("is tracefs mounted on /sys/kernel/tracing?\n");
-		else if (debugfs_configured())
-			pr_debug("is debugfs mounted on /sys/kernel/debug?\n");
-		else
-			pr_debug("Neither tracefs or debugfs is enabled in this kernel\n");
-		goto out_thread_map_delete;
+	if (IS_ERR(evsel)) {
+		tracing_path__strerror_open_tp(errno, errbuf, sizeof(errbuf), "syscalls", "sys_enter_openat");
+		pr_debug("%s\n", errbuf);
+		goto out_cpu_map_delete;
 	}
 
 	if (perf_evsel__open(evsel, cpus, threads) < 0) {
@@ -110,6 +109,8 @@ out_close_fd:
 	perf_evsel__close_fd(evsel, 1, threads->nr);
 out_evsel_delete:
 	perf_evsel__delete(evsel);
+out_cpu_map_delete:
+	cpu_map__put(cpus);
 out_thread_map_delete:
 	thread_map__put(threads);
 	return err;

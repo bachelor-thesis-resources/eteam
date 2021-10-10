@@ -196,7 +196,7 @@ static void slave_event(struct mlx4_dev *dev, u8 slave, struct mlx4_eqe *eqe)
 		return;
 	}
 
-	memcpy(s_eqe, eqe, dev->caps.eqe_size - 1);
+	memcpy(s_eqe, eqe, sizeof(struct mlx4_eqe) - 1);
 	s_eqe->slave_id = slave;
 	/* ensure all information is written before setting the ownersip bit */
 	dma_wmb();
@@ -228,7 +228,8 @@ static void mlx4_set_eq_affinity_hint(struct mlx4_priv *priv, int vec)
 	struct mlx4_dev *dev = &priv->dev;
 	struct mlx4_eq *eq = &priv->eq_table.eq[vec];
 
-	if (!eq->affinity_mask || cpumask_empty(eq->affinity_mask))
+	if (!cpumask_available(eq->affinity_mask) ||
+	    cpumask_empty(eq->affinity_mask))
 		return;
 
 	hint_err = irq_set_affinity_hint(eq->irq, eq->affinity_mask);
@@ -542,8 +543,9 @@ static int mlx4_eq_int(struct mlx4_dev *dev, struct mlx4_eq *eq)
 			break;
 
 		case MLX4_EVENT_TYPE_SRQ_LIMIT:
-			mlx4_dbg(dev, "%s: MLX4_EVENT_TYPE_SRQ_LIMIT\n",
-				 __func__);
+			mlx4_dbg(dev, "%s: MLX4_EVENT_TYPE_SRQ_LIMIT. srq_no=0x%x, eq 0x%x\n",
+				 __func__, be32_to_cpu(eqe->event.srq.srqn),
+				 eq->eqn);
 		case MLX4_EVENT_TYPE_SRQ_CATAS_ERROR:
 			if (mlx4_is_master(dev)) {
 				/* forward only to slave owning the SRQ */
@@ -558,15 +560,19 @@ static int mlx4_eq_int(struct mlx4_dev *dev, struct mlx4_eq *eq)
 						  eq->eqn, eq->cons_index, ret);
 					break;
 				}
-				mlx4_warn(dev, "%s: slave:%d, srq_no:0x%x, event: %02x(%02x)\n",
-					  __func__, slave,
-					  be32_to_cpu(eqe->event.srq.srqn),
-					  eqe->type, eqe->subtype);
+				if (eqe->type ==
+				    MLX4_EVENT_TYPE_SRQ_CATAS_ERROR)
+					mlx4_warn(dev, "%s: slave:%d, srq_no:0x%x, event: %02x(%02x)\n",
+						  __func__, slave,
+						  be32_to_cpu(eqe->event.srq.srqn),
+						  eqe->type, eqe->subtype);
 
 				if (!ret && slave != dev->caps.function) {
-					mlx4_warn(dev, "%s: sending event %02x(%02x) to slave:%d\n",
-						  __func__, eqe->type,
-						  eqe->subtype, slave);
+					if (eqe->type ==
+					    MLX4_EVENT_TYPE_SRQ_CATAS_ERROR)
+						mlx4_warn(dev, "%s: sending event %02x(%02x) to slave:%d\n",
+							  __func__, eqe->type,
+							  eqe->subtype, slave);
 					mlx4_slave_event(dev, slave, eqe);
 					break;
 				}
@@ -924,9 +930,10 @@ static void __iomem *mlx4_get_eq_uar(struct mlx4_dev *dev, struct mlx4_eq *eq)
 
 	if (!priv->eq_table.uar_map[index]) {
 		priv->eq_table.uar_map[index] =
-			ioremap(pci_resource_start(dev->persist->pdev, 2) +
-				((eq->eqn / 4) << PAGE_SHIFT),
-				PAGE_SIZE);
+			ioremap(
+				pci_resource_start(dev->persist->pdev, 2) +
+				((eq->eqn / 4) << (dev->uar_page_shift)),
+				(1 << (dev->uar_page_shift)));
 		if (!priv->eq_table.uar_map[index]) {
 			mlx4_err(dev, "Couldn't map EQ doorbell for EQN 0x%06x\n",
 				 eq->eqn);
@@ -1234,9 +1241,8 @@ int mlx4_init_eq_table(struct mlx4_dev *dev)
 					mlx4_warn(dev, "Failed adding irq rmap\n");
 			}
 #endif
-			err = mlx4_create_eq(dev, dev->caps.num_cqs -
-						  dev->caps.reserved_cqs +
-						  MLX4_NUM_SPARE_EQE,
+			err = mlx4_create_eq(dev, dev->quotas.cq +
+					     MLX4_NUM_SPARE_EQE,
 					     (dev->flags & MLX4_FLAG_MSI_X) ?
 					     i + 1 - !!(i > MLX4_EQ_ASYNC) : 0,
 					     eq);
@@ -1364,6 +1370,10 @@ int mlx4_test_interrupts(struct mlx4_dev *dev)
 	 * and performing a NOP command
 	 */
 	for(i = 0; !err && (i < dev->caps.num_comp_vectors); ++i) {
+		/* Make sure request_irq was called */
+		if (!priv->eq_table.eq[i].have_irq)
+			continue;
+
 		/* Temporary use polling for command completions */
 		mlx4_cmd_use_polling(dev);
 

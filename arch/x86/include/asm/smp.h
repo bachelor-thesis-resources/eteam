@@ -16,19 +16,9 @@
 #endif
 #include <asm/thread_info.h>
 #include <asm/cpumask.h>
-#include <asm/cpufeature.h>
 
 extern int smp_num_siblings;
 extern unsigned int num_processors;
-
-static inline bool cpu_has_ht_siblings(void)
-{
-	bool has_siblings = false;
-#ifdef CONFIG_SMP
-	has_siblings = cpu_has_ht && smp_num_siblings > 1;
-#endif
-	return has_siblings;
-}
 
 DECLARE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_sibling_map);
 DECLARE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_core_map);
@@ -148,6 +138,7 @@ int native_cpu_up(unsigned int cpunum, struct task_struct *tidle);
 int native_cpu_disable(void);
 int common_cpu_die(unsigned int cpu);
 void native_cpu_die(unsigned int cpu);
+void hlt_play_dead(void);
 void native_play_dead(void);
 void play_dead_common(void);
 void wbinvd_on_cpu(int cpu);
@@ -168,6 +159,7 @@ static inline int wbinvd_on_all_cpus(void)
 	wbinvd();
 	return 0;
 }
+#define smp_num_siblings	1
 #endif /* CONFIG_SMP */
 
 extern unsigned disabled_cpus;

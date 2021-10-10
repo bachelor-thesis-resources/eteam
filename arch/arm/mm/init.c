@@ -22,6 +22,7 @@
 #include <linux/memblock.h>
 #include <linux/dma-contiguous.h>
 #include <linux/sizes.h>
+#include <linux/stop_machine.h>
 
 #include <asm/cp15.h>
 #include <asm/mach-types.h>
@@ -610,8 +611,8 @@ static struct section_perm ro_perms[] = {
 		.start  = (unsigned long)_stext,
 		.end    = (unsigned long)__init_begin,
 #ifdef CONFIG_ARM_LPAE
-		.mask   = ~L_PMD_SECT_RDONLY,
-		.prot   = L_PMD_SECT_RDONLY,
+		.mask   = ~(L_PMD_SECT_RDONLY | PMD_SECT_AP2),
+		.prot   = L_PMD_SECT_RDONLY | PMD_SECT_AP2,
 #else
 		.mask   = ~(PMD_SECT_APX | PMD_SECT_AP_WRITE),
 		.prot   = PMD_SECT_APX | PMD_SECT_AP_WRITE,
@@ -627,12 +628,10 @@ static struct section_perm ro_perms[] = {
  * safe to be called with preemption disabled, as under stop_machine().
  */
 static inline void section_update(unsigned long addr, pmdval_t mask,
-				  pmdval_t prot)
+				  pmdval_t prot, struct mm_struct *mm)
 {
-	struct mm_struct *mm;
 	pmd_t *pmd;
 
-	mm = current->active_mm;
 	pmd = pmd_offset(pud_offset(pgd_offset(mm, addr), addr), addr);
 
 #ifdef CONFIG_ARM_LPAE
@@ -656,49 +655,92 @@ static inline bool arch_has_strict_perms(void)
 	return !!(get_cr() & CR_XP);
 }
 
-#define set_section_perms(perms, field)	{				\
-	size_t i;							\
-	unsigned long addr;						\
-									\
-	if (!arch_has_strict_perms())					\
-		return;							\
-									\
-	for (i = 0; i < ARRAY_SIZE(perms); i++) {			\
-		if (!IS_ALIGNED(perms[i].start, SECTION_SIZE) ||	\
-		    !IS_ALIGNED(perms[i].end, SECTION_SIZE)) {		\
-			pr_err("BUG: section %lx-%lx not aligned to %lx\n", \
-				perms[i].start, perms[i].end,		\
-				SECTION_SIZE);				\
-			continue;					\
-		}							\
-									\
-		for (addr = perms[i].start;				\
-		     addr < perms[i].end;				\
-		     addr += SECTION_SIZE)				\
-			section_update(addr, perms[i].mask,		\
-				       perms[i].field);			\
-	}								\
+void set_section_perms(struct section_perm *perms, int n, bool set,
+			struct mm_struct *mm)
+{
+	size_t i;
+	unsigned long addr;
+
+	if (!arch_has_strict_perms())
+		return;
+
+	for (i = 0; i < n; i++) {
+		if (!IS_ALIGNED(perms[i].start, SECTION_SIZE) ||
+		    !IS_ALIGNED(perms[i].end, SECTION_SIZE)) {
+			pr_err("BUG: section %lx-%lx not aligned to %lx\n",
+				perms[i].start, perms[i].end,
+				SECTION_SIZE);
+			continue;
+		}
+
+		for (addr = perms[i].start;
+		     addr < perms[i].end;
+		     addr += SECTION_SIZE)
+			section_update(addr, perms[i].mask,
+				set ? perms[i].prot : perms[i].clear, mm);
+	}
+
 }
 
-static inline void fix_kernmem_perms(void)
+static void update_sections_early(struct section_perm perms[], int n)
 {
-	set_section_perms(nx_perms, prot);
+	struct task_struct *t, *s;
+
+	read_lock(&tasklist_lock);
+	for_each_process(t) {
+		if (t->flags & PF_KTHREAD)
+			continue;
+		for_each_thread(t, s)
+			if (s->mm)
+				set_section_perms(perms, n, true, s->mm);
+	}
+	read_unlock(&tasklist_lock);
+	set_section_perms(perms, n, true, current->active_mm);
+	set_section_perms(perms, n, true, &init_mm);
+}
+
+int __fix_kernmem_perms(void *unused)
+{
+	update_sections_early(nx_perms, ARRAY_SIZE(nx_perms));
+	return 0;
+}
+
+void fix_kernmem_perms(void)
+{
+	stop_machine(__fix_kernmem_perms, NULL, NULL);
 }
 
 #ifdef CONFIG_DEBUG_RODATA
+int __mark_rodata_ro(void *unused)
+{
+	update_sections_early(ro_perms, ARRAY_SIZE(ro_perms));
+	return 0;
+}
+
+static int kernel_set_to_readonly __read_mostly;
+
 void mark_rodata_ro(void)
 {
-	set_section_perms(ro_perms, prot);
+	kernel_set_to_readonly = 1;
+	stop_machine(__mark_rodata_ro, NULL, NULL);
 }
 
 void set_kernel_text_rw(void)
 {
-	set_section_perms(ro_perms, clear);
+	if (!kernel_set_to_readonly)
+		return;
+
+	set_section_perms(ro_perms, ARRAY_SIZE(ro_perms), false,
+				current->active_mm);
 }
 
 void set_kernel_text_ro(void)
 {
-	set_section_perms(ro_perms, prot);
+	if (!kernel_set_to_readonly)
+		return;
+
+	set_section_perms(ro_perms, ARRAY_SIZE(ro_perms), true,
+				current->active_mm);
 }
 #endif /* CONFIG_DEBUG_RODATA */
 

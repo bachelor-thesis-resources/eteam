@@ -935,8 +935,12 @@ static struct dma_async_tx_descriptor *omap_dma_prep_dma_cyclic(
 		else
 			d->ccr |= CCR_SYNC_ELEMENT;
 
-		if (dir == DMA_DEV_TO_MEM)
+		if (dir == DMA_DEV_TO_MEM) {
 			d->ccr |= CCR_TRIGGER_SRC;
+			d->csdp |= CSDP_DST_PACKED;
+		} else {
+			d->csdp |= CSDP_SRC_PACKED;
+		}
 
 		d->cicr |= CICR_MISALIGNED_ERR_IE | CICR_TRANS_ERR_IE;
 
@@ -1195,8 +1199,10 @@ static int omap_dma_probe(struct platform_device *pdev)
 
 		rc = devm_request_irq(&pdev->dev, irq, omap_dma_irq,
 				      IRQF_SHARED, "omap-dma-engine", od);
-		if (rc)
+		if (rc) {
+			omap_dma_free(od);
 			return rc;
+		}
 	}
 
 	rc = dma_async_device_register(&od->ddev);

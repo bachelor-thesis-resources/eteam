@@ -1397,6 +1397,7 @@ config FB_ATY
 	select FB_CFB_IMAGEBLIT
 	select FB_BACKLIGHT if FB_ATY_BACKLIGHT
 	select FB_MACMODES if PPC
+	select FB_ATY_CT if SPARC64 && PCI
 	help
 	  This driver supports graphics boards with the ATI Mach64 chips.
 	  Say Y if you have such a graphics board.
@@ -1407,7 +1408,6 @@ config FB_ATY
 config FB_ATY_CT
 	bool "Mach64 CT/VT/GT/LT (incl. 3D RAGE) support"
 	depends on PCI && FB_ATY
-	default y if SPARC64 && PCI
 	help
 	  Say Y here to support use of ATI's 64-bit Rage boards (or other
 	  boards based on the Mach64 CT, VT, GT, and LT chipsets) as a
@@ -1506,6 +1506,7 @@ config FB_SIS
 	select FB_CFB_COPYAREA
 	select FB_CFB_IMAGEBLIT
 	select FB_BOOT_VESA_SUPPORT if FB_SIS = y
+	select FB_SIS_300 if !FB_SIS_315
 	help
 	  This is the frame buffer device driver for the SiS 300, 315, 330
 	  and 340 series as well as XGI V3XT, V5, V8, Z7 graphics chipsets.
@@ -1666,6 +1667,8 @@ config FB_TRIDENT
 	select FB_CFB_FILLRECT
 	select FB_CFB_COPYAREA
 	select FB_CFB_IMAGEBLIT
+	select FB_DDC
+	select FB_MODE_HELPERS
 	---help---
 	  This is the frame buffer device driver for Trident PCI/AGP chipsets.
 	  Supported chipset families are TGUI 9440/96XX, 3DImage, Blade3D
@@ -1988,16 +1991,6 @@ config FB_SH_MOBILE_LCDC
 	---help---
 	  Frame buffer driver for the on-chip SH-Mobile LCD controller.
 
-config FB_SH_MOBILE_HDMI
-	tristate "SuperH Mobile HDMI controller support"
-	depends on FB_SH_MOBILE_LCDC
-	select FB_MODE_HELPERS
-	select SOUND
-	select SND
-	select SND_SOC
-	---help---
-	  Driver for the on-chip SH-Mobile HDMI controller.
-
 config FB_TMIO
 	tristate "Toshiba Mobile IO FrameBuffer support"
 	depends on FB && (MFD_TMIO || COMPILE_TEST)
@@ -2132,7 +2125,7 @@ config FB_UDL
 
 config FB_IBM_GXT4500
 	tristate "Framebuffer support for IBM GXT4000P/4500P/6000P/6500P adaptors"
-	depends on FB && PPC
+	depends on FB
 	select FB_CFB_FILLRECT
 	select FB_CFB_COPYAREA
 	select FB_CFB_IMAGEBLIT
@@ -2140,7 +2133,8 @@ config FB_IBM_GXT4500
 	  Say Y here to enable support for the IBM GXT4000P/6000P and
 	  GXT4500P/6500P display adaptor based on Raster Engine RC1000,
 	  found on some IBM System P (pSeries) machines. This driver
-	  doesn't use Geometry Engine GT1000.
+	  doesn't use Geometry Engine GT1000. This driver also supports
+	  AGP Fire GL2/3/4 cards on x86.
 
 config FB_PS3
 	tristate "PS3 GPU framebuffer driver"
@@ -2246,7 +2240,6 @@ config XEN_FBDEV_FRONTEND
 	select FB_SYS_IMAGEBLIT
 	select FB_SYS_FOPS
 	select FB_DEFERRED_IO
-	select INPUT_XEN_KBDDEV_FRONTEND if INPUT_MISC
 	select XEN_XENBUS_FRONTEND
 	default y
 	help
@@ -2464,7 +2457,7 @@ config FB_SSD1307
 	tristate "Solomon SSD1307 framebuffer support"
 	depends on FB && I2C
 	depends on OF
-	depends on GPIOLIB
+	depends on GPIOLIB || COMPILE_TEST
 	select FB_SYS_FOPS
 	select FB_SYS_FILLRECT
 	select FB_SYS_COPYAREA
@@ -2475,3 +2468,17 @@ config FB_SSD1307
 	help
 	  This driver implements support for the Solomon SSD1307
 	  OLED controller over I2C.
+
+config FB_SM712
+	tristate "Silicon Motion SM712 framebuffer support"
+	depends on FB && PCI
+	select FB_CFB_FILLRECT
+	select FB_CFB_COPYAREA
+	select FB_CFB_IMAGEBLIT
+	help
+	  Frame buffer driver for the Silicon Motion SM710, SM712, SM721
+	  and SM722 chips.
+
+	  This driver is also available as a module. The module will be
+	  called sm712fb. If you want to compile it as a module, say M
+	  here and read <file:Documentation/kbuild/modules.txt>.

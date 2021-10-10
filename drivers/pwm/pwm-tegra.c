@@ -69,6 +69,7 @@ static int tegra_pwm_config(struct pwm_chip *chip, struct pwm_device *pwm,
 	struct tegra_pwm_chip *pc = to_tegra_pwm_chip(chip);
 	unsigned long long c;
 	unsigned long rate, hz;
+	unsigned long long ns100 = NSEC_PER_SEC;
 	u32 val = 0;
 	int err;
 
@@ -87,9 +88,11 @@ static int tegra_pwm_config(struct pwm_chip *chip, struct pwm_device *pwm,
 	 * cycles at the PWM clock rate will take period_ns nanoseconds.
 	 */
 	rate = clk_get_rate(pc->clk) >> PWM_DUTY_WIDTH;
-	hz = NSEC_PER_SEC / period_ns;
 
-	rate = (rate + (hz / 2)) / hz;
+	/* Consider precision in PWM_SCALE_WIDTH rate calculation */
+	ns100 *= 100;
+	hz = DIV_ROUND_CLOSEST_ULL(ns100, period_ns);
+	rate = DIV_ROUND_CLOSEST(rate * 100, hz);
 
 	/*
 	 * Since the actual PWM divider is the register's frequency divider
@@ -112,7 +115,7 @@ static int tegra_pwm_config(struct pwm_chip *chip, struct pwm_device *pwm,
 	 * If the PWM channel is disabled, make sure to turn on the clock
 	 * before writing the register. Otherwise, keep it enabled.
 	 */
-	if (!test_bit(PWMF_ENABLED, &pwm->flags)) {
+	if (!pwm_is_enabled(pwm)) {
 		err = clk_prepare_enable(pc->clk);
 		if (err < 0)
 			return err;
@@ -124,7 +127,7 @@ static int tegra_pwm_config(struct pwm_chip *chip, struct pwm_device *pwm,
 	/*
 	 * If the PWM is not enabled, turn the clock off again to save power.
 	 */
-	if (!test_bit(PWMF_ENABLED, &pwm->flags))
+	if (!pwm_is_enabled(pwm))
 		clk_disable_unprepare(pc->clk);
 
 	return 0;
@@ -214,7 +217,7 @@ static int tegra_pwm_remove(struct platform_device *pdev)
 	for (i = 0; i < NUM_PWM; i++) {
 		struct pwm_device *pwm = &pc->chip.pwms[i];
 
-		if (!test_bit(PWMF_ENABLED, &pwm->flags))
+		if (!pwm_is_enabled(pwm))
 			if (clk_prepare_enable(pc->clk) < 0)
 				continue;
 

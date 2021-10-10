@@ -165,11 +165,9 @@ DEFINE_BASIC_FETCH_FUNCS(memory)
 static void FETCH_FUNC_NAME(memory, string)(struct pt_regs *regs,
 					    void *addr, void *dest)
 {
-	long ret;
 	int maxlen = get_rloc_len(*(u32 *)dest);
 	u8 *dst = get_rloc_data(dest);
-	u8 *src = addr;
-	mm_segment_t old_fs = get_fs();
+	long ret;
 
 	if (!maxlen)
 		return;
@@ -178,23 +176,13 @@ static void FETCH_FUNC_NAME(memory, string)(struct pt_regs *regs,
 	 * Try to get string again, since the string can be changed while
 	 * probing.
 	 */
-	set_fs(KERNEL_DS);
-	pagefault_disable();
-
-	do
-		ret = __copy_from_user_inatomic(dst++, src++, 1);
-	while (dst[-1] && ret == 0 && src - (u8 *)addr < maxlen);
-
-	dst[-1] = '\0';
-	pagefault_enable();
-	set_fs(old_fs);
+	ret = strncpy_from_unsafe(dst, addr, maxlen);
 
 	if (ret < 0) {	/* Failed to fetch string */
-		((u8 *)get_rloc_data(dest))[0] = '\0';
+		dst[0] = '\0';
 		*(u32 *)dest = make_data_rloc(0, get_rloc_offs(*(u32 *)dest));
 	} else {
-		*(u32 *)dest = make_data_rloc(src - (u8 *)addr,
-					      get_rloc_offs(*(u32 *)dest));
+		*(u32 *)dest = make_data_rloc(ret, get_rloc_offs(*(u32 *)dest));
 	}
 }
 NOKPROBE_SYMBOL(FETCH_FUNC_NAME(memory, string));
@@ -361,11 +349,10 @@ static struct trace_kprobe *find_trace_kprobe(const char *event,
 static int
 enable_trace_kprobe(struct trace_kprobe *tk, struct trace_event_file *file)
 {
+	struct event_file_link *link = NULL;
 	int ret = 0;
 
 	if (file) {
-		struct event_file_link *link;
-
 		link = kmalloc(sizeof(*link), GFP_KERNEL);
 		if (!link) {
 			ret = -ENOMEM;
@@ -384,6 +371,18 @@ enable_trace_kprobe(struct trace_kprobe *tk, struct trace_event_file *file)
 			ret = enable_kretprobe(&tk->rp);
 		else
 			ret = enable_kprobe(&tk->rp.kp);
+	}
+
+	if (ret) {
+		if (file) {
+			/* Notice the if is true on not WARN() */
+			if (!WARN_ON_ONCE(!link))
+				list_del_rcu(&link->list);
+			kfree(link);
+			tk->tp.flags &= ~TP_FLAG_TRACE;
+		} else {
+			tk->tp.flags &= ~TP_FLAG_PROFILE;
+		}
 	}
  out:
 	return ret;
@@ -611,7 +610,7 @@ static int create_trace_kprobe(int argc, char **argv)
 	bool is_return = false, is_delete = false;
 	char *symbol = NULL, *event = NULL, *group = NULL;
 	char *arg;
-	unsigned long offset = 0;
+	long offset = 0;
 	void *addr = NULL;
 	char buf[MAX_EVENT_NAME_LEN];
 
@@ -671,30 +670,25 @@ static int create_trace_kprobe(int argc, char **argv)
 		pr_info("Probe point is not specified.\n");
 		return -EINVAL;
 	}
-	if (isdigit(argv[1][0])) {
-		if (is_return) {
-			pr_info("Return probe point must be a symbol.\n");
-			return -EINVAL;
-		}
-		/* an address specified */
-		ret = kstrtoul(&argv[1][0], 0, (unsigned long *)&addr);
-		if (ret) {
-			pr_info("Failed to parse address.\n");
-			return ret;
-		}
-	} else {
+
+	/* try to parse an address. if that fails, try to read the
+	 * input as a symbol. */
+	if (kstrtoul(argv[1], 0, (unsigned long *)&addr)) {
 		/* a symbol specified */
 		symbol = argv[1];
 		/* TODO: support .init module functions */
 		ret = traceprobe_split_symbol_offset(symbol, &offset);
-		if (ret) {
-			pr_info("Failed to parse symbol.\n");
+		if (ret || offset < 0 || offset > UINT_MAX) {
+			pr_info("Failed to parse either an address or a symbol.\n");
 			return ret;
 		}
 		if (offset && is_return) {
 			pr_info("Return probe must be used without offset.\n");
 			return -EINVAL;
 		}
+	} else if (is_return) {
+		pr_info("Return probe point must be a symbol.\n");
+		return -EINVAL;
 	}
 	argc -= 2; argv += 2;
 
@@ -1483,6 +1477,11 @@ static __init int kprobe_trace_self_tests_init(void)
 
 end:
 	release_all_trace_kprobes();
+	/*
+	 * Wait for the optimizer work to finish. Otherwise it might fiddle
+	 * with probes in already freed __init text.
+	 */
+	wait_for_kprobe_optimizer();
 	if (warn)
 		pr_cont("NG: Some tests are failed. Please check them.\n");
 	else

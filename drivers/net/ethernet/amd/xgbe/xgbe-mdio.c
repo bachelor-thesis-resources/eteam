@@ -872,14 +872,14 @@ static void xgbe_phy_adjust_link(struct xgbe_prv_data *pdata)
 
 		if (pdata->tx_pause != pdata->phy.tx_pause) {
 			new_state = 1;
-			pdata->hw_if.config_tx_flow_control(pdata);
 			pdata->tx_pause = pdata->phy.tx_pause;
+			pdata->hw_if.config_tx_flow_control(pdata);
 		}
 
 		if (pdata->rx_pause != pdata->phy.rx_pause) {
 			new_state = 1;
-			pdata->hw_if.config_rx_flow_control(pdata);
 			pdata->rx_pause = pdata->phy.rx_pause;
+			pdata->hw_if.config_rx_flow_control(pdata);
 		}
 
 		/* Speed support */
@@ -1115,8 +1115,7 @@ static void xgbe_phy_status(struct xgbe_prv_data *pdata)
 	unsigned int reg, link_aneg;
 
 	if (test_bit(XGBE_LINK_ERR, &pdata->dev_state)) {
-		if (test_and_clear_bit(XGBE_LINK, &pdata->dev_state))
-			netif_carrier_off(pdata->netdev);
+		netif_carrier_off(pdata->netdev);
 
 		pdata->phy.link = 0;
 		goto adjust_link;
@@ -1142,10 +1141,7 @@ static void xgbe_phy_status(struct xgbe_prv_data *pdata)
 		if (test_bit(XGBE_LINK_INIT, &pdata->dev_state))
 			clear_bit(XGBE_LINK_INIT, &pdata->dev_state);
 
-		if (!test_bit(XGBE_LINK, &pdata->dev_state)) {
-			set_bit(XGBE_LINK, &pdata->dev_state);
-			netif_carrier_on(pdata->netdev);
-		}
+		netif_carrier_on(pdata->netdev);
 	} else {
 		if (test_bit(XGBE_LINK_INIT, &pdata->dev_state)) {
 			xgbe_check_link_timeout(pdata);
@@ -1156,10 +1152,7 @@ static void xgbe_phy_status(struct xgbe_prv_data *pdata)
 
 		xgbe_phy_status_aneg(pdata);
 
-		if (test_bit(XGBE_LINK, &pdata->dev_state)) {
-			clear_bit(XGBE_LINK, &pdata->dev_state);
-			netif_carrier_off(pdata->netdev);
-		}
+		netif_carrier_off(pdata->netdev);
 	}
 
 adjust_link:
@@ -1179,8 +1172,7 @@ static void xgbe_phy_stop(struct xgbe_prv_data *pdata)
 	devm_free_irq(pdata->dev, pdata->an_irq, pdata);
 
 	pdata->phy.link = 0;
-	if (test_and_clear_bit(XGBE_LINK, &pdata->dev_state))
-		netif_carrier_off(pdata->netdev);
+	netif_carrier_off(pdata->netdev);
 
 	xgbe_phy_adjust_link(pdata);
 }

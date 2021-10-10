@@ -380,6 +380,7 @@ int sctp_packet_transmit(struct sctp_packet *packet)
 {
 	struct sctp_transport *tp = packet->transport;
 	struct sctp_association *asoc = tp->asoc;
+	int confirm;
 	struct sctphdr *sh;
 	struct sk_buff *nskb;
 	struct sctp_chunk *chunk, *tmp;
@@ -534,7 +535,7 @@ int sctp_packet_transmit(struct sctp_packet *packet)
 	 * by CRC32-C as described in <draft-ietf-tsvwg-sctpcsum-02.txt>.
 	 */
 	if (!sctp_checksum_disable) {
-		if (!(dst->dev->features & NETIF_F_SCTP_CSUM) ||
+		if (!(dst->dev->features & NETIF_F_SCTP_CRC) ||
 		    (dst_xfrm(dst) != NULL) || packet->ipfragok) {
 			sh->checksum = sctp_compute_cksum(nskb, 0);
 		} else {
@@ -592,7 +593,14 @@ int sctp_packet_transmit(struct sctp_packet *packet)
 	pr_debug("***sctp_transmit_packet*** skb->len:%d\n", nskb->len);
 
 	nskb->ignore_df = packet->ipfragok;
-	tp->af_specific->sctp_xmit(nskb, tp);
+	confirm = tp->dst_pending_confirm;
+	if (confirm)
+		skb_set_dst_pending_confirm(nskb, 1);
+	/* neighbour should be confirmed on successful transmission or
+	 * positive error
+	 */
+	if (tp->af_specific->sctp_xmit(nskb, tp) >= 0 && confirm)
+		tp->dst_pending_confirm = 0;
 
 out:
 	sctp_packet_reset(packet);

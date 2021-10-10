@@ -92,7 +92,7 @@ DVB_DEFINE_MOD_OPT_ADAPTER_NR(adapter_nr);
 
 /* ------------------------------------------------------------------ */
 
-static int queue_setup(struct vb2_queue *q, const struct v4l2_format *fmt,
+static int queue_setup(struct vb2_queue *q, const void *parg,
 			   unsigned int *num_buffers, unsigned int *num_planes,
 			   unsigned int sizes[], void *alloc_ctxs[])
 {
@@ -110,18 +110,20 @@ static int queue_setup(struct vb2_queue *q, const struct v4l2_format *fmt,
 
 static int buffer_prepare(struct vb2_buffer *vb)
 {
+	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 	struct cx23885_tsport *port = vb->vb2_queue->drv_priv;
 	struct cx23885_buffer *buf =
-		container_of(vb, struct cx23885_buffer, vb);
+		container_of(vbuf, struct cx23885_buffer, vb);
 
 	return cx23885_buf_prepare(buf, port);
 }
 
 static void buffer_finish(struct vb2_buffer *vb)
 {
+	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 	struct cx23885_tsport *port = vb->vb2_queue->drv_priv;
 	struct cx23885_dev *dev = port->dev;
-	struct cx23885_buffer *buf = container_of(vb,
+	struct cx23885_buffer *buf = container_of(vbuf,
 		struct cx23885_buffer, vb);
 
 	cx23885_free_buffer(dev, buf);
@@ -129,8 +131,9 @@ static void buffer_finish(struct vb2_buffer *vb)
 
 static void buffer_queue(struct vb2_buffer *vb)
 {
+	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 	struct cx23885_tsport *port = vb->vb2_queue->drv_priv;
-	struct cx23885_buffer   *buf = container_of(vb,
+	struct cx23885_buffer   *buf = container_of(vbuf,
 		struct cx23885_buffer, vb);
 
 	cx23885_buf_queue(port, buf);
@@ -1449,8 +1452,9 @@ static int dvb_register(struct cx23885_tsport *port)
 		if (fe0->dvb.frontend != NULL) {
 			struct i2c_adapter *tun_i2c;
 
-			fe0->dvb.frontend->sec_priv = kmalloc(sizeof(dib7000p_ops), GFP_KERNEL);
-			memcpy(fe0->dvb.frontend->sec_priv, &dib7000p_ops, sizeof(dib7000p_ops));
+			fe0->dvb.frontend->sec_priv = kmemdup(&dib7000p_ops, sizeof(dib7000p_ops), GFP_KERNEL);
+			if (!fe0->dvb.frontend->sec_priv)
+				return -ENOMEM;
 			tun_i2c = dib7000p_ops.get_i2c_master(fe0->dvb.frontend, DIBX000_I2C_INTERFACE_TUNER, 1);
 			if (!dvb_attach(dib0070_attach, fe0->dvb.frontend, tun_i2c, &dib7070p_dib0070_config))
 				return -ENODEV;
@@ -2165,10 +2169,11 @@ static int dvb_register(struct cx23885_tsport *port)
 		}
 		port->i2c_client_tuner = client_tuner;
 		break;
-	case CX23885_BOARD_HAUPPAUGE_HVR5525:
-		switch (port->nr) {
+	case CX23885_BOARD_HAUPPAUGE_HVR5525: {
 		struct m88rs6000t_config m88rs6000t_config;
 		struct a8293_platform_data a8293_pdata = {};
+
+		switch (port->nr) {
 
 		/* port b - satellite */
 		case 1:
@@ -2264,6 +2269,7 @@ static int dvb_register(struct cx23885_tsport *port)
 			break;
 		}
 		break;
+	}
 	default:
 		printk(KERN_INFO "%s: The frontend of your DVB/ATSC card "
 			" isn't supported yet\n",

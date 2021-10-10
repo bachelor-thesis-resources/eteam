@@ -1,3 +1,68 @@
+                          Informations
+
+  The applied patch of the Ubuntu Linux Kernel is based on the changes
+  made by Technical University Dresden, namely Operating System Group
+
+  Their repositories may be found on Github:
+
+  https://github.com/TUD-OS
+
+  The applied patch originates from the TU Dresden Repository 'eteam':
+
+  https://github.com/TUD-OS/eteam
+
+                  Building the Kernel (Ubuntu-Way)
+
+  1. INSTALL DEPENDENCIES:
+
+      apt update && apt dist-upgrade
+      apt install fakeroot build-essential crash kexec-tools makedumpfile\ 
+        kernel-wedge bison flex libelf-dev libncurses5 libncurses5-dev\ 
+        asciidoc binutils-dev libudev-dev libpci-dev libiberty-dev curl
+  
+  2. ADD SOURCES REPOSITORIES (if not already done by you):
+    
+      sed -Ei 's/^# deb-src /deb-src /' /etc/apt/sources.list
+  
+  3. GET LINUX SOURCES
+
+      apt-get source linux-image-4.4.0-209-generic
+  
+  4. CLONE (GIT) THIS KERNEL REPOSITORY INTO YOUR WORKING DIR
+
+  5. CD INTO RECENTLY CLONED REPOSITORY
+
+  6. SET FILE PERMISSIONS
+    
+      chmod -R a+x *
+  
+  7. CLEAN THE REPOSITORY (MAYBE)
+
+      make mrproper
+      fakeroot debian/rules clean
+  
+  8. EDIT CONFIGURATIONS:
+
+    - Answer Yes (by hitting Enter) for each Question about configuring a 
+      specific architecture build
+
+    - A curses menu will pop up in terminal
+    
+    - Navigate right (Right-Arrow), hit Enter (namely Exit) and Confirm the 
+      save-dialog
+    
+    - Repeat aforementioned bullet point for any question
+    
+    - Start the described configuration process by:
+      
+        fakeroot debian/rules editconfigs
+
+  9. START THE BUILD:
+    
+        fakeroot debian/rules binary-headers binary-generic
+
+===============================================================================
+
         Linux kernel release 4.x <http://kernel.org/>
 
 These are the release notes for Linux version 4.  Read them carefully,
@@ -24,7 +89,7 @@ ON WHAT HARDWARE DOES IT RUN?
   today Linux also runs on (at least) the Compaq Alpha AXP, Sun SPARC and
   UltraSPARC, Motorola 68000, PowerPC, PowerPC64, ARM, Hitachi SuperH, Cell,
   IBM S/390, MIPS, HP PA-RISC, Intel IA-64, DEC VAX, AMD x86-64, AXIS CRIS,
-  Xtensa, Tilera TILE, AVR32 and Renesas M32R architectures.
+  Xtensa, Tilera TILE, AVR32, ARC and Renesas M32R architectures.
 
   Linux is easily portable to most general-purpose 32- or 64-bit architectures
   as long as they have a paged memory management unit (PMMU) and a port of the
@@ -161,7 +226,7 @@ CONFIGURING the kernel:
 
      "make xconfig"     X windows (Qt) based configuration tool.
 
-     "make gconfig"     X windows (Gtk) based configuration tool.
+     "make gconfig"     X windows (GTK+) based configuration tool.
 
      "make oldconfig"   Default all questions based on the contents of
                         your existing ./.config file and asking about

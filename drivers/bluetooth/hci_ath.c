@@ -101,6 +101,9 @@ static int ath_open(struct hci_uart *hu)
 
 	BT_DBG("hu %p", hu);
 
+	if (!hci_uart_has_flow_control(hu))
+		return -EOPNOTSUPP;
+
 	ath = kzalloc(sizeof(*ath), GFP_KERNEL);
 	if (!ath)
 		return -ENOMEM;
@@ -243,6 +246,7 @@ static struct sk_buff *ath_dequeue(struct hci_uart *hu)
 static const struct hci_uart_proto athp = {
 	.id		= HCI_UART_ATH3K,
 	.name		= "ATH3K",
+	.manufacturer	= 69,
 	.open		= ath_open,
 	.close		= ath_close,
 	.flush		= ath_flush,

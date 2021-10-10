@@ -5,6 +5,19 @@ struct target_core_fabric_ops {
 	struct module *module;
 	const char *name;
 	size_t node_acl_size;
+	/*
+	 * Limits number of scatterlist entries per SCF_SCSI_DATA_CDB payload.
+	 * Setting this value tells target-core to enforce this limit, and
+	 * report as INQUIRY EVPD=b0 MAXIMUM TRANSFER LENGTH.
+	 *
+	 * target-core will currently reset se_cmd->data_length to this
+	 * maximum size, and set UNDERFLOW residual count if length exceeds
+	 * this limit.
+	 *
+	 * XXX: Not all initiator hosts honor this block-limit EVPD
+	 * XXX: Currently assumes single PAGE_SIZE per scatterlist entry
+	 */
+	u32 max_data_sg_nents;
 	char *(*get_fabric_name)(void);
 	char *(*tpg_get_wwn)(struct se_portal_group *);
 	u16 (*tpg_get_tag)(struct se_portal_group *);
@@ -95,6 +108,12 @@ void target_unregister_template(const struct target_core_fabric_ops *fo);
 int target_depend_item(struct config_item *item);
 void target_undepend_item(struct config_item *item);
 
+struct se_session *target_alloc_session(struct se_portal_group *,
+		unsigned int, unsigned int, enum target_prot_op prot_op,
+		const char *, void *,
+		int (*callback)(struct se_portal_group *,
+				struct se_session *, void *));
+
 struct se_session *transport_init_session(enum target_prot_op);
 int transport_alloc_session_tags(struct se_session *, unsigned int,
 		unsigned int);
@@ -104,7 +123,7 @@ void	__transport_register_session(struct se_portal_group *,
 		struct se_node_acl *, struct se_session *, void *);
 void	transport_register_session(struct se_portal_group *,
 		struct se_node_acl *, struct se_session *, void *);
-void	target_get_session(struct se_session *);
+int	target_get_session(struct se_session *);
 void	target_put_session(struct se_session *);
 ssize_t	target_show_dynamic_sessions(struct se_portal_group *, char *);
 void	transport_free_session(struct se_session *);
@@ -150,15 +169,16 @@ int	core_tmr_alloc_req(struct se_cmd *, void *, u8, gfp_t);
 void	core_tmr_release_req(struct se_tmr_req *);
 int	transport_generic_handle_tmr(struct se_cmd *);
 void	transport_generic_request_failure(struct se_cmd *, sense_reason_t);
-void	__target_execute_cmd(struct se_cmd *);
 int	transport_lookup_tmr_lun(struct se_cmd *, u64);
+void	core_allocate_nexus_loss_ua(struct se_node_acl *acl);
 
 struct se_node_acl *core_tpg_get_initiator_node_acl(struct se_portal_group *tpg,
 		unsigned char *);
+bool	target_tpg_has_node_acl(struct se_portal_group *tpg,
+		const char *);
 struct se_node_acl *core_tpg_check_initiator_node_acl(struct se_portal_group *,
 		unsigned char *);
-int	core_tpg_set_initiator_node_queue_depth(struct se_portal_group *,
-		unsigned char *, u32, int);
+int	core_tpg_set_initiator_node_queue_depth(struct se_node_acl *, u32);
 int	core_tpg_set_initiator_node_tag(struct se_portal_group *,
 		struct se_node_acl *, const char *);
 int	core_tpg_register(struct se_wwn *, struct se_portal_group *, int);

@@ -179,7 +179,7 @@ static void add_man_viewer(const char *name)
 	while (*p)
 		p = &((*p)->next);
 	*p = zalloc(sizeof(**p) + len + 1);
-	strncpy((*p)->name, name, len);
+	strcpy((*p)->name, name);
 }
 
 static int supported_man_viewer(const char *name, size_t len)
@@ -463,7 +463,7 @@ int cmd_help(int argc, const char **argv, const char *prefix __maybe_unused)
 			builtin_help_subcommands, builtin_help_usage, 0);
 
 	if (show_all) {
-		printf("\n usage: %s\n\n", perf_usage_string);
+		printf("\n Usage: %s\n\n", perf_usage_string);
 		list_commands("perf commands", &main_cmds, &other_cmds);
 		printf(" %s\n\n", perf_more_info_string);
 		return 0;

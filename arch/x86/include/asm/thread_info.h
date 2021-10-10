@@ -27,14 +27,17 @@
  * Without this offset, that can result in a page fault.  (We are
  * careful that, in this case, the value we read doesn't matter.)
  *
- * In vm86 mode, the hardware frame is much longer still, but we neither
- * access the extra members from NMI context, nor do we write such a
- * frame at sp0 at all.
+ * In vm86 mode, the hardware frame is much longer still, so add 16
+ * bytes to make room for the real-mode segments.
  *
  * x86_64 has a fixed-length stack frame.
  */
 #ifdef CONFIG_X86_32
-# define TOP_OF_KERNEL_STACK_PADDING 8
+# ifdef CONFIG_VM86
+#  define TOP_OF_KERNEL_STACK_PADDING 16
+# else
+#  define TOP_OF_KERNEL_STACK_PADDING 8
+# endif
 #else
 # define TOP_OF_KERNEL_STACK_PADDING 0
 #endif
@@ -46,7 +49,7 @@
  */
 #ifndef __ASSEMBLY__
 struct task_struct;
-#include <asm/processor.h>
+#include <asm/cpufeature.h>
 #include <linux/atomic.h>
 
 struct thread_info {
@@ -54,9 +57,7 @@ struct thread_info {
 	__u32			flags;		/* low level flags */
 	__u32			status;		/* thread synchronous flags */
 	__u32			cpu;		/* current CPU */
-	int			saved_preempt_count;
 	mm_segment_t		addr_limit;
-	void __user		*sysenter_return;
 	unsigned int		sig_on_uaccess_error:1;
 	unsigned int		uaccess_err:1;	/* uaccess failed */
 };
@@ -66,7 +67,6 @@ struct thread_info {
 	.task		= &tsk,			\
 	.flags		= 0,			\
 	.cpu		= 0,			\
-	.saved_preempt_count = INIT_PREEMPT_COUNT,	\
 	.addr_limit	= KERNEL_DS,		\
 }
 
@@ -83,18 +83,18 @@ struct thread_info {
  * thread information flags
  * - these are process state flags that various assembly files
  *   may need to access
- * - pending work-to-be-done flags are in LSW
- * - other flags in MSW
- * Warning: layout of LSW is hardcoded in entry.S
  */
 #define TIF_SYSCALL_TRACE	0	/* syscall trace active */
 #define TIF_NOTIFY_RESUME	1	/* callback before returning to user */
 #define TIF_SIGPENDING		2	/* signal pending */
 #define TIF_NEED_RESCHED	3	/* rescheduling necessary */
 #define TIF_SINGLESTEP		4	/* reenable singlestep on user return*/
+#define TIF_SSBD		5	/* Speculative store bypass disable */
 #define TIF_SYSCALL_EMU		6	/* syscall emulation active */
 #define TIF_SYSCALL_AUDIT	7	/* syscall auditing active */
 #define TIF_SECCOMP		8	/* secure computing */
+#define TIF_SPEC_IB		9	/* Indirect branch speculation mitigation */
+#define TIF_SPEC_FORCE_UPDATE	10	/* Force speculation MSR update in context switch */
 #define TIF_USER_RETURN_NOTIFY	11	/* notify kernel of userspace return */
 #define TIF_UPROBE		12	/* breakpointed or singlestepping */
 #define TIF_NOTSC		16	/* TSC is not accessible in userland */
@@ -114,11 +114,14 @@ struct thread_info {
 #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
 #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
 #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
-#define _TIF_SINGLESTEP		(1 << TIF_SINGLESTEP)
 #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
+#define _TIF_SINGLESTEP		(1 << TIF_SINGLESTEP)
+#define _TIF_SSBD		(1 << TIF_SSBD)
 #define _TIF_SYSCALL_EMU	(1 << TIF_SYSCALL_EMU)
 #define _TIF_SYSCALL_AUDIT	(1 << TIF_SYSCALL_AUDIT)
 #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
+#define _TIF_SPEC_IB		(1 << TIF_SPEC_IB)
+#define _TIF_SPEC_FORCE_UPDATE	(1 << TIF_SPEC_FORCE_UPDATE)
 #define _TIF_USER_RETURN_NOTIFY	(1 << TIF_USER_RETURN_NOTIFY)
 #define _TIF_UPROBE		(1 << TIF_UPROBE)
 #define _TIF_NOTSC		(1 << TIF_NOTSC)
@@ -140,30 +143,26 @@ struct thread_info {
 	 _TIF_SECCOMP | _TIF_SINGLESTEP | _TIF_SYSCALL_TRACEPOINT |	\
 	 _TIF_NOHZ)
 
-/* work to do in syscall_trace_leave() */
-#define _TIF_WORK_SYSCALL_EXIT	\
-	(_TIF_SYSCALL_TRACE | _TIF_SYSCALL_AUDIT | _TIF_SINGLESTEP |	\
-	 _TIF_SYSCALL_TRACEPOINT | _TIF_NOHZ)
-
-/* work to do on interrupt/exception return */
-#define _TIF_WORK_MASK							\
-	(0x0000FFFF &							\
-	 ~(_TIF_SYSCALL_TRACE|_TIF_SYSCALL_AUDIT|			\
-	   _TIF_SINGLESTEP|_TIF_SECCOMP|_TIF_SYSCALL_EMU))
-
 /* work to do on any return to user space */
 #define _TIF_ALLWORK_MASK						\
-	((0x0000FFFF & ~_TIF_SECCOMP) | _TIF_SYSCALL_TRACEPOINT |	\
-	_TIF_NOHZ)
-
-/* Only used for 64 bit */
-#define _TIF_DO_NOTIFY_MASK						\
-	(_TIF_SIGPENDING | _TIF_NOTIFY_RESUME |				\
-	 _TIF_USER_RETURN_NOTIFY | _TIF_UPROBE)
+	(_TIF_SYSCALL_TRACE | _TIF_NOTIFY_RESUME | _TIF_SIGPENDING |	\
+	 _TIF_NEED_RESCHED | _TIF_SINGLESTEP | _TIF_SYSCALL_EMU |	\
+	 _TIF_SYSCALL_AUDIT | _TIF_USER_RETURN_NOTIFY | _TIF_UPROBE |	\
+	 _TIF_NOHZ | _TIF_SYSCALL_TRACEPOINT)
 
 /* flags to check in __switch_to() */
-#define _TIF_WORK_CTXSW							\
-	(_TIF_IO_BITMAP|_TIF_NOTSC|_TIF_BLOCKSTEP)
+#define _TIF_WORK_CTXSW_BASE						\
+	(_TIF_IO_BITMAP|_TIF_NOTSC|_TIF_BLOCKSTEP|			\
+	 _TIF_SSBD | _TIF_SPEC_FORCE_UPDATE)
+
+/*
+ * Avoid calls to __switch_to_xtra() on UP as STIBP is not evaluated.
+ */
+#ifdef CONFIG_SMP
+# define _TIF_WORK_CTXSW	(_TIF_WORK_CTXSW_BASE | _TIF_SPEC_IB)
+#else
+# define _TIF_WORK_CTXSW	(_TIF_WORK_CTXSW_BASE)
+#endif
 
 #define _TIF_WORK_CTXSW_PREV (_TIF_WORK_CTXSW|_TIF_USER_RETURN_NOTIFY)
 #define _TIF_WORK_CTXSW_NEXT (_TIF_WORK_CTXSW)
@@ -180,17 +179,6 @@ struct thread_info {
 static inline struct thread_info *current_thread_info(void)
 {
 	return (struct thread_info *)(current_top_of_stack() - THREAD_SIZE);
-}
-
-static inline unsigned long current_stack_pointer(void)
-{
-	unsigned long sp;
-#ifdef CONFIG_X86_64
-	asm("mov %%rsp,%0" : "=g" (sp));
-#else
-	asm("mov %%esp,%0" : "=g" (sp));
-#endif
-	return sp;
 }
 
 #else /* !__ASSEMBLY__ */

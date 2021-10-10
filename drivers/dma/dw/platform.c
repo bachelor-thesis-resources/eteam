@@ -87,13 +87,20 @@ static void dw_dma_acpi_controller_register(struct dw_dma *dw)
 	dma_cap_set(DMA_SLAVE, info->dma_cap);
 	info->filter_fn = dw_dma_acpi_filter;
 
-	ret = devm_acpi_dma_controller_register(dev, acpi_dma_simple_xlate,
-						info);
+	ret = acpi_dma_controller_register(dev, acpi_dma_simple_xlate, info);
 	if (ret)
 		dev_err(dev, "could not register acpi_dma_controller\n");
 }
+
+static void dw_dma_acpi_controller_free(struct dw_dma *dw)
+{
+	struct device *dev = dw->dma.dev;
+
+	acpi_dma_controller_free(dev);
+}
 #else /* !CONFIG_ACPI */
 static inline void dw_dma_acpi_controller_register(struct dw_dma *dw) {}
+static inline void dw_dma_acpi_controller_free(struct dw_dma *dw) {}
 #endif /* !CONFIG_ACPI */
 
 #ifdef CONFIG_OF
@@ -155,6 +162,7 @@ static int dw_probe(struct platform_device *pdev)
 	struct dw_dma_chip *chip;
 	struct device *dev = &pdev->dev;
 	struct resource *mem;
+	const struct acpi_device_id *id;
 	struct dw_dma_platform_data *pdata;
 	int err;
 
@@ -178,6 +186,11 @@ static int dw_probe(struct platform_device *pdev)
 	pdata = dev_get_platdata(dev);
 	if (!pdata)
 		pdata = dw_dma_parse_dt(pdev);
+	if (!pdata && has_acpi_companion(dev)) {
+		id = acpi_match_device(dev->driver->acpi_match_table, dev);
+		if (id)
+			pdata = (struct dw_dma_platform_data *)id->driver_data;
+	}
 
 	chip->dev = dev;
 
@@ -219,6 +232,9 @@ static int dw_remove(struct platform_device *pdev)
 {
 	struct dw_dma_chip *chip = platform_get_drvdata(pdev);
 
+	if (ACPI_HANDLE(&pdev->dev))
+		dw_dma_acpi_controller_free(chip->dw);
+
 	if (pdev->dev.of_node)
 		of_dma_controller_free(pdev->dev.of_node);
 
@@ -233,7 +249,19 @@ static void dw_shutdown(struct platform_device *pdev)
 {
 	struct dw_dma_chip *chip = platform_get_drvdata(pdev);
 
+	/*
+	 * We have to call dw_dma_disable() to stop any ongoing transfer. On
+	 * some platforms we can't do that since DMA device is powered off.
+	 * Moreover we have no possibility to check if the platform is affected
+	 * or not. That's why we call pm_runtime_get_sync() / pm_runtime_put()
+	 * unconditionally. On the other hand we can't use
+	 * pm_runtime_suspended() because runtime PM framework is not fully
+	 * used by the driver.
+	 */
+	pm_runtime_get_sync(chip->dev);
 	dw_dma_disable(chip);
+	pm_runtime_put_sync_suspend(chip->dev);
+
 	clk_disable_unprepare(chip->clk);
 }
 
@@ -246,8 +274,17 @@ MODULE_DEVICE_TABLE(of, dw_dma_of_id_table);
 #endif
 
 #ifdef CONFIG_ACPI
+static struct dw_dma_platform_data dw_dma_acpi_pdata = {
+	.nr_channels = 8,
+	.is_private = true,
+	.chan_allocation_order = CHAN_ALLOCATION_ASCENDING,
+	.chan_priority = CHAN_PRIORITY_ASCENDING,
+	.block_size = 4095,
+	.nr_masters = 2,
+};
+
 static const struct acpi_device_id dw_dma_acpi_id_table[] = {
-	{ "INTL9C60", 0 },
+	{ "INTL9C60", (kernel_ulong_t)&dw_dma_acpi_pdata },
 	{ }
 };
 MODULE_DEVICE_TABLE(acpi, dw_dma_acpi_id_table);

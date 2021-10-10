@@ -263,12 +263,12 @@ static int rtl8180_wx_get_range(struct net_device *dev,
 	range->max_qual.qual = 100;
 	/* TODO: Find real max RSSI and stick here */
 	range->max_qual.level = 0;
-	range->max_qual.noise = -98;
+	range->max_qual.noise = 0x100 - 98;
 	range->max_qual.updated = 7; /* Updated all three */
 
 	range->avg_qual.qual = 92; /* > 8% missed beacons is 'bad' */
 	/* TODO: Find real 'good' to 'bad' threshold value for RSSI */
-	range->avg_qual.level = 20 + -98;
+	range->avg_qual.level = 0x100 - 78;
 	range->avg_qual.noise = 0;
 	range->avg_qual.updated = 7; /* Updated all three */
 
@@ -341,8 +341,10 @@ static int r8192_wx_set_scan(struct net_device *dev, struct iw_request_info *a,
 		struct iw_scan_req *req = (struct iw_scan_req *)b;
 
 		if (req->essid_len) {
-			ieee->current_network.ssid_len = req->essid_len;
-			memcpy(ieee->current_network.ssid, req->essid, req->essid_len);
+			int len = min_t(int, req->essid_len, IW_ESSID_MAX_SIZE);
+
+			ieee->current_network.ssid_len = len;
+			memcpy(ieee->current_network.ssid, req->essid, len);
 		}
 	}
 

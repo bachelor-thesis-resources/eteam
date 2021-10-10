@@ -6,14 +6,14 @@
 /* Forward declaration, a strange C thing */
 struct task_struct;
 struct mm_struct;
+struct vm86;
 
-#include <asm/vm86.h>
 #include <asm/math_emu.h>
 #include <asm/segment.h>
 #include <asm/types.h>
-#include <asm/sigcontext.h>
+#include <uapi/asm/sigcontext.h>
 #include <asm/current.h>
-#include <asm/cpufeature.h>
+#include <asm/cpufeatures.h>
 #include <asm/page.h>
 #include <asm/pgtable_types.h>
 #include <asm/percpu.h>
@@ -24,7 +24,6 @@ struct mm_struct;
 #include <asm/fpu/types.h>
 
 #include <linux/personality.h>
-#include <linux/cpumask.h>
 #include <linux/cache.h>
 #include <linux/threads.h>
 #include <linux/math64.h>
@@ -89,7 +88,7 @@ struct cpuinfo_x86 {
 	__u8			x86;		/* CPU family */
 	__u8			x86_vendor;	/* CPU vendor */
 	__u8			x86_model;
-	__u8			x86_mask;
+	__u8			x86_stepping;
 #ifdef CONFIG_X86_32
 	char			wp_works_ok;	/* It doesn't on 386's */
 
@@ -113,7 +112,7 @@ struct cpuinfo_x86 {
 	char			x86_vendor_id[16];
 	char			x86_model_id[64];
 	/* in KB - valid for CPUS which support this call: */
-	int			x86_cache_size;
+	unsigned int		x86_cache_size;
 	int			x86_cache_alignment;	/* In bytes */
 	/* Cache QoS architectural values: */
 	int			x86_cache_max_rmid;	/* max index */
@@ -129,6 +128,8 @@ struct cpuinfo_x86 {
 	u16			booted_cores;
 	/* Physical processor id: */
 	u16			phys_proc_id;
+	/* Logical processor id: */
+	u16			logical_proc_id;
 	/* Core id: */
 	u16			cpu_core_id;
 	/* Compute unit id */
@@ -136,6 +137,8 @@ struct cpuinfo_x86 {
 	/* Index into per_cpu list: */
 	u16			cpu_index;
 	u32			microcode;
+	/* Address space bits used by the cache internally */
+	u8			x86_cache_bits;
 };
 
 #define X86_VENDOR_INTEL	0
@@ -156,8 +159,8 @@ extern struct cpuinfo_x86	boot_cpu_data;
 extern struct cpuinfo_x86	new_cpu_data;
 
 extern struct tss_struct	doublefault_tss;
-extern __u32			cpu_caps_cleared[NCAPINTS];
-extern __u32			cpu_caps_set[NCAPINTS];
+extern __u32			cpu_caps_cleared[NCAPINTS + NBUGINTS];
+extern __u32			cpu_caps_set[NCAPINTS + NBUGINTS];
 
 #ifdef CONFIG_SMP
 DECLARE_PER_CPU_READ_MOSTLY(struct cpuinfo_x86, cpu_info);
@@ -173,16 +176,25 @@ extern const struct seq_operations cpuinfo_op;
 
 extern void cpu_detect(struct cpuinfo_x86 *c);
 
+static inline unsigned long long l1tf_pfn_limit(void)
+{
+	return BIT_ULL(boot_cpu_data.x86_cache_bits - 1 - PAGE_SHIFT);
+}
+
 extern void early_cpu_init(void);
 extern void identify_boot_cpu(void);
 extern void identify_secondary_cpu(struct cpuinfo_x86 *);
 extern void print_cpu_info(struct cpuinfo_x86 *);
 void print_cpu_msr(struct cpuinfo_x86 *);
 extern void init_scattered_cpuid_features(struct cpuinfo_x86 *c);
+extern u32 get_scattered_cpuid_leaf(unsigned int level,
+				    unsigned int sub_leaf,
+				    u8 reg);
 extern unsigned int init_intel_cacheinfo(struct cpuinfo_x86 *c);
 extern void init_amd_cacheinfo(struct cpuinfo_x86 *c);
-
-extern void detect_extended_topology(struct cpuinfo_x86 *c);
+extern int detect_extended_topology_early(struct cpuinfo_x86 *c);
+extern int detect_extended_topology(struct cpuinfo_x86 *c);
+extern int detect_ht_early(struct cpuinfo_x86 *c);
 extern void detect_ht(struct cpuinfo_x86 *c);
 
 #ifdef CONFIG_X86_32
@@ -205,6 +217,24 @@ static inline void native_cpuid(unsigned int *eax, unsigned int *ebx,
 	    : "0" (*eax), "2" (*ecx)
 	    : "memory");
 }
+
+#define native_cpuid_reg(reg)					\
+static inline unsigned int native_cpuid_##reg(unsigned int op)	\
+{								\
+	unsigned int eax = op, ebx, ecx = 0, edx;		\
+								\
+	native_cpuid(&eax, &ebx, &ecx, &edx);			\
+								\
+	return reg;						\
+}
+
+/*
+ * Native CPUID functions returning a single datum.
+ */
+native_cpuid_reg(eax)
+native_cpuid_reg(ebx)
+native_cpuid_reg(ecx)
+native_cpuid_reg(edx)
 
 static inline void load_cr3(pgd_t *pgdir)
 {
@@ -305,7 +335,7 @@ struct tss_struct {
 
 } ____cacheline_aligned;
 
-DECLARE_PER_CPU_SHARED_ALIGNED(struct tss_struct, cpu_tss);
+DECLARE_PER_CPU_SHARED_ALIGNED_USER_MAPPED(struct tss_struct, cpu_tss);
 
 #ifdef CONFIG_X86_32
 DECLARE_PER_CPU(unsigned long, cpu_current_top_of_stack);
@@ -400,15 +430,9 @@ struct thread_struct {
 	unsigned long		cr2;
 	unsigned long		trap_nr;
 	unsigned long		error_code;
-#ifdef CONFIG_X86_32
+#ifdef CONFIG_VM86
 	/* Virtual 86 mode info */
-	struct vm86_struct __user *vm86_info;
-	unsigned long		screen_bitmap;
-	unsigned long		v86flags;
-	unsigned long		v86mask;
-	unsigned long		saved_sp0;
-	unsigned int		saved_fs;
-	unsigned int		saved_gs;
+	struct vm86		*vm86;
 #endif
 	/* IO permissions: */
 	unsigned long		*io_bitmap_ptr;
@@ -478,6 +502,7 @@ static inline unsigned long current_top_of_stack(void)
 #else
 #define __cpuid			native_cpuid
 #define paravirt_enabled()	0
+#define paravirt_has(x) 	0
 
 static inline void load_sp0(struct tss_struct *tss,
 			    struct thread_struct *thread)
@@ -562,12 +587,12 @@ static inline unsigned int cpuid_edx(unsigned int op)
 }
 
 /* REP NOP (PAUSE) is a good thing to insert into busy-wait loops. */
-static inline void rep_nop(void)
+static __always_inline void rep_nop(void)
 {
 	asm volatile("rep; nop" ::: "memory");
 }
 
-static inline void cpu_relax(void)
+static __always_inline void cpu_relax(void)
 {
 	rep_nop();
 }
@@ -579,7 +604,7 @@ static inline void sync_core(void)
 {
 	int tmp;
 
-#ifdef CONFIG_M486
+#ifdef CONFIG_X86_32
 	/*
 	 * Do a CPUID if available, otherwise do a jump.  The jump
 	 * can conveniently enough be the jump around CPUID.
@@ -651,14 +676,6 @@ static inline void update_debugctlmsr(unsigned long debugctlmsr)
 
 extern void set_task_blockstep(struct task_struct *task, bool on);
 
-/*
- * from system description table in BIOS. Mostly for MCA use, but
- * others may find it useful:
- */
-extern unsigned int		machine_id;
-extern unsigned int		machine_submodel_id;
-extern unsigned int		BIOS_revision;
-
 /* Boot loader type from the setup header: */
 extern int			bootloader_type;
 extern int			bootloader_version;
@@ -720,7 +737,6 @@ static inline void spin_lock_prefetch(const void *x)
 
 #define INIT_THREAD  {							  \
 	.sp0			= TOP_OF_INIT_STACK,			  \
-	.vm86_info		= NULL,					  \
 	.sysenter_cs		= __KERNEL_CS,				  \
 	.io_bitmap_ptr		= NULL,					  \
 }
@@ -853,4 +869,29 @@ bool xen_set_default_idle(void);
 
 void stop_this_cpu(void *dummy);
 void df_debug(struct pt_regs *regs, long error_code);
+
+enum l1tf_mitigations {
+	L1TF_MITIGATION_OFF,
+	L1TF_MITIGATION_FLUSH_NOWARN,
+	L1TF_MITIGATION_FLUSH,
+	L1TF_MITIGATION_FLUSH_NOSMT,
+	L1TF_MITIGATION_FULL,
+	L1TF_MITIGATION_FULL_FORCE
+};
+
+extern enum l1tf_mitigations l1tf_mitigation;
+
+enum mds_mitigations {
+	MDS_MITIGATION_OFF,
+	MDS_MITIGATION_FULL,
+	MDS_MITIGATION_VMWERV,
+};
+
+enum taa_mitigations {
+	TAA_MITIGATION_OFF,
+	TAA_MITIGATION_UCODE_NEEDED,
+	TAA_MITIGATION_VERW,
+	TAA_MITIGATION_TSX_DISABLED,
+};
+
 #endif /* _ASM_X86_PROCESSOR_H */

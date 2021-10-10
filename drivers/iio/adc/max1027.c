@@ -470,6 +470,14 @@ static int max1027_probe(struct spi_device *spi)
 		goto fail_dev_register;
 	}
 
+	/* Internal reset */
+	st->reg = MAX1027_RST_REG;
+	ret = spi_write(st->spi, &st->reg, 1);
+	if (ret < 0) {
+		dev_err(&indio_dev->dev, "Failed to reset the ADC\n");
+		return ret;
+	}
+
 	/* Disable averaging */
 	st->reg = MAX1027_AVG_REG;
 	ret = spi_write(st->spi, &st->reg, 1);
@@ -508,7 +516,7 @@ static int max1027_remove(struct spi_device *spi)
 static struct spi_driver max1027_driver = {
 	.driver = {
 		.name	= "max1027",
-		.owner	= THIS_MODULE,
+		.of_match_table = of_match_ptr(max1027_adc_dt_ids),
 	},
 	.probe		= max1027_probe,
 	.remove		= max1027_remove,

@@ -65,9 +65,15 @@
  *
  * The 40 bit 82580 SYSTIM overflows every
  *   2^40 * 10^-9 /  60  = 18.3 minutes.
+ *
+ * SYSTIM is converted to real time using a timecounter. As
+ * timecounter_cyc2time() allows old timestamps, the timecounter
+ * needs to be updated at least once per half of the SYSTIM interval.
+ * Scheduling of delayed work is not very accurate, so we aim for 8
+ * minutes to be sure the actual interval is shorter than 9.16 minutes.
  */
 
-#define IGB_SYSTIM_OVERFLOW_PERIOD	(HZ * 60 * 9)
+#define IGB_SYSTIM_OVERFLOW_PERIOD	(HZ * 60 * 8)
 #define IGB_PTP_TX_TIMEOUT		(HZ * 15)
 #define INCPERIOD_82576			(1 << E1000_TIMINCA_16NS_SHIFT)
 #define INCVALUE_82576_MASK		((1 << E1000_TIMINCA_16NS_SHIFT) - 1)
@@ -143,7 +149,7 @@ static void igb_ptp_write_i210(struct igb_adapter *adapter,
 	 * sub-nanosecond resolution.
 	 */
 	wr32(E1000_SYSTIML, ts->tv_nsec);
-	wr32(E1000_SYSTIMH, ts->tv_sec);
+	wr32(E1000_SYSTIMH, (u32)ts->tv_sec);
 }
 
 /**
@@ -405,7 +411,7 @@ static void igb_pin_extts(struct igb_adapter *igb, int chan, int pin)
 	wr32(E1000_CTRL_EXT, ctrl_ext);
 }
 
-static void igb_pin_perout(struct igb_adapter *igb, int chan, int pin)
+static void igb_pin_perout(struct igb_adapter *igb, int chan, int pin, int freq)
 {
 	static const u32 aux0_sel_sdp[IGB_N_SDP] = {
 		AUX0_SEL_SDP0, AUX0_SEL_SDP1, AUX0_SEL_SDP2, AUX0_SEL_SDP3,
@@ -423,6 +429,14 @@ static void igb_pin_perout(struct igb_adapter *igb, int chan, int pin)
 	static const u32 ts_sdp_sel_tt1[IGB_N_SDP] = {
 		TS_SDP0_SEL_TT1, TS_SDP1_SEL_TT1,
 		TS_SDP2_SEL_TT1, TS_SDP3_SEL_TT1,
+	};
+	static const u32 ts_sdp_sel_fc0[IGB_N_SDP] = {
+		TS_SDP0_SEL_FC0, TS_SDP1_SEL_FC0,
+		TS_SDP2_SEL_FC0, TS_SDP3_SEL_FC0,
+	};
+	static const u32 ts_sdp_sel_fc1[IGB_N_SDP] = {
+		TS_SDP0_SEL_FC1, TS_SDP1_SEL_FC1,
+		TS_SDP2_SEL_FC1, TS_SDP3_SEL_FC1,
 	};
 	static const u32 ts_sdp_sel_clr[IGB_N_SDP] = {
 		TS_SDP0_SEL_FC1, TS_SDP1_SEL_FC1,
@@ -445,11 +459,17 @@ static void igb_pin_perout(struct igb_adapter *igb, int chan, int pin)
 		tssdp &= ~AUX1_TS_SDP_EN;
 
 	tssdp &= ~ts_sdp_sel_clr[pin];
-	if (chan == 1)
-		tssdp |= ts_sdp_sel_tt1[pin];
-	else
-		tssdp |= ts_sdp_sel_tt0[pin];
-
+	if (freq) {
+		if (chan == 1)
+			tssdp |= ts_sdp_sel_fc1[pin];
+		else
+			tssdp |= ts_sdp_sel_fc0[pin];
+	} else {
+		if (chan == 1)
+			tssdp |= ts_sdp_sel_tt1[pin];
+		else
+			tssdp |= ts_sdp_sel_tt0[pin];
+	}
 	tssdp |= ts_sdp_en[pin];
 
 	wr32(E1000_TSSDP, tssdp);
@@ -463,10 +483,10 @@ static int igb_ptp_feature_enable_i210(struct ptp_clock_info *ptp,
 	struct igb_adapter *igb =
 		container_of(ptp, struct igb_adapter, ptp_caps);
 	struct e1000_hw *hw = &igb->hw;
-	u32 tsauxc, tsim, tsauxc_mask, tsim_mask, trgttiml, trgttimh;
+	u32 tsauxc, tsim, tsauxc_mask, tsim_mask, trgttiml, trgttimh, freqout;
 	unsigned long flags;
-	struct timespec ts;
-	int pin = -1;
+	struct timespec64 ts;
+	int use_freq = 0, pin = -1;
 	s64 ns;
 
 	switch (rq->type) {
@@ -509,42 +529,60 @@ static int igb_ptp_feature_enable_i210(struct ptp_clock_info *ptp,
 		}
 		ts.tv_sec = rq->perout.period.sec;
 		ts.tv_nsec = rq->perout.period.nsec;
-		ns = timespec_to_ns(&ts);
+		ns = timespec64_to_ns(&ts);
 		ns = ns >> 1;
-		if (on && ns < 500000LL) {
-			/* 2k interrupts per second is an awful lot. */
-			return -EINVAL;
+		if (on && ns <= 70000000LL) {
+			if (ns < 8LL)
+				return -EINVAL;
+			use_freq = 1;
 		}
-		ts = ns_to_timespec(ns);
+		ts = ns_to_timespec64(ns);
 		if (rq->perout.index == 1) {
-			tsauxc_mask = TSAUXC_EN_TT1;
-			tsim_mask = TSINTR_TT1;
+			if (use_freq) {
+				tsauxc_mask = TSAUXC_EN_CLK1 | TSAUXC_ST1;
+				tsim_mask = 0;
+			} else {
+				tsauxc_mask = TSAUXC_EN_TT1;
+				tsim_mask = TSINTR_TT1;
+			}
 			trgttiml = E1000_TRGTTIML1;
 			trgttimh = E1000_TRGTTIMH1;
+			freqout = E1000_FREQOUT1;
 		} else {
-			tsauxc_mask = TSAUXC_EN_TT0;
-			tsim_mask = TSINTR_TT0;
+			if (use_freq) {
+				tsauxc_mask = TSAUXC_EN_CLK0 | TSAUXC_ST0;
+				tsim_mask = 0;
+			} else {
+				tsauxc_mask = TSAUXC_EN_TT0;
+				tsim_mask = TSINTR_TT0;
+			}
 			trgttiml = E1000_TRGTTIML0;
 			trgttimh = E1000_TRGTTIMH0;
+			freqout = E1000_FREQOUT0;
 		}
 		spin_lock_irqsave(&igb->tmreg_lock, flags);
 		tsauxc = rd32(E1000_TSAUXC);
 		tsim = rd32(E1000_TSIM);
+		if (rq->perout.index == 1) {
+			tsauxc &= ~(TSAUXC_EN_TT1 | TSAUXC_EN_CLK1 | TSAUXC_ST1);
+			tsim &= ~TSINTR_TT1;
+		} else {
+			tsauxc &= ~(TSAUXC_EN_TT0 | TSAUXC_EN_CLK0 | TSAUXC_ST0);
+			tsim &= ~TSINTR_TT0;
+		}
 		if (on) {
 			int i = rq->perout.index;
-
-			igb_pin_perout(igb, i, pin);
+			igb_pin_perout(igb, i, pin, use_freq);
 			igb->perout[i].start.tv_sec = rq->perout.start.sec;
 			igb->perout[i].start.tv_nsec = rq->perout.start.nsec;
 			igb->perout[i].period.tv_sec = ts.tv_sec;
 			igb->perout[i].period.tv_nsec = ts.tv_nsec;
 			wr32(trgttimh, rq->perout.start.sec);
 			wr32(trgttiml, rq->perout.start.nsec);
+			if (use_freq)
+				wr32(freqout, ns);
 			tsauxc |= tsauxc_mask;
 			tsim |= tsim_mask;
-		} else {
-			tsauxc &= ~tsauxc_mask;
-			tsim &= ~tsim_mask;
 		}
 		wr32(E1000_TSAUXC, tsauxc);
 		wr32(E1000_TSIM, tsim);
@@ -1092,12 +1130,13 @@ void igb_ptp_init(struct igb_adapter *adapter)
 }
 
 /**
- * igb_ptp_stop - Disable PTP device and stop the overflow check.
- * @adapter: Board private structure.
+ * igb_ptp_suspend - Disable PTP work items and prepare for suspend
+ * @adapter: Board private structure
  *
- * This function stops the PTP support and cancels the delayed work.
- **/
-void igb_ptp_stop(struct igb_adapter *adapter)
+ * This function stops the overflow check work and PTP Tx timestamp work, and
+ * will prepare the device for OS suspend.
+ */
+void igb_ptp_suspend(struct igb_adapter *adapter)
 {
 	switch (adapter->hw.mac.type) {
 	case e1000_82576:
@@ -1120,6 +1159,17 @@ void igb_ptp_stop(struct igb_adapter *adapter)
 		adapter->ptp_tx_skb = NULL;
 		clear_bit_unlock(__IGB_PTP_TX_IN_PROGRESS, &adapter->state);
 	}
+}
+
+/**
+ * igb_ptp_stop - Disable PTP device and stop the overflow check.
+ * @adapter: Board private structure.
+ *
+ * This function stops the PTP support and cancels the delayed work.
+ **/
+void igb_ptp_stop(struct igb_adapter *adapter)
+{
+	igb_ptp_suspend(adapter);
 
 	if (adapter->ptp_clock) {
 		ptp_clock_unregister(adapter->ptp_clock);

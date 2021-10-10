@@ -1141,6 +1141,7 @@ static bool smb347_volatile_reg(struct device *dev, unsigned int reg)
 	switch (reg) {
 	case IRQSTAT_A:
 	case IRQSTAT_C:
+	case IRQSTAT_D:
 	case IRQSTAT_E:
 	case IRQSTAT_F:
 	case STAT_A:
@@ -1332,4 +1333,3 @@ MODULE_AUTHOR("Bruce E. Robertson <bruce.e.robertson@intel.com>");
 MODULE_AUTHOR("Mika Westerberg <mika.westerberg@linux.intel.com>");
 MODULE_DESCRIPTION("SMB347 battery charger driver");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS("i2c:smb347");

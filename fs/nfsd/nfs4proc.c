@@ -276,13 +276,13 @@ do_open_lookup(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate, stru
 			nfsd4_security_inode_setsecctx(*resfh, &open->op_label, open->op_bmval);
 
 		/*
-		 * Following rfc 3530 14.2.16, use the returned bitmask
-		 * to indicate which attributes we used to store the
-		 * verifier:
+		 * Following rfc 3530 14.2.16, and rfc 5661 18.16.4
+		 * use the returned bitmask to indicate which attributes
+		 * we used to store the verifier:
 		 */
-		if (open->op_createmode == NFS4_CREATE_EXCLUSIVE && status == 0)
-			open->op_bmval[1] = (FATTR4_WORD1_TIME_ACCESS |
-							FATTR4_WORD1_TIME_MODIFY);
+		if (nfsd_create_is_exclusive(open->op_createmode) && status == 0)
+			open->op_bmval[1] |= (FATTR4_WORD1_TIME_ACCESS |
+						FATTR4_WORD1_TIME_MODIFY);
 	} else
 		/*
 		 * Note this may exit with the parent still locked.
@@ -362,7 +362,6 @@ nfsd4_open(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 {
 	__be32 status;
 	struct svc_fh *resfh = NULL;
-	struct nfsd4_compoundres *resp;
 	struct net *net = SVC_NET(rqstp);
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 
@@ -389,8 +388,7 @@ nfsd4_open(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 		copy_clientid(&open->op_clientid, cstate->session);
 
 	/* check seqid for replay. set nfs4_owner */
-	resp = rqstp->rq_resp;
-	status = nfsd4_process_open1(&resp->cstate, open, nn);
+	status = nfsd4_process_open1(cstate, open, nn);
 	if (status == nfserr_replay_me) {
 		struct nfs4_replay *rp = &open->op_openowner->oo_owner.so_replay;
 		fh_put(&cstate->current_fh);
@@ -417,10 +415,10 @@ nfsd4_open(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	/* Openowner is now set, so sequence id will get bumped.  Now we need
 	 * these checks before we do any creates: */
 	status = nfserr_grace;
-	if (locks_in_grace(net) && open->op_claim_type != NFS4_OPEN_CLAIM_PREVIOUS)
+	if (opens_in_grace(net) && open->op_claim_type != NFS4_OPEN_CLAIM_PREVIOUS)
 		goto out;
 	status = nfserr_no_grace;
-	if (!locks_in_grace(net) && open->op_claim_type == NFS4_OPEN_CLAIM_PREVIOUS)
+	if (!opens_in_grace(net) && open->op_claim_type == NFS4_OPEN_CLAIM_PREVIOUS)
 		goto out;
 
 	switch (open->op_claim_type) {
@@ -829,7 +827,7 @@ nfsd4_remove(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 {
 	__be32 status;
 
-	if (locks_in_grace(SVC_NET(rqstp)))
+	if (opens_in_grace(SVC_NET(rqstp)))
 		return nfserr_grace;
 	status = nfsd_unlink(rqstp, &cstate->current_fh, 0,
 			     remove->rm_name, remove->rm_namelen);
@@ -848,7 +846,7 @@ nfsd4_rename(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 
 	if (!cstate->save_fh.fh_dentry)
 		return status;
-	if (locks_in_grace(SVC_NET(rqstp)) &&
+	if (opens_in_grace(SVC_NET(rqstp)) &&
 		!(cstate->save_fh.fh_export->ex_flags & NFSEXP_NOSUBTREECHECK))
 		return nfserr_grace;
 	status = nfsd_rename(rqstp, &cstate->save_fh, rename->rn_sname,
@@ -879,6 +877,7 @@ nfsd4_secinfo(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 				    &exp, &dentry);
 	if (err)
 		return err;
+	fh_unlock(&cstate->current_fh);
 	if (d_really_is_negative(dentry)) {
 		exp_put(exp);
 		err = nfserr_noent;
@@ -1246,14 +1245,14 @@ nfsd4_layoutget(struct svc_rqst *rqstp,
 	const struct nfsd4_layout_ops *ops;
 	struct nfs4_layout_stateid *ls;
 	__be32 nfserr;
-	int accmode;
+	int accmode = NFSD_MAY_READ_IF_EXEC;
 
 	switch (lgp->lg_seg.iomode) {
 	case IOMODE_READ:
-		accmode = NFSD_MAY_READ;
+		accmode |= NFSD_MAY_READ;
 		break;
 	case IOMODE_RW:
-		accmode = NFSD_MAY_READ | NFSD_MAY_WRITE;
+		accmode |= NFSD_MAY_READ | NFSD_MAY_WRITE;
 		break;
 	default:
 		dprintk("%s: invalid iomode %d\n",
@@ -1311,6 +1310,7 @@ nfsd4_layoutget(struct svc_rqst *rqstp,
 	nfserr = nfsd4_insert_layout(lgp, ls);
 
 out_put_stid:
+	mutex_unlock(&ls->ls_mutex);
 	nfs4_put_stid(&ls->ls_stid);
 out:
 	return nfserr;
@@ -1364,9 +1364,8 @@ nfsd4_layoutcommit(struct svc_rqst *rqstp,
 		goto out;
 	}
 
-	nfserr = ops->proc_layoutcommit(inode, lcp);
-	if (nfserr)
-		goto out_put_stid;
+	/* LAYOUTCOMMIT does not require any serialization */
+	mutex_unlock(&ls->ls_mutex);
 
 	if (new_size > i_size_read(inode)) {
 		lcp->lc_size_chg = 1;
@@ -1375,7 +1374,7 @@ nfsd4_layoutcommit(struct svc_rqst *rqstp,
 		lcp->lc_size_chg = 0;
 	}
 
-out_put_stid:
+	nfserr = ops->proc_layoutcommit(inode, lcp);
 	nfs4_put_stid(&ls->ls_stid);
 out:
 	return nfserr;
@@ -1633,6 +1632,7 @@ nfsd4_proc_compound(struct svc_rqst *rqstp,
 	if (status) {
 		op = &args->ops[0];
 		op->status = status;
+		resp->opcnt = 1;
 		goto encode_op;
 	}
 
@@ -1691,6 +1691,12 @@ nfsd4_proc_compound(struct svc_rqst *rqstp,
 			opdesc->op_get_currentstateid(cstate, &op->u);
 		op->status = opdesc->op_func(rqstp, cstate, &op->u);
 
+		/* Only from SEQUENCE */
+		if (cstate->status == nfserr_replay_cache) {
+			dprintk("%s NFS4.1 replay from cache\n", __func__);
+			status = op->status;
+			goto out;
+		}
 		if (!op->status) {
 			if (opdesc->op_set_currentstateid)
 				opdesc->op_set_currentstateid(cstate, &op->u);
@@ -1701,14 +1707,7 @@ nfsd4_proc_compound(struct svc_rqst *rqstp,
 			if (need_wrongsec_check(rqstp))
 				op->status = check_nfsd_access(current_fh->fh_export, rqstp);
 		}
-
 encode_op:
-		/* Only from SEQUENCE */
-		if (cstate->status == nfserr_replay_cache) {
-			dprintk("%s NFS4.1 replay from cache\n", __func__);
-			status = op->status;
-			goto out;
-		}
 		if (op->status == nfserr_replay_me) {
 			op->replay = &cstate->replay_owner->so_replay;
 			nfsd4_encode_replay(&resp->xdr, op);

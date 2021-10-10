@@ -17,6 +17,7 @@
 #include <linux/quotaops.h>
 #include <linux/types.h>
 #include <linux/writeback.h>
+#include <linux/nospec.h>
 
 static int check_quotactl_permission(struct super_block *sb, int type, int cmd,
 				     qid_t id)
@@ -141,9 +142,9 @@ static int quota_getinfo(struct super_block *sb, int type, void __user *addr)
 	if (tstate->flags & QCI_ROOT_SQUASH)
 		uinfo.dqi_flags |= DQF_ROOT_SQUASH;
 	uinfo.dqi_valid = IIF_ALL;
-	if (!ret && copy_to_user(addr, &uinfo, sizeof(uinfo)))
+	if (copy_to_user(addr, &uinfo, sizeof(uinfo)))
 		return -EFAULT;
-	return ret;
+	return 0;
 }
 
 static int quota_setinfo(struct super_block *sb, int type, void __user *addr)
@@ -211,7 +212,7 @@ static int quota_getquota(struct super_block *sb, int type, qid_t id,
 	if (!sb->s_qcop->get_dqblk)
 		return -ENOSYS;
 	qid = make_kqid(current_user_ns(), type, id);
-	if (!qid_valid(qid))
+	if (!qid_has_mapping(sb->s_user_ns, qid))
 		return -EINVAL;
 	ret = sb->s_qcop->get_dqblk(sb, qid, &fdq);
 	if (ret)
@@ -260,7 +261,7 @@ static int quota_setquota(struct super_block *sb, int type, qid_t id,
 	if (!sb->s_qcop->set_dqblk)
 		return -ENOSYS;
 	qid = make_kqid(current_user_ns(), type, id);
-	if (!qid_valid(qid))
+	if (!qid_has_mapping(sb->s_user_ns, qid))
 		return -EINVAL;
 	copy_from_if_dqblk(&fdq, &idq);
 	return sb->s_qcop->set_dqblk(sb, qid, &fdq);
@@ -553,10 +554,10 @@ static int quota_setxquota(struct super_block *sb, int type, qid_t id,
 	if (!sb->s_qcop->set_dqblk)
 		return -ENOSYS;
 	qid = make_kqid(current_user_ns(), type, id);
-	if (!qid_valid(qid))
+	if (!qid_has_mapping(sb->s_user_ns, qid))
 		return -EINVAL;
 	/* Are we actually setting timer / warning limits for all users? */
-	if (from_kqid(&init_user_ns, qid) == 0 &&
+	if (from_kqid(sb->s_user_ns, qid) == 0 &&
 	    fdq.d_fieldmask & (FS_DQ_WARNS_MASK | FS_DQ_TIMER_MASK)) {
 		struct qc_info qinfo;
 		int ret;
@@ -614,7 +615,7 @@ static int quota_getxquota(struct super_block *sb, int type, qid_t id,
 	if (!sb->s_qcop->get_dqblk)
 		return -ENOSYS;
 	qid = make_kqid(current_user_ns(), type, id);
-	if (!qid_valid(qid))
+	if (!qid_has_mapping(sb->s_user_ns, qid))
 		return -EINVAL;
 	ret = sb->s_qcop->get_dqblk(sb, qid, &qdq);
 	if (ret)
@@ -644,6 +645,7 @@ static int do_quotactl(struct super_block *sb, int type, int cmd, qid_t id,
 
 	if (type >= (XQM_COMMAND(cmd) ? XQM_MAXQUOTAS : MAXQUOTAS))
 		return -EINVAL;
+	type = array_index_nospec(type, MAXQUOTAS);
 	/*
 	 * Quota not supported on this fs? Check this before s_quota_types
 	 * since they needn't be set if quota is not supported at all.
@@ -733,7 +735,7 @@ static struct super_block *quotactl_block(const char __user *special, int cmd)
 
 	if (IS_ERR(tmp))
 		return ERR_CAST(tmp);
-	bdev = lookup_bdev(tmp->name);
+	bdev = lookup_bdev(tmp->name, 0);
 	putname(tmp);
 	if (IS_ERR(bdev))
 		return ERR_CAST(bdev);

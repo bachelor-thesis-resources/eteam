@@ -58,6 +58,7 @@ static void tm_to_opal(struct rtc_time *tm, u32 *y_m_d, u64 *h_m_s_ms)
 static int opal_get_rtc_time(struct device *dev, struct rtc_time *tm)
 {
 	long rc = OPAL_BUSY;
+	int retries = 10;
 	u32 y_m_d;
 	u64 h_m_s_ms;
 	__be32 __y_m_d;
@@ -67,8 +68,11 @@ static int opal_get_rtc_time(struct device *dev, struct rtc_time *tm)
 		rc = opal_rtc_read(&__y_m_d, &__h_m_s_ms);
 		if (rc == OPAL_BUSY_EVENT)
 			opal_poll_events(NULL);
-		else
+		else if (retries-- && (rc == OPAL_HARDWARE
+				       || rc == OPAL_INTERNAL_ERROR))
 			msleep(10);
+		else if (rc != OPAL_BUSY && rc != OPAL_BUSY_EVENT)
+			break;
 	}
 
 	if (rc != OPAL_SUCCESS)
@@ -84,6 +88,7 @@ static int opal_get_rtc_time(struct device *dev, struct rtc_time *tm)
 static int opal_set_rtc_time(struct device *dev, struct rtc_time *tm)
 {
 	long rc = OPAL_BUSY;
+	int retries = 10;
 	u32 y_m_d = 0;
 	u64 h_m_s_ms = 0;
 
@@ -92,8 +97,11 @@ static int opal_set_rtc_time(struct device *dev, struct rtc_time *tm)
 		rc = opal_rtc_write(y_m_d, h_m_s_ms);
 		if (rc == OPAL_BUSY_EVENT)
 			opal_poll_events(NULL);
-		else
+		else if (retries-- && (rc == OPAL_HARDWARE
+				       || rc == OPAL_INTERNAL_ERROR))
 			msleep(10);
+		else if (rc != OPAL_BUSY && rc != OPAL_BUSY_EVENT)
+			break;
 	}
 
 	return rc == OPAL_SUCCESS ? 0 : -EIO;
@@ -142,6 +150,16 @@ static int opal_get_tpo_time(struct device *dev, struct rtc_wkalrm *alarm)
 
 	y_m_d = be32_to_cpu(__y_m_d);
 	h_m_s_ms = ((u64)be32_to_cpu(__h_m) << 32);
+
+	/* check if no alarm is set */
+	if (y_m_d == 0 && h_m_s_ms == 0) {
+		pr_debug("No alarm is set\n");
+		rc = -ENOENT;
+		goto exit;
+	} else {
+		pr_debug("Alarm set to %x %llx\n", y_m_d, h_m_s_ms);
+	}
+
 	opal_to_tm(y_m_d, h_m_s_ms, &alarm->time);
 
 exit:
@@ -152,10 +170,10 @@ exit:
 /* Set Timed Power-On */
 static int opal_set_tpo_time(struct device *dev, struct rtc_wkalrm *alarm)
 {
-	u64 h_m_s_ms = 0, token;
+	u64 h_m_s_ms = 0;
 	struct opal_msg msg;
 	u32 y_m_d = 0;
-	int rc;
+	int token, rc;
 
 	tm_to_opal(&alarm->time, &y_m_d, &h_m_s_ms);
 
@@ -190,20 +208,22 @@ exit:
 	return rc;
 }
 
-static const struct rtc_class_ops opal_rtc_ops = {
+static struct rtc_class_ops opal_rtc_ops = {
 	.read_time	= opal_get_rtc_time,
 	.set_time	= opal_set_rtc_time,
-	.read_alarm	= opal_get_tpo_time,
-	.set_alarm	= opal_set_tpo_time,
 };
 
 static int opal_rtc_probe(struct platform_device *pdev)
 {
 	struct rtc_device *rtc;
 
-	if (pdev->dev.of_node && of_get_property(pdev->dev.of_node, "has-tpo",
-						 NULL))
+	if (pdev->dev.of_node &&
+	    (of_property_read_bool(pdev->dev.of_node, "wakeup-source") ||
+	     of_property_read_bool(pdev->dev.of_node, "has-tpo")/* legacy */)) {
 		device_set_wakeup_capable(&pdev->dev, true);
+		opal_rtc_ops.read_alarm	= opal_get_tpo_time;
+		opal_rtc_ops.set_alarm = opal_set_tpo_time;
+	}
 
 	rtc = devm_rtc_device_register(&pdev->dev, DRVNAME, &opal_rtc_ops,
 				       THIS_MODULE);
@@ -236,7 +256,6 @@ static struct platform_driver opal_rtc_driver = {
 	.id_table	= opal_rtc_driver_ids,
 	.driver		= {
 		.name		= DRVNAME,
-		.owner		= THIS_MODULE,
 		.of_match_table	= opal_rtc_match,
 	},
 };

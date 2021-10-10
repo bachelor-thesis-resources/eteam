@@ -22,6 +22,7 @@
 #include <linux/srcu.h>
 #include <linux/rculist.h>
 #include <linux/wait.h>
+#include <linux/module.h>
 
 #include <linux/fsnotify_backend.h>
 #include "fsnotify.h"
@@ -40,6 +41,17 @@ static void fsnotify_final_destroy_group(struct fsnotify_group *group)
 }
 
 /*
+ * Stop queueing new events for this group. Once this function returns
+ * fsnotify_add_event() will not add any new events to the group's queue.
+ */
+void fsnotify_group_stop_queueing(struct fsnotify_group *group)
+{
+	mutex_lock(&group->notification_mutex);
+	group->shutdown = true;
+	mutex_unlock(&group->notification_mutex);
+}
+
+/*
  * Trying to get rid of a group. Remove all marks, flush all events and release
  * the group reference.
  * Note that another thread calling fsnotify_clear_marks_by_group() may still
@@ -47,6 +59,14 @@ static void fsnotify_final_destroy_group(struct fsnotify_group *group)
  */
 void fsnotify_destroy_group(struct fsnotify_group *group)
 {
+	/*
+	 * Stop queueing new events. The code below is careful enough to not
+	 * require this but fanotify needs to stop queuing events even before
+	 * fsnotify_destroy_group() is called and this makes the other callers
+	 * of fsnotify_destroy_group() to see the same behavior.
+	 */
+	fsnotify_group_stop_queueing(group);
+
 	/* clear all inode marks for this group */
 	fsnotify_clear_marks_by_group(group);
 
@@ -72,6 +92,7 @@ void fsnotify_get_group(struct fsnotify_group *group)
 {
 	atomic_inc(&group->refcnt);
 }
+EXPORT_SYMBOL(fsnotify_get_group);
 
 /*
  * Drop a reference to a group.  Free it if it's through.
@@ -81,6 +102,7 @@ void fsnotify_put_group(struct fsnotify_group *group)
 	if (atomic_dec_and_test(&group->refcnt))
 		fsnotify_final_destroy_group(group);
 }
+EXPORT_SYMBOL(fsnotify_put_group);
 
 /*
  * Create a new fsnotify_group and hold a reference for the group returned.
@@ -109,6 +131,7 @@ struct fsnotify_group *fsnotify_alloc_group(const struct fsnotify_ops *ops)
 
 	return group;
 }
+EXPORT_SYMBOL(fsnotify_alloc_group);
 
 int fsnotify_fasync(int fd, struct file *file, int on)
 {

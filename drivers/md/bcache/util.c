@@ -31,20 +31,27 @@ int bch_ ## name ## _h(const char *cp, type *res)		\
 	case 'y':						\
 	case 'z':						\
 		u++;						\
+		/* fall through */				\
 	case 'e':						\
 		u++;						\
+		/* fall through */				\
 	case 'p':						\
 		u++;						\
+		/* fall through */				\
 	case 't':						\
 		u++;						\
+		/* fall through */				\
 	case 'g':						\
 		u++;						\
+		/* fall through */				\
 	case 'm':						\
 		u++;						\
+		/* fall through */				\
 	case 'k':						\
 		u++;						\
 		if (e++ == cp)					\
 			return -EINVAL;				\
+		/* fall through */				\
 	case '\n':						\
 	case '\0':						\
 		if (*e == '\n')					\
@@ -73,59 +80,43 @@ STRTO_H(strtouint, unsigned int)
 STRTO_H(strtoll, long long)
 STRTO_H(strtoull, unsigned long long)
 
+/**
+ * bch_hprint - formats @v to human readable string for sysfs.
+ * @buf: the (at least 8 byte) buffer to format the result into.
+ * @v: signed 64 bit integer
+ *
+ * Returns the number of bytes used by format.
+ */
 ssize_t bch_hprint(char *buf, int64_t v)
 {
 	static const char units[] = "?kMGTPEZY";
-	char dec[4] = "";
-	int u, t = 0;
+	int u = 0, t;
 
-	for (u = 0; v >= 1024 || v <= -1024; u++) {
-		t = v & ~(~0 << 10);
-		v >>= 10;
-	}
+	uint64_t q;
 
-	if (!u)
-		return sprintf(buf, "%llu", v);
+	if (v < 0)
+		q = -v;
+	else
+		q = v;
 
-	if (v < 100 && v > -100)
-		snprintf(dec, sizeof(dec), ".%i", t / 100);
+	/* For as long as the number is more than 3 digits, but at least
+	 * once, shift right / divide by 1024.  Keep the remainder for
+	 * a digit after the decimal point.
+	 */
+	do {
+		u++;
 
-	return sprintf(buf, "%lli%s%c", v, dec, units[u]);
-}
+		t = q & ~(~0 << 10);
+		q >>= 10;
+	} while (q >= 1000);
 
-ssize_t bch_snprint_string_list(char *buf, size_t size, const char * const list[],
-			    size_t selected)
-{
-	char *out = buf;
-	size_t i;
-
-	for (i = 0; list[i]; i++)
-		out += snprintf(out, buf + size - out,
-				i == selected ? "[%s] " : "%s ", list[i]);
-
-	out[-1] = '\n';
-	return out - buf;
-}
-
-ssize_t bch_read_string_list(const char *buf, const char * const list[])
-{
-	size_t i;
-	char *s, *d = kstrndup(buf, PAGE_SIZE - 1, GFP_KERNEL);
-	if (!d)
-		return -ENOMEM;
-
-	s = strim(d);
-
-	for (i = 0; list[i]; i++)
-		if (!strcmp(list[i], s))
-			break;
-
-	kfree(d);
-
-	if (!list[i])
-		return -EINVAL;
-
-	return i;
+	if (v < 0)
+		/* '-', up to 3 digits, '.', 1 digit, 1 character, null;
+		 * yields 8 bytes.
+		 */
+		return sprintf(buf, "-%llu.%i%c", q, t * 10 / 1024, units[u]);
+	else
+		return sprintf(buf, "%llu.%i%c", q, t * 10 / 1024, units[u]);
 }
 
 bool bch_is_zero(const char *p, size_t n)
@@ -197,13 +188,12 @@ void bch_time_stats_update(struct time_stats *stats, uint64_t start_time)
 }
 
 /**
- * bch_next_delay() - increment @d by the amount of work done, and return how
- * long to delay until the next time to do some work.
+ * bch_next_delay() - update ratelimiting statistics and calculate next delay
+ * @d: the struct bch_ratelimit to update
+ * @done: the amount of work done, in arbitrary units
  *
- * @d - the struct bch_ratelimit to update
- * @done - the amount of work done, in arbitrary units
- *
- * Returns the amount of time to delay by, in jiffies
+ * Increment @d by the amount of work done, and return how long to delay in
+ * jiffies until the next time to do some work.
  */
 uint64_t bch_next_delay(struct bch_ratelimit *d, uint64_t done)
 {

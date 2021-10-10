@@ -128,6 +128,7 @@ enum e1000_phy_type {
 	e1000_phy_ife,
 	e1000_phy_82580,
 	e1000_phy_i210,
+	e1000_phy_bcm54616,
 };
 
 enum e1000_bus_type {
@@ -325,7 +326,7 @@ struct e1000_mac_operations {
 	s32 (*get_thermal_sensor_data)(struct e1000_hw *);
 	s32 (*init_thermal_sensor_thresh)(struct e1000_hw *);
 #endif
-
+	void (*write_vfta)(struct e1000_hw *, u32, u32);
 };
 
 struct e1000_phy_operations {
@@ -441,6 +442,7 @@ struct e1000_phy_info {
 	u16 cable_length;
 	u16 max_cable_length;
 	u16 min_cable_length;
+	u16 pair_length[4];
 
 	u8 mdix;
 

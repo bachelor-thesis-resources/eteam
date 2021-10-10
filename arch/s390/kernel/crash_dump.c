@@ -23,6 +23,8 @@
 #define PTR_SUB(x, y) (((char *) (x)) - ((unsigned long) (y)))
 #define PTR_DIFF(x, y) ((unsigned long)(((char *) (x)) - ((unsigned long) (y))))
 
+#define LINUX_NOTE_NAME "LINUX"
+
 static struct memblock_region oldmem_region;
 
 static struct memblock_type oldmem_type = {
@@ -31,16 +33,6 @@ static struct memblock_type oldmem_type = {
 	.total_size = 0,
 	.regions = &oldmem_region,
 };
-
-#define for_each_dump_mem_range(i, nid, p_start, p_end, p_nid)		\
-	for (i = 0, __next_mem_range(&i, nid, MEMBLOCK_NONE,		\
-				     &memblock.physmem,			\
-				     &oldmem_type, p_start,		\
-				     p_end, p_nid);			\
-	     i != (u64)ULLONG_MAX;					\
-	     __next_mem_range(&i, nid, MEMBLOCK_NONE, &memblock.physmem,\
-			      &oldmem_type,				\
-			      p_start, p_end, p_nid))
 
 struct dump_save_areas dump_save_areas;
 
@@ -322,7 +314,7 @@ static void *nt_fpregset(void *ptr, struct save_area *sa)
 static void *nt_s390_timer(void *ptr, struct save_area *sa)
 {
 	return nt_init(ptr, NT_S390_TIMER, &sa->timer, sizeof(sa->timer),
-			 KEXEC_CORE_NOTE_NAME);
+			 LINUX_NOTE_NAME);
 }
 
 /*
@@ -331,7 +323,7 @@ static void *nt_s390_timer(void *ptr, struct save_area *sa)
 static void *nt_s390_tod_cmp(void *ptr, struct save_area *sa)
 {
 	return nt_init(ptr, NT_S390_TODCMP, &sa->clk_cmp,
-		       sizeof(sa->clk_cmp), KEXEC_CORE_NOTE_NAME);
+		       sizeof(sa->clk_cmp), LINUX_NOTE_NAME);
 }
 
 /*
@@ -340,7 +332,7 @@ static void *nt_s390_tod_cmp(void *ptr, struct save_area *sa)
 static void *nt_s390_tod_preg(void *ptr, struct save_area *sa)
 {
 	return nt_init(ptr, NT_S390_TODPREG, &sa->tod_reg,
-		       sizeof(sa->tod_reg), KEXEC_CORE_NOTE_NAME);
+		       sizeof(sa->tod_reg), LINUX_NOTE_NAME);
 }
 
 /*
@@ -349,7 +341,7 @@ static void *nt_s390_tod_preg(void *ptr, struct save_area *sa)
 static void *nt_s390_ctrs(void *ptr, struct save_area *sa)
 {
 	return nt_init(ptr, NT_S390_CTRS, &sa->ctrl_regs,
-		       sizeof(sa->ctrl_regs), KEXEC_CORE_NOTE_NAME);
+		       sizeof(sa->ctrl_regs), LINUX_NOTE_NAME);
 }
 
 /*
@@ -358,7 +350,7 @@ static void *nt_s390_ctrs(void *ptr, struct save_area *sa)
 static void *nt_s390_prefix(void *ptr, struct save_area *sa)
 {
 	return nt_init(ptr, NT_S390_PREFIX, &sa->pref_reg,
-			 sizeof(sa->pref_reg), KEXEC_CORE_NOTE_NAME);
+			 sizeof(sa->pref_reg), LINUX_NOTE_NAME);
 }
 
 /*
@@ -367,7 +359,7 @@ static void *nt_s390_prefix(void *ptr, struct save_area *sa)
 static void *nt_s390_vx_high(void *ptr, __vector128 *vx_regs)
 {
 	return nt_init(ptr, NT_S390_VXRS_HIGH, &vx_regs[16],
-		       16 * sizeof(__vector128), KEXEC_CORE_NOTE_NAME);
+		       16 * sizeof(__vector128), LINUX_NOTE_NAME);
 }
 
 /*
@@ -380,12 +372,12 @@ static void *nt_s390_vx_low(void *ptr, __vector128 *vx_regs)
 	int i;
 
 	note = (Elf64_Nhdr *)ptr;
-	note->n_namesz = strlen(KEXEC_CORE_NOTE_NAME) + 1;
+	note->n_namesz = strlen(LINUX_NOTE_NAME) + 1;
 	note->n_descsz = 16 * 8;
 	note->n_type = NT_S390_VXRS_LOW;
 	len = sizeof(Elf64_Nhdr);
 
-	memcpy(ptr + len, KEXEC_CORE_NOTE_NAME, note->n_namesz);
+	memcpy(ptr + len, LINUX_NOTE_NAME, note->n_namesz);
 	len = roundup(len + note->n_namesz, 4);
 
 	ptr += len;
@@ -472,6 +464,20 @@ static void *nt_vmcoreinfo(void *ptr)
 }
 
 /*
+ * Initialize final note (needed for /proc/vmcore code)
+ */
+static void *nt_final(void *ptr)
+{
+	Elf64_Nhdr *note;
+
+	note = (Elf64_Nhdr *) ptr;
+	note->n_namesz = 0;
+	note->n_descsz = 0;
+	note->n_type = 0;
+	return PTR_ADD(ptr, sizeof(Elf64_Nhdr));
+}
+
+/*
  * Initialize ELF header (new kernel)
  */
 static void *ehdr_init(Elf64_Ehdr *ehdr, int mem_chunk_cnt)
@@ -515,7 +521,8 @@ static int get_mem_chunk_cnt(void)
 	int cnt = 0;
 	u64 idx;
 
-	for_each_dump_mem_range(idx, NUMA_NO_NODE, NULL, NULL, NULL)
+	for_each_mem_range(idx, &memblock.physmem, &oldmem_type, NUMA_NO_NODE,
+			   MEMBLOCK_NONE, NULL, NULL, NULL)
 		cnt++;
 	return cnt;
 }
@@ -528,7 +535,8 @@ static void loads_init(Elf64_Phdr *phdr, u64 loads_offset)
 	phys_addr_t start, end;
 	u64 idx;
 
-	for_each_dump_mem_range(idx, NUMA_NO_NODE, &start, &end, NULL) {
+	for_each_mem_range(idx, &memblock.physmem, &oldmem_type, NUMA_NO_NODE,
+			   MEMBLOCK_NONE, &start, &end, NULL) {
 		phdr->p_filesz = end - start;
 		phdr->p_type = PT_LOAD;
 		phdr->p_offset = start;
@@ -559,6 +567,7 @@ static void *notes_init(Elf64_Phdr *phdr, void *ptr, u64 notes_offset)
 		ptr = fill_cpu_elf_notes(ptr, &sa_ext->sa, sa_ext->vx_regs);
 	}
 	ptr = nt_vmcoreinfo(ptr);
+	ptr = nt_final(ptr);
 	memset(phdr, 0, sizeof(*phdr));
 	phdr->p_type = PT_NOTE;
 	phdr->p_offset = notes_offset;

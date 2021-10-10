@@ -34,7 +34,7 @@
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
-#include <media/videobuf2-core.h>
+#include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-dma-contig.h>
 
 #include "camif-core.h"
@@ -117,6 +117,8 @@ static int sensor_set_power(struct camif_dev *camif, int on)
 
 	if (camif->sensor.power_count == !on)
 		err = v4l2_subdev_call(sensor->sd, core, s_power, on);
+	if (err == -ENOIOCTLCMD)
+		err = 0;
 	if (!err)
 		sensor->power_count += on ? 1 : -1;
 
@@ -164,12 +166,12 @@ static int camif_reinitialize(struct camif_vp *vp)
 	/* Release unused buffers */
 	while (!list_empty(&vp->pending_buf_q)) {
 		buf = camif_pending_queue_pop(vp);
-		vb2_buffer_done(&buf->vb, VB2_BUF_STATE_ERROR);
+		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 	}
 
 	while (!list_empty(&vp->active_buf_q)) {
 		buf = camif_active_queue_pop(vp);
-		vb2_buffer_done(&buf->vb, VB2_BUF_STATE_ERROR);
+		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 	}
 
 	spin_unlock_irqrestore(&camif->slock, flags);
@@ -328,25 +330,19 @@ irqreturn_t s3c_camif_irq_handler(int irq, void *priv)
 	    !list_empty(&vp->active_buf_q)) {
 		unsigned int index;
 		struct camif_buffer *vbuf;
-		struct timeval *tv;
-		struct timespec ts;
 		/*
 		 * Get previous DMA write buffer index:
 		 * 0 => DMA buffer 0, 2;
 		 * 1 => DMA buffer 1, 3.
 		 */
 		index = (CISTATUS_FRAMECNT(status) + 2) & 1;
-
-		ktime_get_ts(&ts);
 		vbuf = camif_active_queue_peek(vp, index);
 
 		if (!WARN_ON(vbuf == NULL)) {
 			/* Dequeue a filled buffer */
-			tv = &vbuf->vb.v4l2_buf.timestamp;
-			tv->tv_sec = ts.tv_sec;
-			tv->tv_usec = ts.tv_nsec / NSEC_PER_USEC;
-			vbuf->vb.v4l2_buf.sequence = vp->frame_sequence++;
-			vb2_buffer_done(&vbuf->vb, VB2_BUF_STATE_DONE);
+			v4l2_get_timestamp(&vbuf->vb.timestamp);
+			vbuf->vb.sequence = vp->frame_sequence++;
+			vb2_buffer_done(&vbuf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 
 			/* Set up an empty buffer at the DMA engine */
 			vbuf = camif_pending_queue_pop(vp);
@@ -441,10 +437,11 @@ static void stop_streaming(struct vb2_queue *vq)
 	camif_stop_capture(vp);
 }
 
-static int queue_setup(struct vb2_queue *vq, const struct v4l2_format *pfmt,
+static int queue_setup(struct vb2_queue *vq, const void *parg,
 		       unsigned int *num_buffers, unsigned int *num_planes,
 		       unsigned int sizes[], void *allocators[])
 {
+	const struct v4l2_format *pfmt = parg;
 	const struct v4l2_pix_format *pix = NULL;
 	struct camif_vp *vp = vb2_get_drv_priv(vq);
 	struct camif_dev *camif = vp->camif;
@@ -496,13 +493,14 @@ static int buffer_prepare(struct vb2_buffer *vb)
 
 static void buffer_queue(struct vb2_buffer *vb)
 {
-	struct camif_buffer *buf = container_of(vb, struct camif_buffer, vb);
+	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+	struct camif_buffer *buf = container_of(vbuf, struct camif_buffer, vb);
 	struct camif_vp *vp = vb2_get_drv_priv(vb->vb2_queue);
 	struct camif_dev *camif = vp->camif;
 	unsigned long flags;
 
 	spin_lock_irqsave(&camif->slock, flags);
-	WARN_ON(camif_prepare_addr(vp, &buf->vb, &buf->paddr));
+	WARN_ON(camif_prepare_addr(vp, &buf->vb.vb2_buf, &buf->paddr));
 
 	if (!(vp->state & ST_VP_STREAMING) && vp->active_buffers < 2) {
 		/* Schedule an empty buffer in H/W */
@@ -1272,16 +1270,17 @@ static void __camif_subdev_try_format(struct camif_dev *camif,
 {
 	const struct s3c_camif_variant *variant = camif->variant;
 	const struct vp_pix_limits *pix_lim;
-	int i = ARRAY_SIZE(camif_mbus_formats);
+	unsigned int i;
 
 	/* FIXME: constraints against codec or preview path ? */
 	pix_lim = &variant->vp_pix_limits[VP_CODEC];
 
-	while (i-- >= 0)
+	for (i = 0; i < ARRAY_SIZE(camif_mbus_formats); i++)
 		if (camif_mbus_formats[i] == mf->code)
 			break;
 
-	mf->code = camif_mbus_formats[i];
+	if (i == ARRAY_SIZE(camif_mbus_formats))
+		mf->code = camif_mbus_formats[0];
 
 	if (pad == CAMIF_SD_PAD_SINK) {
 		v4l_bound_align_image(&mf->width, 8, CAMIF_MAX_PIX_WIDTH,

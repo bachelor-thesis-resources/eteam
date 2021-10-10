@@ -1123,8 +1123,11 @@ static int wl12xx_chip_wakeup(struct wl1271 *wl, bool plt)
 		goto out;
 
 	ret = wl12xx_fetch_firmware(wl, plt);
-	if (ret < 0)
-		goto out;
+	if (ret < 0) {
+		kfree(wl->fw_status);
+		kfree(wl->raw_fw_status);
+		kfree(wl->tx_res_if);
+	}
 
 out:
 	return ret;
@@ -1792,6 +1795,9 @@ static int wl1271_op_suspend(struct ieee80211_hw *hw,
 
 	wl->wow_enabled = true;
 	wl12xx_for_each_wlvif(wl, wlvif) {
+		if (wlcore_is_p2p_mgmt(wlvif))
+			continue;
+
 		ret = wl1271_configure_suspend(wl, wlvif, wow);
 		if (ret < 0) {
 			mutex_unlock(&wl->mutex);
@@ -1901,6 +1907,9 @@ static int wl1271_op_resume(struct ieee80211_hw *hw)
 		goto out;
 
 	wl12xx_for_each_wlvif(wl, wlvif) {
+		if (wlcore_is_p2p_mgmt(wlvif))
+			continue;
+
 		wl1271_configure_resume(wl, wlvif);
 	}
 
@@ -2256,6 +2265,7 @@ static int wl12xx_init_vif_data(struct wl1271 *wl, struct ieee80211_vif *vif)
 		wlvif->p2p = 1;
 		/* fall-through */
 	case NL80211_IFTYPE_STATION:
+	case NL80211_IFTYPE_P2P_DEVICE:
 		wlvif->bss_type = BSS_TYPE_STA_BSS;
 		break;
 	case NL80211_IFTYPE_ADHOC:
@@ -2477,7 +2487,8 @@ static void wlcore_hw_queue_iter(void *data, u8 *mac,
 {
 	struct wlcore_hw_queue_iter_data *iter_data = data;
 
-	if (WARN_ON_ONCE(vif->hw_queue[0] == IEEE80211_INVAL_HW_QUEUE))
+	if (vif->type == NL80211_IFTYPE_P2P_DEVICE ||
+	    WARN_ON_ONCE(vif->hw_queue[0] == IEEE80211_INVAL_HW_QUEUE))
 		return;
 
 	if (iter_data->cur_running || vif == iter_data->vif) {
@@ -2494,6 +2505,11 @@ static int wlcore_allocate_hw_queue_base(struct wl1271 *wl,
 	struct ieee80211_vif *vif = wl12xx_wlvif_to_vif(wlvif);
 	struct wlcore_hw_queue_iter_data iter_data = {};
 	int i, q_base;
+
+	if (vif->type == NL80211_IFTYPE_P2P_DEVICE) {
+		vif->cab_queue = IEEE80211_INVAL_HW_QUEUE;
+		return 0;
+	}
 
 	iter_data.vif = vif;
 
@@ -2618,14 +2634,27 @@ static int wl1271_op_add_interface(struct ieee80211_hw *hw,
 			goto out;
 	}
 
-	ret = wl12xx_cmd_role_enable(wl, vif->addr,
-				     role_type, &wlvif->role_id);
-	if (ret < 0)
-		goto out;
+	if (!wlcore_is_p2p_mgmt(wlvif)) {
+		ret = wl12xx_cmd_role_enable(wl, vif->addr,
+					     role_type, &wlvif->role_id);
+		if (ret < 0)
+			goto out;
 
-	ret = wl1271_init_vif_specific(wl, vif);
-	if (ret < 0)
-		goto out;
+		ret = wl1271_init_vif_specific(wl, vif);
+		if (ret < 0)
+			goto out;
+
+	} else {
+		ret = wl12xx_cmd_role_enable(wl, vif->addr, WL1271_ROLE_DEVICE,
+					     &wlvif->dev_role_id);
+		if (ret < 0)
+			goto out;
+
+		/* needed mainly for configuring rate policies */
+		ret = wl1271_sta_hw_init(wl, wlvif);
+		if (ret < 0)
+			goto out;
+	}
 
 	list_add(&wlvif->list, &wl->wlvif_list);
 	set_bit(WLVIF_FLAG_INITIALIZED, &wlvif->flags);
@@ -2696,9 +2725,15 @@ static void __wl1271_op_remove_interface(struct wl1271 *wl,
 				wl12xx_stop_dev(wl, wlvif);
 		}
 
-		ret = wl12xx_cmd_role_disable(wl, &wlvif->role_id);
-		if (ret < 0)
-			goto deinit;
+		if (!wlcore_is_p2p_mgmt(wlvif)) {
+			ret = wl12xx_cmd_role_disable(wl, &wlvif->role_id);
+			if (ret < 0)
+				goto deinit;
+		} else {
+			ret = wl12xx_cmd_role_disable(wl, &wlvif->dev_role_id);
+			if (ret < 0)
+				goto deinit;
+		}
 
 		wl1271_ps_elp_sleep(wl);
 	}
@@ -2854,21 +2889,8 @@ static int wlcore_join(struct wl1271 *wl, struct wl12xx_vif *wlvif)
 
 	if (is_ibss)
 		ret = wl12xx_cmd_role_start_ibss(wl, wlvif);
-	else {
-		if (wl->quirks & WLCORE_QUIRK_START_STA_FAILS) {
-			/*
-			 * TODO: this is an ugly workaround for wl12xx fw
-			 * bug - we are not able to tx/rx after the first
-			 * start_sta, so make dummy start+stop calls,
-			 * and then call start_sta again.
-			 * this should be fixed in the fw.
-			 */
-			wl12xx_cmd_role_start_sta(wl, wlvif);
-			wl12xx_cmd_role_stop_sta(wl, wlvif);
-		}
-
+	else
 		ret = wl12xx_cmd_role_start_sta(wl, wlvif);
-	}
 
 	return ret;
 }
@@ -3088,6 +3110,9 @@ static int wl12xx_config_vif(struct wl1271 *wl, struct wl12xx_vif *wlvif,
 {
 	int ret;
 
+	if (wlcore_is_p2p_mgmt(wlvif))
+		return 0;
+
 	if (conf->power_level != wlvif->power_level) {
 		ret = wl1271_acx_tx_power(wl, wlvif, conf->power_level);
 		if (ret < 0)
@@ -3207,6 +3232,9 @@ static void wl1271_op_configure_filter(struct ieee80211_hw *hw,
 		goto out;
 
 	wl12xx_for_each_wlvif(wl, wlvif) {
+		if (wlcore_is_p2p_mgmt(wlvif))
+			continue;
+
 		if (wlvif->bss_type != BSS_TYPE_AP_BSS) {
 			if (*total & FIF_ALLMULTI)
 				ret = wl1271_acx_group_address_tbl(wl, wlvif,
@@ -4837,6 +4865,9 @@ static int wl1271_op_conf_tx(struct ieee80211_hw *hw,
 	u8 ps_scheme;
 	int ret = 0;
 
+	if (wlcore_is_p2p_mgmt(wlvif))
+		return 0;
+
 	mutex_lock(&wl->mutex);
 
 	wl1271_debug(DEBUG_MAC80211, "mac80211 conf tx %d", queue);
@@ -5220,14 +5251,16 @@ out:
 
 static int wl1271_op_ampdu_action(struct ieee80211_hw *hw,
 				  struct ieee80211_vif *vif,
-				  enum ieee80211_ampdu_mlme_action action,
-				  struct ieee80211_sta *sta, u16 tid, u16 *ssn,
-				  u8 buf_size)
+				  struct ieee80211_ampdu_params *params)
 {
 	struct wl1271 *wl = hw->priv;
 	struct wl12xx_vif *wlvif = wl12xx_vif_to_data(vif);
 	int ret;
 	u8 hlid, *ba_bitmap;
+	struct ieee80211_sta *sta = params->sta;
+	enum ieee80211_ampdu_mlme_action action = params->action;
+	u16 tid = params->tid;
+	u16 *ssn = &params->ssn;
 
 	wl1271_debug(DEBUG_MAC80211, "mac80211 ampdu action %d tid %d", action,
 		     tid);
@@ -5285,7 +5318,9 @@ static int wl1271_op_ampdu_action(struct ieee80211_hw *hw,
 		}
 
 		ret = wl12xx_acx_set_ba_receiver_session(wl, tid, *ssn, true,
-							 hlid);
+				hlid,
+				params->buf_size);
+
 		if (!ret) {
 			*ba_bitmap |= BIT(tid);
 			wl->ba_rx_session_count++;
@@ -5306,7 +5341,7 @@ static int wl1271_op_ampdu_action(struct ieee80211_hw *hw,
 		}
 
 		ret = wl12xx_acx_set_ba_receiver_session(wl, tid, 0, false,
-							 hlid);
+							 hlid, 0);
 		if (!ret) {
 			*ba_bitmap &= ~BIT(tid);
 			wl->ba_rx_session_count--;
@@ -6078,8 +6113,10 @@ static int wl1271_init_ieee80211(struct wl1271 *wl)
 	wl->hw->wiphy->n_cipher_suites = ARRAY_SIZE(cipher_suites);
 
 	wl->hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION) |
-		BIT(NL80211_IFTYPE_ADHOC) | BIT(NL80211_IFTYPE_AP) |
-		BIT(NL80211_IFTYPE_P2P_CLIENT) | BIT(NL80211_IFTYPE_P2P_GO);
+					 BIT(NL80211_IFTYPE_AP) |
+					 BIT(NL80211_IFTYPE_P2P_DEVICE) |
+					 BIT(NL80211_IFTYPE_P2P_CLIENT) |
+					 BIT(NL80211_IFTYPE_P2P_GO);
 	wl->hw->wiphy->max_scan_ssids = 1;
 	wl->hw->wiphy->max_sched_scan_ssids = 16;
 	wl->hw->wiphy->max_match_sets = 16;

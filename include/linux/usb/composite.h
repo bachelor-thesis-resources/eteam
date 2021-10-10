@@ -53,6 +53,9 @@
 /* big enough to hold our biggest descriptor */
 #define USB_COMP_EP0_BUFSIZ	1024
 
+/* OS feature descriptor length <= 4kB */
+#define USB_COMP_EP0_OS_DESC_BUFSIZ	4096
+
 #define USB_MS_TO_HS_INTERVAL(x)	(ilog2((x * 1000 / 125)) + 1)
 struct usb_configuration;
 
@@ -228,6 +231,8 @@ struct usb_function {
 	struct list_head		list;
 	DECLARE_BITMAP(endpoints, 32);
 	const struct usb_function_instance *fi;
+
+	unsigned int		bind_deactivated:1;
 };
 
 int usb_add_function(struct usb_configuration *, struct usb_function *);

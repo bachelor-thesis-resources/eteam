@@ -26,7 +26,7 @@
 
 #include <linux/list.h>
 #include <linux/types.h>
-#include "viosrp.h"
+#include <scsi/viosrp.h>
 
 #define IBMVFC_NAME	"ibmvfc"
 #define IBMVFC_DRIVER_VERSION		"1.0.11"
@@ -366,7 +366,7 @@ enum ibmvfc_fcp_rsp_info_codes {
 };
 
 struct ibmvfc_fcp_rsp_info {
-	__be16 reserved;
+	u8 reserved[3];
 	u8 rsp_code;
 	u8 reserved2[4];
 }__attribute__((packed, aligned (2)));

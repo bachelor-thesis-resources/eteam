@@ -160,8 +160,12 @@ static ssize_t mtdchar_read(struct file *file, char __user *buf, size_t count,
 
 	pr_debug("MTD_read\n");
 
-	if (*ppos + count > mtd->size)
-		count = mtd->size - *ppos;
+	if (*ppos + count > mtd->size) {
+		if (*ppos < mtd->size)
+			count = mtd->size - *ppos;
+		else
+			count = 0;
+	}
 
 	if (!count)
 		return 0;
@@ -246,7 +250,7 @@ static ssize_t mtdchar_write(struct file *file, const char __user *buf, size_t c
 
 	pr_debug("MTD_write\n");
 
-	if (*ppos == mtd->size)
+	if (*ppos >= mtd->size)
 		return -ENOSPC;
 
 	if (*ppos + count > mtd->size)
@@ -367,9 +371,6 @@ static int mtdchar_writeoob(struct file *file, struct mtd_info *mtd,
 	struct mtd_oob_ops ops;
 	uint32_t retlen;
 	int ret = 0;
-
-	if (!(file->f_mode & FMODE_WRITE))
-		return -EPERM;
 
 	if (length > 4096)
 		return -EINVAL;
@@ -498,21 +499,17 @@ static int shrink_ecclayout(const struct nand_ecclayout *from,
 }
 
 static int mtdchar_blkpg_ioctl(struct mtd_info *mtd,
-			   struct blkpg_ioctl_arg __user *arg)
+			       struct blkpg_ioctl_arg *arg)
 {
-	struct blkpg_ioctl_arg a;
 	struct blkpg_partition p;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
 
-	if (copy_from_user(&a, arg, sizeof(struct blkpg_ioctl_arg)))
+	if (copy_from_user(&p, arg->data, sizeof(p)))
 		return -EFAULT;
 
-	if (copy_from_user(&p, a.data, sizeof(struct blkpg_partition)))
-		return -EFAULT;
-
-	switch (a.op) {
+	switch (arg->op) {
 	case BLKPG_ADD_PARTITION:
 
 		/* Only master mtd device must be used to add partitions */
@@ -608,6 +605,48 @@ static int mtdchar_ioctl(struct file *file, u_int cmd, u_long arg)
 			return -EFAULT;
 	}
 
+	/*
+	 * Check the file mode to require "dangerous" commands to have write
+	 * permissions.
+	 */
+	switch (cmd) {
+	/* "safe" commands */
+	case MEMGETREGIONCOUNT:
+	case MEMGETREGIONINFO:
+	case MEMGETINFO:
+	case MEMREADOOB:
+	case MEMREADOOB64:
+	case MEMLOCK:
+	case MEMUNLOCK:
+	case MEMISLOCKED:
+	case MEMGETOOBSEL:
+	case MEMGETBADBLOCK:
+	case MEMSETBADBLOCK:
+	case OTPSELECT:
+	case OTPGETREGIONCOUNT:
+	case OTPGETREGIONINFO:
+	case OTPLOCK:
+	case ECCGETLAYOUT:
+	case ECCGETSTATS:
+	case MTDFILEMODE:
+	case BLKPG:
+	case BLKRRPART:
+		break;
+
+	/* "dangerous" commands */
+	case MEMERASE:
+	case MEMERASE64:
+	case MEMWRITEOOB:
+	case MEMWRITEOOB64:
+	case MEMWRITE:
+		if (!(file->f_mode & FMODE_WRITE))
+			return -EPERM;
+		break;
+
+	default:
+		return -ENOTTY;
+	}
+
 	switch (cmd) {
 	case MEMGETREGIONCOUNT:
 		if (copy_to_user(argp, &(mtd->numeraseregions), sizeof(int)))
@@ -654,9 +693,6 @@ static int mtdchar_ioctl(struct file *file, u_int cmd, u_long arg)
 	case MEMERASE64:
 	{
 		struct erase_info *erase;
-
-		if(!(file->f_mode & FMODE_WRITE))
-			return -EPERM;
 
 		erase=kzalloc(sizeof(struct erase_info),GFP_KERNEL);
 		if (!erase)
@@ -966,8 +1002,13 @@ static int mtdchar_ioctl(struct file *file, u_int cmd, u_long arg)
 
 	case BLKPG:
 	{
-		ret = mtdchar_blkpg_ioctl(mtd,
-		      (struct blkpg_ioctl_arg __user *)arg);
+		struct blkpg_ioctl_arg __user *blk_arg = argp;
+		struct blkpg_ioctl_arg a;
+
+		if (copy_from_user(&a, blk_arg, sizeof(a)))
+			ret = -EFAULT;
+		else
+			ret = mtdchar_blkpg_ioctl(mtd, &a);
 		break;
 	}
 
@@ -977,9 +1018,6 @@ static int mtdchar_ioctl(struct file *file, u_int cmd, u_long arg)
 		ret = 0;
 		break;
 	}
-
-	default:
-		ret = -ENOTTY;
 	}
 
 	return ret;
@@ -1023,6 +1061,11 @@ static long mtdchar_compat_ioctl(struct file *file, unsigned int cmd,
 		struct mtd_oob_buf32 buf;
 		struct mtd_oob_buf32 __user *buf_user = argp;
 
+		if (!(file->f_mode & FMODE_WRITE)) {
+			ret = -EPERM;
+			break;
+		}
+
 		if (copy_from_user(&buf, argp, sizeof(buf)))
 			ret = -EFAULT;
 		else
@@ -1046,6 +1089,29 @@ static long mtdchar_compat_ioctl(struct file *file, unsigned int cmd,
 				&buf_user->start);
 		break;
 	}
+
+	case BLKPG:
+	{
+		/* Convert from blkpg_compat_ioctl_arg to blkpg_ioctl_arg */
+		struct blkpg_compat_ioctl_arg __user *uarg = argp;
+		struct blkpg_compat_ioctl_arg compat_arg;
+		struct blkpg_ioctl_arg a;
+
+		if (copy_from_user(&compat_arg, uarg, sizeof(compat_arg))) {
+			ret = -EFAULT;
+			break;
+		}
+
+		memset(&a, 0, sizeof(a));
+		a.op = compat_arg.op;
+		a.flags = compat_arg.flags;
+		a.datalen = compat_arg.datalen;
+		a.data = compat_ptr(compat_arg.data);
+
+		ret = mtdchar_blkpg_ioctl(mtd, &a);
+		break;
+	}
+
 	default:
 		ret = mtdchar_ioctl(file, cmd, (unsigned long)argp);
 	}

@@ -19,6 +19,8 @@
  *   - PACKET_FANOUT_LB
  *   - PACKET_FANOUT_CPU
  *   - PACKET_FANOUT_ROLLOVER
+ *   - PACKET_FANOUT_CBPF
+ *   - PACKET_FANOUT_EBPF
  *
  * Todo:
  * - functionality: PACKET_FANOUT_FLAG_DEFRAG
@@ -44,8 +46,11 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/unistd.h>	/* for __NR_bpf */
 #include <linux/filter.h>
+#include <linux/bpf.h>
 #include <linux/if_packet.h>
+#include <net/if.h>
 #include <net/ethernet.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
@@ -67,17 +72,31 @@
 
 /* Open a socket in a given fanout mode.
  * @return -1 if mode is bad, a valid socket otherwise */
-static int sock_fanout_open(uint16_t typeflags, int num_packets)
+static int sock_fanout_open(uint16_t typeflags)
 {
+	struct sockaddr_ll addr = {0};
 	int fd, val;
 
-	fd = socket(PF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
+	fd = socket(PF_PACKET, SOCK_DGRAM, 0);
 	if (fd < 0) {
 		perror("socket packet");
 		exit(1);
 	}
 
-	/* fanout group ID is always 0: tests whether old groups are deleted */
+	pair_udp_setfilter(fd);
+
+	addr.sll_family = AF_PACKET;
+	addr.sll_protocol = htons(ETH_P_IP);
+	addr.sll_ifindex = if_nametoindex("lo");
+	if (addr.sll_ifindex == 0) {
+		perror("if_nametoindex");
+		exit(1);
+	}
+	if (bind(fd, (void *) &addr, sizeof(addr))) {
+		perror("bind packet");
+		exit(1);
+	}
+
 	val = ((int) typeflags) << 16;
 	if (setsockopt(fd, SOL_PACKET, PACKET_FANOUT, &val, sizeof(val))) {
 		if (close(fd)) {
@@ -87,8 +106,53 @@ static int sock_fanout_open(uint16_t typeflags, int num_packets)
 		return -1;
 	}
 
-	pair_udp_setfilter(fd);
 	return fd;
+}
+
+static void sock_fanout_set_ebpf(int fd)
+{
+	static char log_buf[65536];
+
+	const int len_off = __builtin_offsetof(struct __sk_buff, len);
+	struct bpf_insn prog[] = {
+		{ BPF_ALU64 | BPF_MOV | BPF_X,   6, 1, 0, 0 },
+		{ BPF_LDX   | BPF_W   | BPF_MEM, 0, 6, len_off, 0 },
+		{ BPF_JMP   | BPF_JGE | BPF_K,   0, 0, 1, DATA_LEN },
+		{ BPF_JMP   | BPF_JA  | BPF_K,   0, 0, 4, 0 },
+		{ BPF_LD    | BPF_B   | BPF_ABS, 0, 0, 0, 0x50 },
+		{ BPF_JMP   | BPF_JEQ | BPF_K,   0, 0, 2, DATA_CHAR },
+		{ BPF_JMP   | BPF_JEQ | BPF_K,   0, 0, 1, DATA_CHAR_1 },
+		{ BPF_ALU   | BPF_MOV | BPF_K,   0, 0, 0, 0 },
+		{ BPF_JMP   | BPF_EXIT,          0, 0, 0, 0 }
+	};
+	union bpf_attr attr;
+	int pfd;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
+	attr.insns = (unsigned long) prog;
+	attr.insn_cnt = sizeof(prog) / sizeof(prog[0]);
+	attr.license = (unsigned long) "GPL";
+	attr.log_buf = (unsigned long) log_buf,
+	attr.log_size = sizeof(log_buf),
+	attr.log_level = 1,
+
+	pfd = syscall(__NR_bpf, BPF_PROG_LOAD, &attr, sizeof(attr));
+	if (pfd < 0) {
+		perror("bpf");
+		fprintf(stderr, "bpf verifier:\n%s\n", log_buf);
+		exit(1);
+	}
+
+	if (setsockopt(fd, SOL_PACKET, PACKET_FANOUT_DATA, &pfd, sizeof(pfd))) {
+		perror("fanout data ebpf");
+		exit(1);
+	}
+
+	if (close(pfd)) {
+		perror("close ebpf");
+		exit(1);
+	}
 }
 
 static char *sock_fanout_open_ring(int fd)
@@ -115,8 +179,8 @@ static char *sock_fanout_open_ring(int fd)
 
 	ring = mmap(0, req.tp_block_size * req.tp_block_nr,
 		    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	if (!ring) {
-		fprintf(stderr, "packetsock ring mmap\n");
+	if (ring == MAP_FAILED) {
+		perror("packetsock ring mmap");
 		exit(1);
 	}
 
@@ -148,7 +212,7 @@ static int sock_fanout_read(int fds[], char *rings[], const int expect[])
 
 	if ((!(ret[0] == expect[0] && ret[1] == expect[1])) &&
 	    (!(ret[0] == expect[1] && ret[1] == expect[0]))) {
-		fprintf(stderr, "ERROR: incorrect queue lengths\n");
+		fprintf(stderr, "warning: incorrect queue lengths\n");
 		return 1;
 	}
 
@@ -161,7 +225,7 @@ static void test_control_single(void)
 	fprintf(stderr, "test: control single socket\n");
 
 	if (sock_fanout_open(PACKET_FANOUT_ROLLOVER |
-			       PACKET_FANOUT_FLAG_ROLLOVER, 0) != -1) {
+			       PACKET_FANOUT_FLAG_ROLLOVER) != -1) {
 		fprintf(stderr, "ERROR: opened socket with dual rollover\n");
 		exit(1);
 	}
@@ -174,26 +238,26 @@ static void test_control_group(void)
 
 	fprintf(stderr, "test: control multiple sockets\n");
 
-	fds[0] = sock_fanout_open(PACKET_FANOUT_HASH, 20);
+	fds[0] = sock_fanout_open(PACKET_FANOUT_HASH);
 	if (fds[0] == -1) {
 		fprintf(stderr, "ERROR: failed to open HASH socket\n");
 		exit(1);
 	}
 	if (sock_fanout_open(PACKET_FANOUT_HASH |
-			       PACKET_FANOUT_FLAG_DEFRAG, 10) != -1) {
+			       PACKET_FANOUT_FLAG_DEFRAG) != -1) {
 		fprintf(stderr, "ERROR: joined group with wrong flag defrag\n");
 		exit(1);
 	}
 	if (sock_fanout_open(PACKET_FANOUT_HASH |
-			       PACKET_FANOUT_FLAG_ROLLOVER, 10) != -1) {
+			       PACKET_FANOUT_FLAG_ROLLOVER) != -1) {
 		fprintf(stderr, "ERROR: joined group with wrong flag ro\n");
 		exit(1);
 	}
-	if (sock_fanout_open(PACKET_FANOUT_CPU, 10) != -1) {
+	if (sock_fanout_open(PACKET_FANOUT_CPU) != -1) {
 		fprintf(stderr, "ERROR: joined group with wrong mode\n");
 		exit(1);
 	}
-	fds[1] = sock_fanout_open(PACKET_FANOUT_HASH, 20);
+	fds[1] = sock_fanout_open(PACKET_FANOUT_HASH);
 	if (fds[1] == -1) {
 		fprintf(stderr, "ERROR: failed to join group\n");
 		exit(1);
@@ -209,16 +273,23 @@ static int test_datapath(uint16_t typeflags, int port_off,
 {
 	const int expect0[] = { 0, 0 };
 	char *rings[2];
+	uint8_t type = typeflags & 0xFF;
 	int fds[2], fds_udp[2][2], ret;
 
-	fprintf(stderr, "test: datapath 0x%hx\n", typeflags);
+	fprintf(stderr, "\ntest: datapath 0x%hx ports %hu,%hu\n",
+		typeflags, PORT_BASE, PORT_BASE + port_off);
 
-	fds[0] = sock_fanout_open(typeflags, 20);
-	fds[1] = sock_fanout_open(typeflags, 20);
+	fds[0] = sock_fanout_open(typeflags);
+	fds[1] = sock_fanout_open(typeflags);
 	if (fds[0] == -1 || fds[1] == -1) {
 		fprintf(stderr, "ERROR: failed open\n");
 		exit(1);
 	}
+	if (type == PACKET_FANOUT_CBPF)
+		sock_setfilter(fds[0], SOL_PACKET, PACKET_FANOUT_DATA);
+	else if (type == PACKET_FANOUT_EBPF)
+		sock_fanout_set_ebpf(fds[0]);
+
 	rings[0] = sock_fanout_open_ring(fds[0]);
 	rings[1] = sock_fanout_open_ring(fds[1]);
 	pair_udp_open(fds_udp[0], PORT_BASE);
@@ -227,11 +298,11 @@ static int test_datapath(uint16_t typeflags, int port_off,
 
 	/* Send data, but not enough to overflow a queue */
 	pair_udp_send(fds_udp[0], 15);
-	pair_udp_send(fds_udp[1], 5);
+	pair_udp_send_char(fds_udp[1], 5, DATA_CHAR_1);
 	ret = sock_fanout_read(fds, rings, expect1);
 
 	/* Send more data, overflow the queue */
-	pair_udp_send(fds_udp[0], 15);
+	pair_udp_send_char(fds_udp[0], 15, DATA_CHAR_1);
 	/* TODO: ensure consistent order between expect1 and expect2 */
 	ret |= sock_fanout_read(fds, rings, expect2);
 
@@ -275,7 +346,8 @@ int main(int argc, char **argv)
 	const int expect_rb[2][2]	= { { 15, 5 },  { 20, 15 } };
 	const int expect_cpu0[2][2]	= { { 20, 0 },  { 20, 0 } };
 	const int expect_cpu1[2][2]	= { { 0, 20 },  { 0, 20 } };
-	int port_off = 2, tries = 5, ret;
+	const int expect_bpf[2][2]	= { { 15, 5 },  { 15, 20 } };
+	int port_off = 2, tries = 20, ret;
 
 	test_control_single();
 	test_control_group();
@@ -283,10 +355,14 @@ int main(int argc, char **argv)
 	/* find a set of ports that do not collide onto the same socket */
 	ret = test_datapath(PACKET_FANOUT_HASH, port_off,
 			    expect_hash[0], expect_hash[1]);
-	while (ret && tries--) {
+	while (ret) {
 		fprintf(stderr, "info: trying alternate ports (%d)\n", tries);
 		ret = test_datapath(PACKET_FANOUT_HASH, ++port_off,
 				    expect_hash[0], expect_hash[1]);
+		if (!--tries) {
+			fprintf(stderr, "too many collisions\n");
+			return 1;
+		}
 	}
 
 	ret |= test_datapath(PACKET_FANOUT_HASH | PACKET_FANOUT_FLAG_ROLLOVER,
@@ -295,6 +371,11 @@ int main(int argc, char **argv)
 			     port_off, expect_lb[0], expect_lb[1]);
 	ret |= test_datapath(PACKET_FANOUT_ROLLOVER,
 			     port_off, expect_rb[0], expect_rb[1]);
+
+	ret |= test_datapath(PACKET_FANOUT_CBPF,
+			     port_off, expect_bpf[0], expect_bpf[1]);
+	ret |= test_datapath(PACKET_FANOUT_EBPF,
+			     port_off, expect_bpf[0], expect_bpf[1]);
 
 	set_cpuaffinity(0);
 	ret |= test_datapath(PACKET_FANOUT_CPU, port_off,

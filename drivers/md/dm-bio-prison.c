@@ -32,7 +32,7 @@ static struct kmem_cache *_cell_cache;
  */
 struct dm_bio_prison *dm_bio_prison_create(void)
 {
-	struct dm_bio_prison *prison = kmalloc(sizeof(*prison), GFP_KERNEL);
+	struct dm_bio_prison *prison = kzalloc(sizeof(*prison), GFP_KERNEL);
 
 	if (!prison)
 		return NULL;
@@ -236,8 +236,10 @@ void dm_cell_error(struct dm_bio_prison *prison,
 	bio_list_init(&bios);
 	dm_cell_release(prison, cell, &bios);
 
-	while ((bio = bio_list_pop(&bios)))
-		bio_endio(bio, error);
+	while ((bio = bio_list_pop(&bios))) {
+		bio->bi_error = error;
+		bio_endio(bio);
+	}
 }
 EXPORT_SYMBOL_GPL(dm_cell_error);
 

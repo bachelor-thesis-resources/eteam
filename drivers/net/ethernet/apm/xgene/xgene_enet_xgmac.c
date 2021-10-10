@@ -184,6 +184,11 @@ static void xgene_xgmac_set_mac_addr(struct xgene_enet_pdata *pdata)
 	xgene_enet_wr_mac(pdata, HSTMACADR_MSW_ADDR, addr1);
 }
 
+static void xgene_xgmac_set_mss(struct xgene_enet_pdata *pdata)
+{
+	xgene_enet_wr_csr(pdata, XG_TSIF_MSS_REG0_ADDR, pdata->mss);
+}
+
 static u32 xgene_enet_link_status(struct xgene_enet_pdata *pdata)
 {
 	u32 data;
@@ -204,8 +209,8 @@ static void xgene_xgmac_init(struct xgene_enet_pdata *pdata)
 	data &= ~HSTLENCHK;
 	xgene_enet_wr_mac(pdata, AXGMAC_CONFIG_1, data);
 
-	xgene_enet_wr_mac(pdata, HSTMAXFRAME_LENGTH_ADDR, 0x06000600);
 	xgene_xgmac_set_mac_addr(pdata);
+	xgene_xgmac_set_mss(pdata);
 
 	xgene_enet_rd_csr(pdata, XG_RSIF_CONFIG_REG_ADDR, &data);
 	data |= CFG_RSIF_FPBUFF_TIMEOUT_EN;
@@ -253,13 +258,29 @@ static void xgene_xgmac_tx_disable(struct xgene_enet_pdata *pdata)
 
 static int xgene_enet_reset(struct xgene_enet_pdata *pdata)
 {
+	struct device *dev = &pdata->pdev->dev;
+
 	if (!xgene_ring_mgr_init(pdata))
 		return -ENODEV;
 
-	if (!IS_ERR(pdata->clk)) {
+	if (dev->of_node) {
 		clk_prepare_enable(pdata->clk);
+		udelay(5);
 		clk_disable_unprepare(pdata->clk);
+		udelay(5);
 		clk_prepare_enable(pdata->clk);
+		udelay(5);
+	} else {
+#ifdef CONFIG_ACPI
+		if (acpi_has_method(ACPI_HANDLE(&pdata->pdev->dev), "_RST")) {
+			acpi_evaluate_object(ACPI_HANDLE(&pdata->pdev->dev),
+					     "_RST", NULL, NULL);
+		} else if (acpi_has_method(ACPI_HANDLE(&pdata->pdev->dev),
+					   "_INI")) {
+			acpi_evaluate_object(ACPI_HANDLE(&pdata->pdev->dev),
+					     "_INI", NULL, NULL);
+		}
+#endif
 	}
 
 	xgene_enet_ecc_init(pdata);
@@ -287,8 +308,30 @@ static void xgene_enet_xgcle_bypass(struct xgene_enet_pdata *pdata,
 
 static void xgene_enet_shutdown(struct xgene_enet_pdata *pdata)
 {
-	if (!IS_ERR(pdata->clk))
-		clk_disable_unprepare(pdata->clk);
+	struct device *dev = &pdata->pdev->dev;
+
+	if (dev->of_node) {
+		if (!IS_ERR(pdata->clk))
+			clk_disable_unprepare(pdata->clk);
+	}
+}
+
+static void xgene_enet_clear(struct xgene_enet_pdata *pdata,
+			     struct xgene_enet_desc_ring *ring)
+{
+	u32 addr, val, data;
+
+	val = xgene_enet_ring_bufnum(ring->id);
+
+	if (xgene_enet_is_bufpool(ring->id)) {
+		addr = ENET_CFGSSQMIFPRESET_ADDR;
+		data = BIT(val - 0x20);
+	} else {
+		addr = ENET_CFGSSQMIWQRESET_ADDR;
+		data = BIT(val);
+	}
+
+	xgene_enet_wr_ring_if(pdata, addr, data);
 }
 
 static void xgene_enet_link_state(struct work_struct *work)
@@ -329,11 +372,13 @@ struct xgene_mac_ops xgene_xgmac_ops = {
 	.rx_disable = xgene_xgmac_rx_disable,
 	.tx_disable = xgene_xgmac_tx_disable,
 	.set_mac_addr = xgene_xgmac_set_mac_addr,
+	.set_mss = xgene_xgmac_set_mss,
 	.link_state = xgene_enet_link_state
 };
 
 struct xgene_port_ops xgene_xgport_ops = {
 	.reset = xgene_enet_reset,
+	.clear = xgene_enet_clear,
 	.cle_bypass = xgene_enet_xgcle_bypass,
 	.shutdown = xgene_enet_shutdown,
 };

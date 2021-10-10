@@ -13,6 +13,7 @@
  * You should have received a copy of the GNU General Public License along with
  * this program; if not, see <http://www.gnu.org/licenses/>.
  *
+ * Description: Data Center Bridging netlink interface
  * Author: Lucy Liu <lucy.liu@intel.com>
  */
 
@@ -24,7 +25,7 @@
 #include <linux/dcbnl.h>
 #include <net/dcbevent.h>
 #include <linux/rtnetlink.h>
-#include <linux/module.h>
+#include <linux/init.h>
 #include <net/sock.h>
 
 /* Data Center Bridging (DCB) is a collection of Ethernet enhancements
@@ -47,10 +48,6 @@
  * This file implements an rtnetlink interface to allow configuration of DCB
  * features for capable devices.
  */
-
-MODULE_AUTHOR("Lucy Liu, <lucy.liu@intel.com>");
-MODULE_DESCRIPTION("Data Center Bridging netlink interface");
-MODULE_LICENSE("GPL");
 
 /**************** DCB attribute policies *************************************/
 
@@ -1728,6 +1725,8 @@ static int dcb_doit(struct sk_buff *skb, struct nlmsghdr *nlh)
 	fn = &reply_funcs[dcb->cmd];
 	if (!fn->cb)
 		return -EOPNOTSUPP;
+	if (fn->type == RTM_SETDCB && !netlink_capable(skb, CAP_NET_ADMIN))
+		return -EPERM;
 
 	if (!tb[DCB_ATTR_IFNAME])
 		return -EINVAL;
@@ -1766,7 +1765,7 @@ static struct dcb_app_type *dcb_app_lookup(const struct dcb_app *app,
 		if (itr->app.selector == app->selector &&
 		    itr->app.protocol == app->protocol &&
 		    itr->ifindex == ifindex &&
-		    (!prio || itr->app.priority == prio))
+		    ((prio == -1) || itr->app.priority == prio))
 			return itr;
 	}
 
@@ -1801,7 +1800,8 @@ u8 dcb_getapp(struct net_device *dev, struct dcb_app *app)
 	u8 prio = 0;
 
 	spin_lock_bh(&dcb_lock);
-	if ((itr = dcb_app_lookup(app, dev->ifindex, 0)))
+	itr = dcb_app_lookup(app, dev->ifindex, -1);
+	if (itr)
 		prio = itr->app.priority;
 	spin_unlock_bh(&dcb_lock);
 
@@ -1829,7 +1829,8 @@ int dcb_setapp(struct net_device *dev, struct dcb_app *new)
 
 	spin_lock_bh(&dcb_lock);
 	/* Search for existing match and replace */
-	if ((itr = dcb_app_lookup(new, dev->ifindex, 0))) {
+	itr = dcb_app_lookup(new, dev->ifindex, -1);
+	if (itr) {
 		if (new->priority)
 			itr->app.priority = new->priority;
 		else {
@@ -1862,7 +1863,8 @@ u8 dcb_ieee_getapp_mask(struct net_device *dev, struct dcb_app *app)
 	u8 prio = 0;
 
 	spin_lock_bh(&dcb_lock);
-	if ((itr = dcb_app_lookup(app, dev->ifindex, 0)))
+	itr = dcb_app_lookup(app, dev->ifindex, -1);
+	if (itr)
 		prio |= 1 << itr->app.priority;
 	spin_unlock_bh(&dcb_lock);
 
@@ -1935,19 +1937,6 @@ int dcb_ieee_delapp(struct net_device *dev, struct dcb_app *del)
 }
 EXPORT_SYMBOL(dcb_ieee_delapp);
 
-static void dcb_flushapp(void)
-{
-	struct dcb_app_type *app;
-	struct dcb_app_type *tmp;
-
-	spin_lock_bh(&dcb_lock);
-	list_for_each_entry_safe(app, tmp, &dcb_app_list, list) {
-		list_del(&app->list);
-		kfree(app);
-	}
-	spin_unlock_bh(&dcb_lock);
-}
-
 static int __init dcbnl_init(void)
 {
 	INIT_LIST_HEAD(&dcb_app_list);
@@ -1957,12 +1946,4 @@ static int __init dcbnl_init(void)
 
 	return 0;
 }
-module_init(dcbnl_init);
-
-static void __exit dcbnl_exit(void)
-{
-	rtnl_unregister(PF_UNSPEC, RTM_GETDCB);
-	rtnl_unregister(PF_UNSPEC, RTM_SETDCB);
-	dcb_flushapp();
-}
-module_exit(dcbnl_exit);
+device_initcall(dcbnl_init);

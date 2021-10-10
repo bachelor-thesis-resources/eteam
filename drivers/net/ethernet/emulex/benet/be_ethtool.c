@@ -138,6 +138,7 @@ static const struct be_ethtool_stat et_stats[] = {
 static const struct be_ethtool_stat et_rx_stats[] = {
 	{DRVSTAT_RX_INFO(rx_bytes)},/* If moving this member see above note */
 	{DRVSTAT_RX_INFO(rx_pkts)}, /* If moving this member see above note */
+	{DRVSTAT_RX_INFO(rx_vxlan_offload_pkts)},
 	{DRVSTAT_RX_INFO(rx_compl)},
 	{DRVSTAT_RX_INFO(rx_compl_err)},
 	{DRVSTAT_RX_INFO(rx_mcast_pkts)},
@@ -190,6 +191,7 @@ static const struct be_ethtool_stat et_tx_stats[] = {
 	{DRVSTAT_TX_INFO(tx_internal_parity_err)},
 	{DRVSTAT_TX_INFO(tx_bytes)},
 	{DRVSTAT_TX_INFO(tx_pkts)},
+	{DRVSTAT_TX_INFO(tx_vxlan_offload_pkts)},
 	/* Number of skbs queued for trasmission by the driver */
 	{DRVSTAT_TX_INFO(tx_reqs)},
 	/* Number of times the TX queue was stopped due to lack
@@ -232,9 +234,6 @@ static void be_get_drvinfo(struct net_device *netdev,
 
 	strlcpy(drvinfo->bus_info, pci_name(adapter->pdev),
 		sizeof(drvinfo->bus_info));
-	drvinfo->testinfo_len = 0;
-	drvinfo->regdump_len = 0;
-	drvinfo->eedump_len = 0;
 }
 
 static u32 lancer_cmd_get_file_len(struct be_adapter *adapter, u8 *file_name)
@@ -847,10 +846,21 @@ err:
 static u64 be_loopback_test(struct be_adapter *adapter, u8 loopback_type,
 			    u64 *status)
 {
-	be_cmd_set_loopback(adapter, adapter->hba_port_num, loopback_type, 1);
+	int ret;
+
+	ret = be_cmd_set_loopback(adapter, adapter->hba_port_num,
+				  loopback_type, 1);
+	if (ret)
+		return ret;
+
 	*status = be_cmd_loopback_test(adapter, adapter->hba_port_num,
 				       loopback_type, 1500, 2, 0xabc);
-	be_cmd_set_loopback(adapter, adapter->hba_port_num, BE_NO_LOOPBACK, 1);
+
+	ret = be_cmd_set_loopback(adapter, adapter->hba_port_num,
+				  BE_NO_LOOPBACK, 1);
+	if (ret)
+		return ret;
+
 	return *status;
 }
 
@@ -858,7 +868,7 @@ static void be_self_test(struct net_device *netdev, struct ethtool_test *test,
 			 u64 *data)
 {
 	struct be_adapter *adapter = netdev_priv(netdev);
-	int status;
+	int status, cnt;
 	u8 link_status = 0;
 
 	if (adapter->function_caps & BE_FUNCTION_CAPS_SUPER_NIC) {
@@ -868,6 +878,9 @@ static void be_self_test(struct net_device *netdev, struct ethtool_test *test,
 	}
 
 	memset(data, 0, sizeof(u64) * ETHTOOL_TESTS_NUM);
+
+	/* check link status before offline tests */
+	link_status = netif_carrier_ok(netdev);
 
 	if (test->flags & ETH_TEST_FL_OFFLINE) {
 		if (be_loopback_test(adapter, BE_MAC_LOOPBACK, &data[0]) != 0)
@@ -889,13 +902,26 @@ static void be_self_test(struct net_device *netdev, struct ethtool_test *test,
 		test->flags |= ETH_TEST_FL_FAILED;
 	}
 
-	status = be_cmd_link_status_query(adapter, NULL, &link_status, 0);
-	if (status) {
-		test->flags |= ETH_TEST_FL_FAILED;
-		data[4] = -1;
-	} else if (!link_status) {
+	/* link status was down prior to test */
+	if (!link_status) {
 		test->flags |= ETH_TEST_FL_FAILED;
 		data[4] = 1;
+		return;
+	}
+
+	for (cnt = 10; cnt; cnt--) {
+		status = be_cmd_link_status_query(adapter, NULL, &link_status,
+						  0);
+		if (status) {
+			test->flags |= ETH_TEST_FL_FAILED;
+			data[4] = -1;
+			break;
+		}
+
+		if (link_status)
+			break;
+
+		msleep_interruptible(500);
 	}
 }
 
@@ -1040,7 +1066,7 @@ static int be_get_rxnfc(struct net_device *netdev, struct ethtool_rxnfc *cmd,
 		cmd->data = be_get_rss_hash_opts(adapter, cmd->flow_type);
 		break;
 	case ETHTOOL_GRXRINGS:
-		cmd->data = adapter->num_rx_qs - 1;
+		cmd->data = adapter->num_rx_qs;
 		break;
 	default:
 		return -EINVAL;
@@ -1052,9 +1078,7 @@ static int be_get_rxnfc(struct net_device *netdev, struct ethtool_rxnfc *cmd,
 static int be_set_rss_hash_opts(struct be_adapter *adapter,
 				struct ethtool_rxnfc *cmd)
 {
-	struct be_rx_obj *rxo;
-	int status = 0, i, j;
-	u8 rsstable[128];
+	int status;
 	u32 rss_flags = adapter->rss_info.rss_flags;
 
 	if (cmd->data != L3_RSS_FLAGS &&
@@ -1103,20 +1127,11 @@ static int be_set_rss_hash_opts(struct be_adapter *adapter,
 	}
 
 	if (rss_flags == adapter->rss_info.rss_flags)
-		return status;
-
-	if (be_multi_rxq(adapter)) {
-		for (j = 0; j < 128; j += adapter->num_rss_qs) {
-			for_all_rss_queues(adapter, rxo, i) {
-				if ((j + i) >= 128)
-					break;
-				rsstable[j + i] = rxo->rss_id;
-			}
-		}
-	}
+		return 0;
 
 	status = be_cmd_rss_config(adapter, adapter->rss_info.rsstable,
-				   rss_flags, 128, adapter->rss_info.rss_hkey);
+				   rss_flags, RSS_INDIR_TABLE_LEN,
+				   adapter->rss_info.rss_hkey);
 	if (!status)
 		adapter->rss_info.rss_flags = rss_flags;
 

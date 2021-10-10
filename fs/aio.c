@@ -40,6 +40,7 @@
 #include <linux/ramfs.h>
 #include <linux/percpu-refcount.h>
 #include <linux/mount.h>
+#include <linux/nospec.h>
 
 #include <asm/kmap_types.h>
 #include <asm/uaccess.h>
@@ -68,9 +69,9 @@ struct aio_ring {
 #define AIO_RING_PAGES	8
 
 struct kioctx_table {
-	struct rcu_head	rcu;
-	unsigned	nr;
-	struct kioctx	*table[];
+	struct rcu_head		rcu;
+	unsigned		nr;
+	struct kioctx __rcu	*table[];
 };
 
 struct kioctx_cpu {
@@ -115,7 +116,8 @@ struct kioctx {
 	struct page		**ring_pages;
 	long			nr_pages;
 
-	struct work_struct	free_work;
+	struct rcu_head		free_rcu;
+	struct work_struct	free_work;	/* see free_ioctx() */
 
 	/*
 	 * signals when all in-flight requests are done
@@ -239,7 +241,12 @@ static struct dentry *aio_mount(struct file_system_type *fs_type,
 	static const struct dentry_operations ops = {
 		.d_dname	= simple_dname,
 	};
-	return mount_pseudo(fs_type, "aio:", NULL, &ops, AIO_RING_MAGIC);
+	struct dentry *root = mount_pseudo(fs_type, "aio:", NULL, &ops,
+					   AIO_RING_MAGIC);
+
+	if (!IS_ERR(root))
+		root->d_sb->s_iflags |= SB_I_NOEXEC;
+	return root;
 }
 
 /* aio_setup
@@ -308,15 +315,9 @@ static void aio_free_ring(struct kioctx *ctx)
 	}
 }
 
-static int aio_ring_mmap(struct file *file, struct vm_area_struct *vma)
+static int aio_ring_mremap(struct vm_area_struct *vma)
 {
-	vma->vm_flags |= VM_DONTEXPAND;
-	vma->vm_ops = &generic_file_vm_ops;
-	return 0;
-}
-
-static int aio_ring_remap(struct file *file, struct vm_area_struct *vma)
-{
+	struct file *file = vma->vm_file;
 	struct mm_struct *mm = vma->vm_mm;
 	struct kioctx_table *table;
 	int i, res = -EINVAL;
@@ -327,7 +328,7 @@ static int aio_ring_remap(struct file *file, struct vm_area_struct *vma)
 	for (i = 0; i < table->nr; i++) {
 		struct kioctx *ctx;
 
-		ctx = table->table[i];
+		ctx = rcu_dereference(table->table[i]);
 		if (ctx && ctx->aio_ring_file == file) {
 			if (!atomic_read(&ctx->dead)) {
 				ctx->user_id = ctx->mmap_base = vma->vm_start;
@@ -342,9 +343,24 @@ static int aio_ring_remap(struct file *file, struct vm_area_struct *vma)
 	return res;
 }
 
+static const struct vm_operations_struct aio_ring_vm_ops = {
+	.mremap		= aio_ring_mremap,
+#if IS_ENABLED(CONFIG_MMU)
+	.fault		= filemap_fault,
+	.map_pages	= filemap_map_pages,
+	.page_mkwrite	= filemap_page_mkwrite,
+#endif
+};
+
+static int aio_ring_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	vma->vm_flags |= VM_DONTEXPAND;
+	vma->vm_ops = &aio_ring_vm_ops;
+	return 0;
+}
+
 static const struct file_operations aio_ring_fops = {
 	.mmap = aio_ring_mmap,
-	.mremap = aio_ring_remap,
 };
 
 #if IS_ENABLED(CONFIG_MIGRATION)
@@ -424,10 +440,9 @@ static const struct address_space_operations aio_ctx_aops = {
 #endif
 };
 
-static int aio_setup_ring(struct kioctx *ctx)
+static int aio_setup_ring(struct kioctx *ctx, unsigned int nr_events)
 {
 	struct aio_ring *ring;
-	unsigned nr_events = ctx->max_reqs;
 	struct mm_struct *mm = current->mm;
 	unsigned long size, unused;
 	int nr_pages;
@@ -559,6 +574,12 @@ static int kiocb_cancel(struct aio_kiocb *kiocb)
 	return cancel(&kiocb->common);
 }
 
+/*
+ * free_ioctx() should be RCU delayed to synchronize against the RCU
+ * protected lookup_ioctx() and also needs process context to call
+ * aio_free_ring(), so the double bouncing through kioctx->free_rcu and
+ * ->free_work.
+ */
 static void free_ioctx(struct work_struct *work)
 {
 	struct kioctx *ctx = container_of(work, struct kioctx, free_work);
@@ -572,6 +593,14 @@ static void free_ioctx(struct work_struct *work)
 	kmem_cache_free(kioctx_cachep, ctx);
 }
 
+static void free_ioctx_rcufn(struct rcu_head *head)
+{
+	struct kioctx *ctx = container_of(head, struct kioctx, free_rcu);
+
+	INIT_WORK(&ctx->free_work, free_ioctx);
+	schedule_work(&ctx->free_work);
+}
+
 static void free_ioctx_reqs(struct percpu_ref *ref)
 {
 	struct kioctx *ctx = container_of(ref, struct kioctx, reqs);
@@ -580,8 +609,8 @@ static void free_ioctx_reqs(struct percpu_ref *ref)
 	if (ctx->rq_wait && atomic_dec_and_test(&ctx->rq_wait->count))
 		complete(&ctx->rq_wait->comp);
 
-	INIT_WORK(&ctx->free_work, free_ioctx);
-	schedule_work(&ctx->free_work);
+	/* Synchronize against RCU protected table->table[] dereferences */
+	call_rcu(&ctx->free_rcu, free_ioctx_rcufn);
 }
 
 /*
@@ -599,9 +628,8 @@ static void free_ioctx_users(struct percpu_ref *ref)
 	while (!list_empty(&ctx->active_reqs)) {
 		req = list_first_entry(&ctx->active_reqs,
 				       struct aio_kiocb, ki_list);
-
-		list_del_init(&req->ki_list);
 		kiocb_cancel(req);
+		list_del_init(&req->ki_list);
 	}
 
 	spin_unlock_irq(&ctx->ctx_lock);
@@ -622,9 +650,9 @@ static int ioctx_add_table(struct kioctx *ctx, struct mm_struct *mm)
 	while (1) {
 		if (table)
 			for (i = 0; i < table->nr; i++)
-				if (!table->table[i]) {
+				if (!rcu_access_pointer(table->table[i])) {
 					ctx->id = i;
-					table->table[i] = ctx;
+					rcu_assign_pointer(table->table[i], ctx);
 					spin_unlock(&mm->ioctx_lock);
 
 					/* While kioctx setup is in progress,
@@ -685,6 +713,12 @@ static struct kioctx *ioctx_alloc(unsigned nr_events)
 	int err = -ENOMEM;
 
 	/*
+	 * Store the original nr_events -- what userspace passed to io_setup(),
+	 * for counting against the global limit -- before it changes.
+	 */
+	unsigned int max_reqs = nr_events;
+
+	/*
 	 * We keep track of the number of available ringbuffer slots, to prevent
 	 * overflow (reqs_available), and we also use percpu counters for this.
 	 *
@@ -702,14 +736,14 @@ static struct kioctx *ioctx_alloc(unsigned nr_events)
 		return ERR_PTR(-EINVAL);
 	}
 
-	if (!nr_events || (unsigned long)nr_events > (aio_max_nr * 2UL))
+	if (!nr_events || (unsigned long)max_reqs > aio_max_nr)
 		return ERR_PTR(-EAGAIN);
 
 	ctx = kmem_cache_zalloc(kioctx_cachep, GFP_KERNEL);
 	if (!ctx)
 		return ERR_PTR(-ENOMEM);
 
-	ctx->max_reqs = nr_events;
+	ctx->max_reqs = max_reqs;
 
 	spin_lock_init(&ctx->ctx_lock);
 	spin_lock_init(&ctx->completion_lock);
@@ -731,7 +765,7 @@ static struct kioctx *ioctx_alloc(unsigned nr_events)
 	if (!ctx->cpu)
 		goto err;
 
-	err = aio_setup_ring(ctx);
+	err = aio_setup_ring(ctx, nr_events);
 	if (err < 0)
 		goto err;
 
@@ -742,8 +776,8 @@ static struct kioctx *ioctx_alloc(unsigned nr_events)
 
 	/* limit the number of system wide aios */
 	spin_lock(&aio_nr_lock);
-	if (aio_nr + nr_events > (aio_max_nr * 2UL) ||
-	    aio_nr + nr_events < aio_nr) {
+	if (aio_nr + ctx->max_reqs > aio_max_nr ||
+	    aio_nr + ctx->max_reqs < aio_nr) {
 		spin_unlock(&aio_nr_lock);
 		err = -EAGAIN;
 		goto err_ctx;
@@ -799,11 +833,11 @@ static int kill_ioctx(struct mm_struct *mm, struct kioctx *ctx,
 	}
 
 	table = rcu_dereference_raw(mm->ioctx_table);
-	WARN_ON(ctx != table->table[ctx->id]);
-	table->table[ctx->id] = NULL;
+	WARN_ON(ctx != rcu_access_pointer(table->table[ctx->id]));
+	RCU_INIT_POINTER(table->table[ctx->id], NULL);
 	spin_unlock(&mm->ioctx_lock);
 
-	/* percpu_ref_kill() will do the necessary call_rcu() */
+	/* free_ioctx_reqs() will do the necessary RCU synchronization */
 	wake_up_all(&ctx->wait);
 
 	/*
@@ -845,7 +879,8 @@ void exit_aio(struct mm_struct *mm)
 
 	skipped = 0;
 	for (i = 0; i < table->nr; ++i) {
-		struct kioctx *ctx = table->table[i];
+		struct kioctx *ctx =
+			rcu_dereference_protected(table->table[i], true);
 
 		if (!ctx) {
 			skipped++;
@@ -1034,10 +1069,11 @@ static struct kioctx *lookup_ioctx(unsigned long ctx_id)
 	if (!table || id >= table->nr)
 		goto out;
 
-	ctx = table->table[id];
+	id = array_index_nospec(id, table->nr);
+	ctx = rcu_dereference(table->table[id]);
 	if (ctx && ctx->user_id == ctx_id) {
-		percpu_ref_get(&ctx->users);
-		ret = ctx;
+		if (percpu_ref_tryget_live(&ctx->users))
+			ret = ctx;
 	}
 out:
 	rcu_read_unlock();

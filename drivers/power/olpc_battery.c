@@ -427,14 +427,14 @@ static int olpc_bat_get_property(struct power_supply *psy,
 		if (ret)
 			return ret;
 
-		val->intval = (s16)be16_to_cpu(ec_word) * 100 / 256;
+		val->intval = (s16)be16_to_cpu(ec_word) * 10 / 256;
 		break;
 	case POWER_SUPPLY_PROP_TEMP_AMBIENT:
 		ret = olpc_ec_cmd(EC_AMB_TEMP, NULL, 0, (void *)&ec_word, 2);
 		if (ret)
 			return ret;
 
-		val->intval = (int)be16_to_cpu(ec_word) * 100 / 256;
+		val->intval = (int)be16_to_cpu(ec_word) * 10 / 256;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
 		ret = olpc_ec_cmd(EC_BAT_ACR, NULL, 0, (void *)&ec_word, 2);
@@ -521,11 +521,6 @@ static ssize_t olpc_bat_eeprom_read(struct file *filp, struct kobject *kobj,
 	int ret;
 	int i;
 
-	if (off >= EEPROM_SIZE)
-		return 0;
-	if (off + count > EEPROM_SIZE)
-		count = EEPROM_SIZE - off;
-
 	for (i = 0; i < count; i++) {
 		ec_byte = EEPROM_START + off + i;
 		ret = olpc_ec_cmd(EC_BAT_EEPROM, &ec_byte, 1, &buf[i], 1);
@@ -545,7 +540,7 @@ static struct bin_attribute olpc_bat_eeprom = {
 		.name = "eeprom",
 		.mode = S_IRUGO,
 	},
-	.size = 0,
+	.size = EEPROM_SIZE,
 	.read = olpc_bat_eeprom_read,
 };
 

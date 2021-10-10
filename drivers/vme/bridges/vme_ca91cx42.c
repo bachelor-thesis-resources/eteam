@@ -204,8 +204,7 @@ static int ca91cx42_irq_init(struct vme_bridge *ca91cx42_bridge)
 	/* Need pdev */
 	pdev = container_of(ca91cx42_bridge->parent, struct pci_dev, dev);
 
-	/* Initialise list for VME bus errors */
-	INIT_LIST_HEAD(&ca91cx42_bridge->vme_errors);
+	INIT_LIST_HEAD(&ca91cx42_bridge->vme_error_handlers);
 
 	mutex_init(&ca91cx42_bridge->irq_mtx);
 
@@ -468,7 +467,7 @@ static int ca91cx42_slave_get(struct vme_slave_resource *image, int *enabled,
 	vme_bound = ioread32(bridge->base + CA91CX42_VSI_BD[i]);
 	pci_offset = ioread32(bridge->base + CA91CX42_VSI_TO[i]);
 
-	*pci_base = (dma_addr_t)vme_base + pci_offset;
+	*pci_base = (dma_addr_t)*vme_base + pci_offset;
 	*size = (unsigned long long)((vme_bound - *vme_base) + granularity);
 
 	*enabled = 0;
@@ -554,7 +553,7 @@ static int ca91cx42_alloc_resource(struct vme_master_resource *image,
 	image->bus_resource.flags = IORESOURCE_MEM;
 
 	retval = pci_bus_alloc_resource(pdev->bus,
-		&image->bus_resource, size, size, PCIBIOS_MIN_MEM,
+		&image->bus_resource, size, 0x10000, PCIBIOS_MIN_MEM,
 		0, NULL, NULL);
 	if (retval) {
 		dev_err(ca91cx42_bridge->parent, "Failed to allocate mem "

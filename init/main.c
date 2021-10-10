@@ -81,6 +81,7 @@
 #include <linux/integrity.h>
 #include <linux/proc_ns.h>
 #include <linux/io.h>
+#include <linux/kaiser.h>
 
 #include <asm/io.h>
 #include <asm/bugs.h>
@@ -492,6 +493,7 @@ static void __init mm_init(void)
 	pgtable_init();
 	vmalloc_init();
 	ioremap_huge_init();
+	kaiser_init();
 }
 
 asmlinkage __visible void __init start_kernel(void)
@@ -536,6 +538,8 @@ asmlinkage __visible void __init start_kernel(void)
 	page_alloc_init();
 
 	pr_notice("Kernel command line: %s\n", boot_command_line);
+	/* parameters may set static keys */
+	jump_label_init();
 	parse_early_param();
 	after_dashes = parse_args("Booting kernel",
 				  static_command_line, __start___param,
@@ -544,8 +548,6 @@ asmlinkage __visible void __init start_kernel(void)
 	if (!IS_ERR_OR_NULL(after_dashes))
 		parse_args("Setting init args", after_dashes, NULL, 0, -1, -1,
 			   NULL, set_init_arg);
-
-	jump_label_init();
 
 	/*
 	 * These use large bootmem allocations and must precede
@@ -681,6 +683,8 @@ asmlinkage __visible void __init start_kernel(void)
 
 	/* Do the rest non-__init'ed, we're now alive */
 	rest_init();
+
+	prevent_tail_call_optimization();
 }
 
 /* Call all constructor functions linked into the kernel. */
@@ -877,7 +881,6 @@ static void __init do_initcalls(void)
 static void __init do_basic_setup(void)
 {
 	cpuset_init_smp();
-	usermodehelper_init();
 	shmem_init();
 	driver_init();
 	init_irq_proc();
@@ -938,6 +941,13 @@ static int __ref kernel_init(void *unused)
 	/* need to finish all async __init code before freeing the memory */
 	async_synchronize_full();
 	free_initmem();
+	/*
+	 * load_module() results in W+X mappings, which are cleaned up
+	 * with call_rcu_sched().  Let's make sure that queued work is
+	 * flushed so that we don't hit false positives looking for
+	 * insecure pages which are W+X.
+	 */
+	rcu_barrier_sched();
 	mark_rodata_ro();
 	system_state = SYSTEM_RUNNING;
 	numa_default_policy();

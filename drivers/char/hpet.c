@@ -12,7 +12,6 @@
  */
 
 #include <linux/interrupt.h>
-#include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
 #include <linux/miscdevice.h>
@@ -377,7 +376,7 @@ static __init int hpet_mmap_enable(char *str)
 	pr_info("HPET mmap %s\n", hpet_mmap_enabled ? "enabled" : "disabled");
 	return 1;
 }
-__setup("hpet_mmap", hpet_mmap_enable);
+__setup("hpet_mmap=", hpet_mmap_enable);
 
 static int hpet_mmap(struct file *file, struct vm_area_struct *vma)
 {
@@ -570,8 +569,7 @@ static inline unsigned long hpet_time_div(struct hpets *hpets,
 	unsigned long long m;
 
 	m = hpets->hp_tick_freq + (dis >> 1);
-	do_div(m, dis);
-	return (unsigned long)m;
+	return div64_ul(m, dis);
 }
 
 static int
@@ -1043,24 +1041,16 @@ static int hpet_acpi_add(struct acpi_device *device)
 	return hpet_alloc(&data);
 }
 
-static int hpet_acpi_remove(struct acpi_device *device)
-{
-	/* XXX need to unregister clocksource, dealloc mem, etc */
-	return -EINVAL;
-}
-
 static const struct acpi_device_id hpet_device_ids[] = {
 	{"PNP0103", 0},
 	{"", 0},
 };
-MODULE_DEVICE_TABLE(acpi, hpet_device_ids);
 
 static struct acpi_driver hpet_acpi_driver = {
 	.name = "hpet",
 	.ids = hpet_device_ids,
 	.ops = {
 		.add = hpet_acpi_add,
-		.remove = hpet_acpi_remove,
 		},
 };
 
@@ -1086,19 +1076,9 @@ static int __init hpet_init(void)
 
 	return 0;
 }
+device_initcall(hpet_init);
 
-static void __exit hpet_exit(void)
-{
-	acpi_bus_unregister_driver(&hpet_acpi_driver);
-
-	if (sysctl_header)
-		unregister_sysctl_table(sysctl_header);
-	misc_deregister(&hpet_misc);
-
-	return;
-}
-
-module_init(hpet_init);
-module_exit(hpet_exit);
+/*
 MODULE_AUTHOR("Bob Picco <Robert.Picco@hp.com>");
 MODULE_LICENSE("GPL");
+*/

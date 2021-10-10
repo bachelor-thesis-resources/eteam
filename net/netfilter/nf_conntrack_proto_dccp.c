@@ -244,14 +244,14 @@ dccp_state_table[CT_DCCP_ROLE_MAX + 1][DCCP_PKT_SYNCACK + 1][CT_DCCP_MAX + 1] = 
 		 * We currently ignore Sync packets
 		 *
 		 *	sNO, sRQ, sRS, sPO, sOP, sCR, sCG, sTW */
-			sIG, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
+			sIV, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
 		},
 		[DCCP_PKT_SYNCACK] = {
 		/*
 		 * We currently ignore SyncAck packets
 		 *
 		 *	sNO, sRQ, sRS, sPO, sOP, sCR, sCG, sTW */
-			sIG, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
+			sIV, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
 		},
 	},
 	[CT_DCCP_ROLE_SERVER] = {
@@ -372,14 +372,14 @@ dccp_state_table[CT_DCCP_ROLE_MAX + 1][DCCP_PKT_SYNCACK + 1][CT_DCCP_MAX + 1] = 
 		 * We currently ignore Sync packets
 		 *
 		 *	sNO, sRQ, sRS, sPO, sOP, sCR, sCG, sTW */
-			sIG, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
+			sIV, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
 		},
 		[DCCP_PKT_SYNCACK] = {
 		/*
 		 * We currently ignore SyncAck packets
 		 *
 		 *	sNO, sRQ, sRS, sPO, sOP, sCR, sCG, sTW */
-			sIG, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
+			sIV, sIG, sIG, sIG, sIG, sIG, sIG, sIG,
 		},
 	},
 };
@@ -398,7 +398,7 @@ static inline struct dccp_net *dccp_pernet(struct net *net)
 }
 
 static bool dccp_pkt_to_tuple(const struct sk_buff *skb, unsigned int dataoff,
-			      struct nf_conntrack_tuple *tuple)
+			      struct net *net, struct nf_conntrack_tuple *tuple)
 {
 	struct dccp_hdr _hdr, *dh;
 

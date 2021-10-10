@@ -26,7 +26,7 @@
 #include <linux/user.h>
 #include <linux/interrupt.h>
 #include <linux/delay.h>
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/ptrace.h>
 #include <linux/notifier.h>
 #include <linux/kprobes.h>
@@ -48,6 +48,9 @@
 #include <asm/syscalls.h>
 #include <asm/debugreg.h>
 #include <asm/switch_to.h>
+#include <asm/xen/hypervisor.h>
+
+#include "process.h"
 
 asmlinkage extern void ret_from_fork(void);
 
@@ -121,13 +124,15 @@ void __show_regs(struct pt_regs *regs, int all)
 void release_thread(struct task_struct *dead_task)
 {
 	if (dead_task->mm) {
+#ifdef CONFIG_MODIFY_LDT_SYSCALL
 		if (dead_task->mm->context.ldt) {
 			pr_warn("WARNING: dead process %s still has LDT? <%p/%d>\n",
 				dead_task->comm,
-				dead_task->mm->context.ldt,
+				dead_task->mm->context.ldt->entries,
 				dead_task->mm->context.ldt->size);
 			BUG();
 		}
+#endif
 	}
 }
 
@@ -247,9 +252,10 @@ start_thread(struct pt_regs *regs, unsigned long new_ip, unsigned long new_sp)
 	start_thread_common(regs, new_ip, new_sp,
 			    __USER_CS, __USER_DS, 0);
 }
+EXPORT_SYMBOL_GPL(start_thread);
 
-#ifdef CONFIG_IA32_EMULATION
-void start_thread_ia32(struct pt_regs *regs, u32 new_ip, u32 new_sp)
+#ifdef CONFIG_COMPAT
+void compat_start_thread(struct pt_regs *regs, u32 new_ip, u32 new_sp)
 {
 	start_thread_common(regs, new_ip, new_sp,
 			    test_thread_flag(TIF_X32)
@@ -330,7 +336,7 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	/*
 	 * Switch FS and GS.
 	 *
-	 * These are even more complicated than FS and GS: they have
+	 * These are even more complicated than DS and ES: they have
 	 * 64-bit bases are that controlled by arch_prctl.  Those bases
 	 * only differ from the values in the GDT or LDT if the selector
 	 * is 0.
@@ -399,23 +405,21 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	 */
 	this_cpu_write(current_task, next_p);
 
-	/*
-	 * If it were not for PREEMPT_ACTIVE we could guarantee that the
-	 * preempt_count of all tasks was equal here and this would not be
-	 * needed.
-	 */
-	task_thread_info(prev_p)->saved_preempt_count = this_cpu_read(__preempt_count);
-	this_cpu_write(__preempt_count, task_thread_info(next_p)->saved_preempt_count);
-
 	/* Reload esp0 and ss1.  This changes current_thread_info(). */
 	load_sp0(tss, next);
 
+	switch_to_extra(prev_p, next_p);
+
+#ifdef CONFIG_XEN
 	/*
-	 * Now maybe reload the debug registers and handle I/O bitmaps
+	 * On Xen PV, IOPL bits in pt_regs->flags have no effect, and
+	 * current_pt_regs()->flags may not match the current task's
+	 * intended IOPL.  We need to switch it manually.
 	 */
-	if (unlikely(task_thread_info(next_p)->flags & _TIF_WORK_CTXSW_NEXT ||
-		     task_thread_info(prev_p)->flags & _TIF_WORK_CTXSW_PREV))
-		__switch_to_xtra(prev_p, next_p, tss);
+	if (unlikely(static_cpu_has(X86_FEATURE_XENPV) &&
+		     prev->iopl != next->iopl))
+		xen_set_iopl_mask(next->iopl);
+#endif
 
 	if (static_cpu_has_bug(X86_BUG_SYSRET_SS_ATTRS)) {
 		/*
@@ -496,30 +500,6 @@ void set_personality_ia32(bool x32)
 	}
 }
 EXPORT_SYMBOL_GPL(set_personality_ia32);
-
-unsigned long get_wchan(struct task_struct *p)
-{
-	unsigned long stack;
-	u64 fp, ip;
-	int count = 0;
-
-	if (!p || p == current || p->state == TASK_RUNNING)
-		return 0;
-	stack = (unsigned long)task_stack_page(p);
-	if (p->thread.sp < stack || p->thread.sp >= stack+THREAD_SIZE)
-		return 0;
-	fp = *(u64 *)(p->thread.sp);
-	do {
-		if (fp < (unsigned long)stack ||
-		    fp >= (unsigned long)stack+THREAD_SIZE)
-			return 0;
-		ip = *(u64 *)(fp+8);
-		if (!in_sched_functions(ip))
-			return ip;
-		fp = *(u64 *)fp;
-	} while (count++ < 16);
-	return 0;
-}
 
 long do_arch_prctl(struct task_struct *task, int code, unsigned long addr)
 {

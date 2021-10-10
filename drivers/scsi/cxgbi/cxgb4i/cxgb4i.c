@@ -160,7 +160,7 @@ static struct scsi_transport_template *cxgb4i_stt;
 
 #define DIV_ROUND_UP(n, d)	(((n) + (d) - 1) / (d))
 #define RCV_BUFSIZ_MASK		0x3FFU
-#define MAX_IMM_TX_PKT_LEN	128
+#define MAX_IMM_TX_PKT_LEN	256
 
 static int push_tx_frames(struct cxgbi_sock *, int);
 
@@ -1339,6 +1339,7 @@ static void release_offload_resources(struct cxgbi_sock *csk)
 		csk, csk->state, csk->flags, csk->tid);
 
 	cxgbi_sock_free_cpl_skbs(csk);
+	cxgbi_sock_purge_write_queue(csk);
 	if (csk->wr_cred != csk->wr_max_cred) {
 		cxgbi_sock_purge_wr_queue(csk);
 		cxgbi_sock_reset_wr_list(csk);

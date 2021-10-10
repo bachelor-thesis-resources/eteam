@@ -499,7 +499,6 @@ EXPORT_SYMBOL(smp_call_function);
 unsigned int setup_max_cpus = NR_CPUS;
 EXPORT_SYMBOL(setup_max_cpus);
 
-
 /*
  * Setup routine for controlling SMP activation
  *
@@ -578,6 +577,26 @@ void __init smp_init(void)
 			cpu_up(cpu);
 	}
 
+#ifdef CONFIG_HOTPLUG_SMT
+	/* Handle nosmt[=force] here */
+	if (cpu_smt_control == CPU_SMT_DISABLED ||
+	    cpu_smt_control == CPU_SMT_FORCE_DISABLED) {
+		int ret;
+
+		cpu_maps_update_begin();
+		for_each_online_cpu(cpu) {
+			if (topology_is_primary_thread(cpu))
+				continue;
+			ret = cpu_down_maps_locked(cpu);
+			if (ret)
+				break;
+		}
+		cpu_maps_update_done();
+	}
+#endif
+
+	/* Final decision about SMT support */
+	cpu_smt_check_topology();
 	/* Any cleanup work */
 	smp_announce();
 	smp_cpus_done(setup_max_cpus);
@@ -669,7 +688,7 @@ void on_each_cpu_cond(bool (*cond_func)(int cpu, void *info),
 	cpumask_var_t cpus;
 	int cpu, ret;
 
-	might_sleep_if(gfp_flags & __GFP_WAIT);
+	might_sleep_if(gfpflags_allow_blocking(gfp_flags));
 
 	if (likely(zalloc_cpumask_var(&cpus, (gfp_flags|__GFP_NOWARN)))) {
 		preempt_disable();

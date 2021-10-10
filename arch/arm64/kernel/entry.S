@@ -27,7 +27,9 @@
 #include <asm/cpufeature.h>
 #include <asm/errno.h>
 #include <asm/esr.h>
+#include <asm/memory.h>
 #include <asm/thread_info.h>
+#include <asm/asm-uaccess.h>
 #include <asm/unistd.h>
 
 /*
@@ -93,7 +95,13 @@
 	disable_step_tsk x19, x20		// exceptions when scheduling.
 	.else
 	add	x21, sp, #S_FRAME_SIZE
-	.endif
+	get_thread_info tsk
+	/* Save the task's original addr_limit and set USER_DS (TASK_SIZE_64) */
+	ldr	x20, [tsk, #TI_ADDR_LIMIT]
+	str	x20, [sp, #S_ORIG_ADDR_LIMIT]
+	mov	x20, #TASK_SIZE_64
+	str	x20, [tsk, #TI_ADDR_LIMIT]
+	.endif /* \el == 0 */
 	mrs	x22, elr_el1
 	mrs	x23, spsr_el1
 	stp	lr, x21, [sp, #S_LR]
@@ -117,31 +125,34 @@
 	.endm
 
 	.macro	kernel_exit, el
+	.if	\el != 0
+	/* Restore the task's original addr_limit. */
+	ldr	x20, [sp, #S_ORIG_ADDR_LIMIT]
+	str	x20, [tsk, #TI_ADDR_LIMIT]
+	.endif
+
 	ldp	x21, x22, [sp, #S_PC]		// load ELR, SPSR
 	.if	\el == 0
 	ct_user_enter
 	ldr	x23, [sp, #S_SP]		// load return stack pointer
 	msr	sp_el0, x23
-
 #ifdef CONFIG_ARM64_ERRATUM_845719
-
-#undef SEQUENCE_ORG
-#undef SEQUENCE_ALT
-
+alternative_if_not ARM64_WORKAROUND_845719
+	nop
+	nop
 #ifdef CONFIG_PID_IN_CONTEXTIDR
-
-#define SEQUENCE_ORG	"nop ; nop ; nop"
-#define SEQUENCE_ALT	"tbz x22, #4, 1f ; mrs x29, contextidr_el1; msr contextidr_el1, x29; 1:"
-
-#else
-
-#define SEQUENCE_ORG	"nop ; nop"
-#define SEQUENCE_ALT	"tbz x22, #4, 1f ; msr contextidr_el1, xzr; 1:"
-
+	nop
 #endif
-
-	alternative_insn SEQUENCE_ORG, SEQUENCE_ALT, ARM64_WORKAROUND_845719
-
+alternative_else
+	tbz	x22, #4, 1f
+#ifdef CONFIG_PID_IN_CONTEXTIDR
+	mrs	x29, contextidr_el1
+	msr	contextidr_el1, x29
+#else
+	msr contextidr_el1, xzr
+#endif
+1:
+alternative_endif
 #endif
 	.endif
 	msr	elr_el1, x21			// set up the return data
@@ -232,7 +243,7 @@ END(vectors)
  * Invalid mode handlers
  */
 	.macro	inv_entry, el, reason, regsize = 64
-	kernel_entry el, \regsize
+	kernel_entry \el, \regsize
 	mov	x0, sp
 	mov	x1, #\reason
 	mrs	x2, esr_el1
@@ -306,12 +317,13 @@ el1_da:
 	/*
 	 * Data abort handling
 	 */
-	mrs	x0, far_el1
+	mrs	x3, far_el1
 	enable_dbg
 	// re-enable interrupts if they were enabled in the aborted context
 	tbnz	x23, #7, 1f			// PSR_I_BIT
 	enable_irq
 1:
+	clear_address_tag x0, x3
 	mov	x2, sp				// struct pt_regs
 	bl	do_mem_abort
 
@@ -433,6 +445,8 @@ el0_sync_compat:
 	b.eq	el0_fpsimd_acc
 	cmp	x24, #ESR_ELx_EC_FP_EXC32	// FP/ASIMD exception
 	b.eq	el0_fpsimd_exc
+	cmp	x24, #ESR_ELx_EC_PC_ALIGN	// pc alignment exception
+	b.eq	el0_sp_pc
 	cmp	x24, #ESR_ELx_EC_UNKNOWN	// unknown exception in EL0
 	b.eq	el0_undef
 	cmp	x24, #ESR_ELx_EC_CP15_32	// CP15 MRC/MCR trap
@@ -471,7 +485,7 @@ el0_da:
 	// enable interrupts before calling the main handler
 	enable_dbg_and_irq
 	ct_user_exit
-	bic	x0, x26, #(0xff << 56)
+	clear_address_tag x0, x26
 	mov	x1, x25
 	mov	x2, sp
 	bl	do_mem_abort
@@ -550,7 +564,7 @@ el0_inv:
 	mov	x0, sp
 	mov	x1, #BAD_SYNC
 	mov	x2, x25
-	bl	bad_mode
+	bl	bad_el0_sync
 	b	ret_to_user
 ENDPROC(el0_sync)
 
@@ -635,6 +649,9 @@ work_pending:
 	bl	do_notify_resume
 	b	ret_to_user
 work_resched:
+#ifdef CONFIG_TRACE_IRQFLAGS
+	bl	trace_hardirqs_off		// the IRQs are off here, inform the tracing code
+#endif
 	bl	schedule
 
 /*

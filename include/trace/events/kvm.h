@@ -204,7 +204,7 @@ TRACE_EVENT(kvm_ack_irq,
 	{ KVM_TRACE_MMIO_WRITE, "write" }
 
 TRACE_EVENT(kvm_mmio,
-	TP_PROTO(int type, int len, u64 gpa, u64 val),
+	TP_PROTO(int type, int len, u64 gpa, void *val),
 	TP_ARGS(type, len, gpa, val),
 
 	TP_STRUCT__entry(
@@ -218,7 +218,10 @@ TRACE_EVENT(kvm_mmio,
 		__entry->type		= type;
 		__entry->len		= len;
 		__entry->gpa		= gpa;
-		__entry->val		= val;
+		__entry->val		= 0;
+		if (val)
+			memcpy(&__entry->val, val,
+			       min_t(u32, sizeof(__entry->val), len));
 	),
 
 	TP_printk("mmio %s len %u gpa 0x%llx val 0x%llx",
@@ -357,6 +360,36 @@ TRACE_EVENT(
 );
 
 #endif
+
+TRACE_EVENT(kvm_halt_poll_ns,
+	TP_PROTO(bool grow, unsigned int vcpu_id, int new, int old),
+	TP_ARGS(grow, vcpu_id, new, old),
+
+	TP_STRUCT__entry(
+		__field(bool, grow)
+		__field(unsigned int, vcpu_id)
+		__field(int, new)
+		__field(int, old)
+	),
+
+	TP_fast_assign(
+		__entry->grow           = grow;
+		__entry->vcpu_id        = vcpu_id;
+		__entry->new            = new;
+		__entry->old            = old;
+	),
+
+	TP_printk("vcpu %u: halt_poll_ns %d (%s %d)",
+			__entry->vcpu_id,
+			__entry->new,
+			__entry->grow ? "grow" : "shrink",
+			__entry->old)
+);
+
+#define trace_kvm_halt_poll_ns_grow(vcpu_id, new, old) \
+	trace_kvm_halt_poll_ns(true, vcpu_id, new, old)
+#define trace_kvm_halt_poll_ns_shrink(vcpu_id, new, old) \
+	trace_kvm_halt_poll_ns(false, vcpu_id, new, old)
 
 #endif /* _TRACE_KVM_MAIN_H */
 

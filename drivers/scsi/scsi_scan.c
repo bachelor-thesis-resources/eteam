@@ -55,6 +55,7 @@
  * Default timeout
  */
 #define SCSI_TIMEOUT (2*HZ)
+#define SCSI_REPORT_LUNS_TIMEOUT (30*HZ)
 
 /*
  * Prefix values for the SCSI id's (stored in sysfs name field)
@@ -216,7 +217,7 @@ static struct scsi_device *scsi_alloc_sdev(struct scsi_target *starget,
 	extern void scsi_requeue_run_queue(struct work_struct *work);
 
 	sdev = kzalloc(sizeof(*sdev) + shost->transportt->device_size,
-		       GFP_ATOMIC);
+		       GFP_KERNEL);
 	if (!sdev)
 		goto out;
 
@@ -274,8 +275,7 @@ static struct scsi_device *scsi_alloc_sdev(struct scsi_target *starget,
 	WARN_ON_ONCE(!blk_get_queue(sdev->request_queue));
 	sdev->request_queue->queuedata = sdev;
 
-	if (!shost_use_blk_mq(sdev->host) &&
-	    (shost->bqt || shost->hostt->use_blk_tags)) {
+	if (!shost_use_blk_mq(sdev->host)) {
 		blk_queue_init_tags(sdev->request_queue,
 				    sdev->host->cmd_per_lun, shost->bqt,
 				    shost->hostt->tag_alloc_policy);
@@ -314,6 +314,7 @@ static void scsi_target_destroy(struct scsi_target *starget)
 	struct Scsi_Host *shost = dev_to_shost(dev->parent);
 	unsigned long flags;
 
+	BUG_ON(starget->state == STARGET_DEL);
 	starget->state = STARGET_DEL;
 	transport_destroy_device(dev);
 	spin_lock_irqsave(shost->host_lock, flags);
@@ -380,11 +381,12 @@ static void scsi_target_reap_ref_release(struct kref *kref)
 		= container_of(kref, struct scsi_target, reap_ref);
 
 	/*
-	 * if we get here and the target is still in the CREATED state that
+	 * if we get here and the target is still in a CREATED state that
 	 * means it was allocated but never made visible (because a scan
 	 * turned up no LUNs), so don't call device_del() on it.
 	 */
-	if (starget->state != STARGET_CREATED) {
+	if ((starget->state != STARGET_CREATED) &&
+	    (starget->state != STARGET_CREATED_REMOVE)) {
 		transport_remove_device(&starget->dev);
 		device_del(&starget->dev);
 	}
@@ -701,9 +703,12 @@ static int scsi_probe_lun(struct scsi_device *sdev, unsigned char *inq_result,
 	 * strings.
 	 */
 	if (sdev->inquiry_len < 36) {
-		sdev_printk(KERN_INFO, sdev,
-			    "scsi scan: INQUIRY result too short (%d),"
-			    " using 36\n", sdev->inquiry_len);
+		if (!sdev->host->short_inquiry) {
+			shost_printk(KERN_INFO, sdev->host,
+				    "scsi scan: INQUIRY result too short (%d),"
+				    " using 36\n", sdev->inquiry_len);
+			sdev->host->short_inquiry = 1;
+		}
 		sdev->inquiry_len = 36;
 	}
 
@@ -786,7 +791,7 @@ static int scsi_add_lun(struct scsi_device *sdev, unsigned char *inq_result,
 	 */
 	sdev->inquiry = kmemdup(inq_result,
 				max_t(size_t, sdev->inquiry_len, 36),
-				GFP_ATOMIC);
+				GFP_KERNEL);
 	if (sdev->inquiry == NULL)
 		return SCSI_SCAN_NO_RESPONSE;
 
@@ -958,6 +963,9 @@ static int scsi_add_lun(struct scsi_device *sdev, unsigned char *inq_result,
 	if (*bflags & BLIST_NO_DIF)
 		sdev->no_dif = 1;
 
+	if (*bflags & BLIST_SYNC_ALUA)
+		sdev->synchronous_alua = 1;
+
 	sdev->eh_timeout = SCSI_DEFAULT_EH_TIMEOUT;
 
 	if (*bflags & BLIST_TRY_VPD_PAGES)
@@ -1080,7 +1088,7 @@ static int scsi_probe_and_add_lun(struct scsi_target *starget,
 	if (!sdev)
 		goto out;
 
-	result = kmalloc(result_len, GFP_ATOMIC |
+	result = kmalloc(result_len, GFP_KERNEL |
 			((shost->unchecked_isa_dma) ? __GFP_DMA : 0));
 	if (!result)
 		goto out_free_sdev;
@@ -1383,7 +1391,7 @@ retry:
 
 		result = scsi_execute_req(sdev, scsi_cmd, DMA_FROM_DEVICE,
 					  lun_data, length, &sshdr,
-					  SCSI_TIMEOUT + 4 * HZ, 3, NULL);
+					  SCSI_REPORT_LUNS_TIMEOUT, 3, NULL);
 
 		SCSI_LOG_SCAN_BUS(3, sdev_printk (KERN_INFO, sdev,
 				"scsi scan: REPORT LUNS"
@@ -1455,12 +1463,12 @@ retry:
  out_err:
 	kfree(lun_data);
  out:
-	scsi_device_put(sdev);
 	if (scsi_device_created(sdev))
 		/*
 		 * the sdev we used didn't appear in the report luns scan
 		 */
 		__scsi_remove_device(sdev);
+	scsi_device_put(sdev);
 	return ret;
 }
 
@@ -1705,16 +1713,16 @@ static void scsi_sysfs_add_devices(struct Scsi_Host *shost)
  */
 static struct async_scan_data *scsi_prep_async_scan(struct Scsi_Host *shost)
 {
-	struct async_scan_data *data;
+	struct async_scan_data *data = NULL;
 	unsigned long flags;
 
 	if (strncmp(scsi_scan_type, "sync", 4) == 0)
 		return NULL;
 
+	mutex_lock(&shost->scan_mutex);
 	if (shost->async_scan) {
-		shost_printk(KERN_INFO, shost, "%s called twice\n", __func__);
-		dump_stack();
-		return NULL;
+		shost_printk(KERN_DEBUG, shost, "%s called twice\n", __func__);
+		goto err;
 	}
 
 	data = kmalloc(sizeof(*data), GFP_KERNEL);
@@ -1725,7 +1733,6 @@ static struct async_scan_data *scsi_prep_async_scan(struct Scsi_Host *shost)
 		goto err;
 	init_completion(&data->prev_finished);
 
-	mutex_lock(&shost->scan_mutex);
 	spin_lock_irqsave(shost->host_lock, flags);
 	shost->async_scan = 1;
 	spin_unlock_irqrestore(shost->host_lock, flags);
@@ -1740,6 +1747,7 @@ static struct async_scan_data *scsi_prep_async_scan(struct Scsi_Host *shost)
 	return data;
 
  err:
+	mutex_unlock(&shost->scan_mutex);
 	kfree(data);
 	return NULL;
 }

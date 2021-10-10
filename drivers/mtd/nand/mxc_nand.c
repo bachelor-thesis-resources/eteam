@@ -49,7 +49,7 @@
 #define NFC_V1_V2_CONFIG		(host->regs + 0x0a)
 #define NFC_V1_V2_ECC_STATUS_RESULT	(host->regs + 0x0c)
 #define NFC_V1_V2_RSLTMAIN_AREA		(host->regs + 0x0e)
-#define NFC_V1_V2_RSLTSPARE_AREA	(host->regs + 0x10)
+#define NFC_V21_RSLTSPARE_AREA		(host->regs + 0x10)
 #define NFC_V1_V2_WRPROT		(host->regs + 0x12)
 #define NFC_V1_UNLOCKSTART_BLKADDR	(host->regs + 0x14)
 #define NFC_V1_UNLOCKEND_BLKADDR	(host->regs + 0x16)
@@ -879,7 +879,7 @@ static void copy_spare(struct mtd_info *mtd, bool bfrom)
 				      oob_chunk_size);
 
 		/* the last chunk */
-		memcpy16_toio(&s[oob_chunk_size * sparebuf_size],
+		memcpy16_toio(&s[i * sparebuf_size],
 			      &d[i * oob_chunk_size],
 			      host->used_oobsize - i * oob_chunk_size);
 	}
@@ -1033,6 +1033,9 @@ static void preset_v2(struct mtd_info *mtd)
 
 	writew(config1, NFC_V1_V2_CONFIG1);
 	/* preset operation */
+
+	/* spare area size in 16-bit half-words */
+	writew(mtd->oobsize / 2, NFC_V21_RSLTSPARE_AREA);
 
 	/* Unlock the internal RAM Buffer */
 	writew(0x2, NFC_V1_V2_CONFIG);
@@ -1458,6 +1461,7 @@ static const struct of_device_id mxcnd_dt_ids[] = {
 	},
 	{ /* sentinel */ }
 };
+MODULE_DEVICE_TABLE(of, mxcnd_dt_ids);
 
 static int __init mxcnd_probe_dt(struct mxc_nand_host *host)
 {
@@ -1516,7 +1520,6 @@ static int mxcnd_probe(struct platform_device *pdev)
 	this = &host->nand;
 	mtd = &host->mtd;
 	mtd->priv = this;
-	mtd->owner = THIS_MODULE;
 	mtd->dev.parent = &pdev->dev;
 	mtd->name = DRIVER_NAME;
 

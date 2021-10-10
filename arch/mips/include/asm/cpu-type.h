@@ -46,6 +46,7 @@ static inline int __pure __get_cpu_type(const int cpu_type)
 	case CPU_34K:
 	case CPU_1004K:
 	case CPU_74K:
+	case CPU_1074K:
 	case CPU_M14KC:
 	case CPU_M14KEC:
 	case CPU_INTERAPTIV:
@@ -75,6 +76,10 @@ static inline int __pure __get_cpu_type(const int cpu_type)
 	 * All MIPS64 R2 processors have their own special symbols.  That is,
 	 * there currently is no pure R2 core
 	 */
+#endif
+
+#ifdef CONFIG_SYS_HAS_CPU_MIPS64_R6
+	case CPU_I6400:
 #endif
 
 #ifdef CONFIG_SYS_HAS_CPU_R3000

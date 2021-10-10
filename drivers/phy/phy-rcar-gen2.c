@@ -17,8 +17,7 @@
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
-
-#include <asm/cmpxchg.h>
+#include <linux/atomic.h>
 
 #define USBHS_LPSTS			0x02
 #define USBHS_UGCTRL			0x80
@@ -184,7 +183,7 @@ static int rcar_gen2_phy_power_off(struct phy *p)
 	return 0;
 }
 
-static struct phy_ops rcar_gen2_phy_ops = {
+static const struct phy_ops rcar_gen2_phy_ops = {
 	.init		= rcar_gen2_phy_init,
 	.exit		= rcar_gen2_phy_exit,
 	.power_on	= rcar_gen2_phy_power_on,
@@ -288,6 +287,7 @@ static int rcar_gen2_phy_probe(struct platform_device *pdev)
 		error = of_property_read_u32(np, "reg", &channel_num);
 		if (error || channel_num > 2) {
 			dev_err(dev, "Invalid \"reg\" property\n");
+			of_node_put(np);
 			return error;
 		}
 		channel->select_mask = select_mask[channel_num];
@@ -303,6 +303,7 @@ static int rcar_gen2_phy_probe(struct platform_device *pdev)
 						   &rcar_gen2_phy_ops);
 			if (IS_ERR(phy->phy)) {
 				dev_err(dev, "Failed to create PHY\n");
+				of_node_put(np);
 				return PTR_ERR(phy->phy);
 			}
 			phy_set_drvdata(phy->phy, phy);

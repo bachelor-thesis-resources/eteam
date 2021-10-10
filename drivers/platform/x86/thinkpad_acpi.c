@@ -128,6 +128,7 @@ enum {
 /* ACPI HIDs */
 #define TPACPI_ACPI_IBM_HKEY_HID	"IBM0068"
 #define TPACPI_ACPI_LENOVO_HKEY_HID	"LEN0068"
+#define TPACPI_ACPI_LENOVO_HKEY_V2_HID	"LEN0268"
 #define TPACPI_ACPI_EC_HID		"PNP0C09"
 
 /* Input IDs */
@@ -303,6 +304,7 @@ static struct {
 	u32 hotkey_mask:1;
 	u32 hotkey_wlsw:1;
 	u32 hotkey_tablet:1;
+	u32 kbdlight:1;
 	u32 light:1;
 	u32 light_status:1;
 	u32 bright_acpimode:1;
@@ -402,7 +404,7 @@ static const char *str_supported(int is_supported);
 #else
 static inline const char *str_supported(int is_supported) { return ""; }
 #define vdbg_printk(a_dbg_level, format, arg...)	\
-	no_printk(format, ##arg)
+	do { if (0) no_printk(format, ##arg); } while (0)
 #endif
 
 static void tpacpi_log_usertask(const char * const what)
@@ -1913,7 +1915,9 @@ enum {	/* hot key scan codes (derived from ACPI DSDT) */
 	TP_ACPI_HOTKEYSCAN_UNK7,
 	TP_ACPI_HOTKEYSCAN_UNK8,
 
-	TP_ACPI_HOTKEYSCAN_MUTE2,
+	/* Adaptive keyboard keycodes */
+	TP_ACPI_HOTKEYSCAN_ADAPTIVE_START,
+	TP_ACPI_HOTKEYSCAN_MUTE2        = TP_ACPI_HOTKEYSCAN_ADAPTIVE_START,
 	TP_ACPI_HOTKEYSCAN_BRIGHTNESS_ZERO,
 	TP_ACPI_HOTKEYSCAN_CLIPPING_TOOL,
 	TP_ACPI_HOTKEYSCAN_CLOUD,
@@ -1933,6 +1937,15 @@ enum {	/* hot key scan codes (derived from ACPI DSDT) */
 	TP_ACPI_HOTKEYSCAN_MIC_CANCELLATION,
 	TP_ACPI_HOTKEYSCAN_CAMERA_MODE,
 	TP_ACPI_HOTKEYSCAN_ROTATE_DISPLAY,
+
+	/* Lenovo extended keymap, starting at 0x1300 */
+	TP_ACPI_HOTKEYSCAN_EXTENDED_START,
+	/* first new observed key (star, favorites) is 0x1311 */
+	TP_ACPI_HOTKEYSCAN_STAR = 69,
+	TP_ACPI_HOTKEYSCAN_CLIPPING_TOOL2,
+	TP_ACPI_HOTKEYSCAN_UNK25,
+	TP_ACPI_HOTKEYSCAN_BLUETOOTH,
+	TP_ACPI_HOTKEYSCAN_KEYBOARD,
 
 	/* Hotkey keymap size */
 	TPACPI_HOTKEY_MAP_LEN
@@ -2042,6 +2055,7 @@ static int hotkey_autosleep_ack;
 
 static u32 hotkey_orig_mask;		/* events the BIOS had enabled */
 static u32 hotkey_all_mask;		/* all events supported in fw */
+static u32 hotkey_adaptive_all_mask;	/* all adaptive events supported in fw */
 static u32 hotkey_reserved_mask;	/* events better left disabled */
 static u32 hotkey_driver_mask;		/* events needed by the driver */
 static u32 hotkey_user_mask;		/* events visible to userspace */
@@ -2474,7 +2488,7 @@ static void hotkey_compare_and_issue_event(struct tp_nvram_state *oldn,
  */
 static int hotkey_kthread(void *data)
 {
-	struct tp_nvram_state s[2];
+	struct tp_nvram_state s[2] = { 0 };
 	u32 poll_mask, event_mask;
 	unsigned int si, so;
 	unsigned long t;
@@ -2741,6 +2755,17 @@ static ssize_t hotkey_all_mask_show(struct device *dev,
 
 static DEVICE_ATTR_RO(hotkey_all_mask);
 
+/* sysfs hotkey all_mask ----------------------------------------------- */
+static ssize_t hotkey_adaptive_all_mask_show(struct device *dev,
+			   struct device_attribute *attr,
+			   char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "0x%08x\n",
+			hotkey_adaptive_all_mask | hotkey_source_mask);
+}
+
+static DEVICE_ATTR_RO(hotkey_adaptive_all_mask);
+
 /* sysfs hotkey recommended_mask --------------------------------------- */
 static ssize_t hotkey_recommended_mask_show(struct device *dev,
 					    struct device_attribute *attr,
@@ -2984,6 +3009,7 @@ static struct attribute *hotkey_attributes[] __initdata = {
 	&dev_attr_wakeup_hotunplug_complete.attr,
 	&dev_attr_hotkey_mask.attr,
 	&dev_attr_hotkey_all_mask.attr,
+	&dev_attr_hotkey_adaptive_all_mask.attr,
 	&dev_attr_hotkey_recommended_mask.attr,
 #ifdef CONFIG_THINKPAD_ACPI_HOTKEY_POLL
 	&dev_attr_hotkey_source_mask.attr,
@@ -3182,6 +3208,15 @@ static int __init hotkey_init(struct ibm_init_struct *iibm)
 		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
 		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
 		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+
+		/* No assignment, used for newer Lenovo models */
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN
+
 		},
 
 	/* Generic keymap for Lenovo ThinkPads */
@@ -3267,6 +3302,29 @@ static int __init hotkey_init(struct ibm_init_struct *iibm)
 		KEY_RESERVED,        /* Microphone cancellation */
 		KEY_RESERVED,        /* Camera mode */
 		KEY_RESERVED,        /* Rotate display, 0x116 */
+
+		/*
+		 * These are found in 2017 models (e.g. T470s, X270).
+		 * The lowest known value is 0x311, which according to
+		 * the manual should launch a user defined favorite
+		 * application.
+		 *
+		 * The offset for these is TP_ACPI_HOTKEYSCAN_EXTENDED_START,
+		 * corresponding to 0x34.
+		 */
+
+		/* (assignments unknown, please report if found) */
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN,
+
+		KEY_FAVORITES,       /* Favorite app, 0x311 */
+		KEY_RESERVED,        /* Clipping tool */
+		KEY_RESERVED,
+		KEY_BLUETOOTH,       /* Bluetooth */
+		KEY_KEYBOARD         /* Keyboard, 0x315 */
 		},
 	};
 
@@ -3320,20 +3378,6 @@ static int __init hotkey_init(struct ibm_init_struct *iibm)
 	if (!tp_features.hotkey)
 		return 1;
 
-	/*
-	 * Check if we have an adaptive keyboard, like on the
-	 * Lenovo Carbon X1 2014 (2nd Gen).
-	 */
-	if (acpi_evalf(hkey_handle, &hkeyv, "MHKV", "qd")) {
-		if ((hkeyv >> 8) == 2) {
-			tp_features.has_adaptive_kbd = true;
-			res = sysfs_create_group(&tpacpi_pdev->dev.kobj,
-					&adaptive_kbd_attr_group);
-			if (res)
-				goto err_exit;
-		}
-	}
-
 	quirks = tpacpi_check_quirks(tpacpi_hotkey_qtable,
 				     ARRAY_SIZE(tpacpi_hotkey_qtable));
 
@@ -3356,30 +3400,70 @@ static int __init hotkey_init(struct ibm_init_struct *iibm)
 	   A30, R30, R31, T20-22, X20-21, X22-24.  Detected by checking
 	   for HKEY interface version 0x100 */
 	if (acpi_evalf(hkey_handle, &hkeyv, "MHKV", "qd")) {
-		if ((hkeyv >> 8) != 1) {
-			pr_err("unknown version of the HKEY interface: 0x%x\n",
-			       hkeyv);
-			pr_err("please report this to %s\n", TPACPI_MAIL);
-		} else {
+		vdbg_printk(TPACPI_DBG_INIT | TPACPI_DBG_HKEY,
+			    "firmware HKEY interface version: 0x%x\n",
+			    hkeyv);
+
+		switch (hkeyv >> 8) {
+		case 1:
 			/*
 			 * MHKV 0x100 in A31, R40, R40e,
 			 * T4x, X31, and later
 			 */
-			vdbg_printk(TPACPI_DBG_INIT | TPACPI_DBG_HKEY,
-				"firmware HKEY interface version: 0x%x\n",
-				hkeyv);
 
 			/* Paranoia check AND init hotkey_all_mask */
 			if (!acpi_evalf(hkey_handle, &hotkey_all_mask,
 					"MHKA", "qd")) {
-				pr_err("missing MHKA handler, "
-				       "please report this to %s\n",
+				pr_err("missing MHKA handler, please report this to %s\n",
 				       TPACPI_MAIL);
 				/* Fallback: pre-init for FN+F3,F4,F12 */
 				hotkey_all_mask = 0x080cU;
 			} else {
 				tp_features.hotkey_mask = 1;
 			}
+			break;
+
+		case 2:
+			/*
+			 * MHKV 0x200 in X1, T460s, X260, T560, X1 Tablet (2016)
+			 */
+
+			/* Paranoia check AND init hotkey_all_mask */
+			if (!acpi_evalf(hkey_handle, &hotkey_all_mask,
+					"MHKA", "dd", 1)) {
+				pr_err("missing MHKA handler, please report this to %s\n",
+				       TPACPI_MAIL);
+				/* Fallback: pre-init for FN+F3,F4,F12 */
+				hotkey_all_mask = 0x080cU;
+			} else {
+				tp_features.hotkey_mask = 1;
+			}
+
+			/*
+			 * Check if we have an adaptive keyboard, like on the
+			 * Lenovo Carbon X1 2014 (2nd Gen).
+			 */
+			if (acpi_evalf(hkey_handle, &hotkey_adaptive_all_mask,
+				       "MHKA", "dd", 2)) {
+				if (hotkey_adaptive_all_mask != 0) {
+					tp_features.has_adaptive_kbd = true;
+					res = sysfs_create_group(
+						&tpacpi_pdev->dev.kobj,
+						&adaptive_kbd_attr_group);
+					if (res)
+						goto err_exit;
+				}
+			} else {
+				tp_features.has_adaptive_kbd = false;
+				hotkey_adaptive_all_mask = 0x0U;
+			}
+			break;
+
+		default:
+			pr_err("unknown version of the HKEY interface: 0x%x\n",
+			       hkeyv);
+			pr_err("please report this to %s\n", TPACPI_MAIL);
+			break;
 		}
 	}
 
@@ -3569,7 +3653,6 @@ static const int adaptive_keyboard_modes[] = {
 #define DFR_CHANGE_ROW			0x101
 #define DFR_SHOW_QUICKVIEW_ROW		0x102
 #define FIRST_ADAPTIVE_KEY		0x103
-#define ADAPTIVE_KEY_OFFSET		0x020
 
 /* press Fn key a while second, it will switch to Function Mode. Then
  * release Fn key, previous mode be restored.
@@ -3659,13 +3742,15 @@ static bool adaptive_keyboard_hotkey_notify_hotkey(unsigned int scancode)
 
 	default:
 		if (scancode < FIRST_ADAPTIVE_KEY ||
-		    scancode >= FIRST_ADAPTIVE_KEY + TPACPI_HOTKEY_MAP_LEN -
-				ADAPTIVE_KEY_OFFSET) {
+		    scancode >= FIRST_ADAPTIVE_KEY +
+		    TP_ACPI_HOTKEYSCAN_EXTENDED_START -
+		    TP_ACPI_HOTKEYSCAN_ADAPTIVE_START) {
 			pr_info("Unhandled adaptive keyboard key: 0x%x\n",
 					scancode);
 			return false;
 		}
-		keycode = hotkey_keycode_map[scancode - FIRST_ADAPTIVE_KEY + ADAPTIVE_KEY_OFFSET];
+		keycode = hotkey_keycode_map[scancode - FIRST_ADAPTIVE_KEY +
+					     TP_ACPI_HOTKEYSCAN_ADAPTIVE_START];
 		if (keycode != KEY_RESERVED) {
 			mutex_lock(&tpacpi_inputdev_send_mutex);
 
@@ -3690,19 +3775,44 @@ static bool hotkey_notify_hotkey(const u32 hkey,
 	*send_acpi_ev = true;
 	*ignore_acpi_ev = false;
 
-	/* HKEY event 0x1001 is scancode 0x00 */
-	if (scancode > 0 && scancode <= TPACPI_HOTKEY_MAP_LEN) {
-		scancode--;
-		if (!(hotkey_source_mask & (1 << scancode))) {
-			tpacpi_input_send_key_masked(scancode);
-			*send_acpi_ev = false;
-		} else {
-			*ignore_acpi_ev = true;
+	/*
+	 * Original events are in the 0x10XX range, the adaptive keyboard
+	 * found in 2014 X1 Carbon emits events are of 0x11XX. In 2017
+	 * models, additional keys are emitted through 0x13XX.
+	 */
+	switch ((hkey >> 8) & 0xf) {
+	case 0:
+		if (scancode > 0 &&
+		    scancode <= TP_ACPI_HOTKEYSCAN_ADAPTIVE_START) {
+			/* HKEY event 0x1001 is scancode 0x00 */
+			scancode--;
+			if (!(hotkey_source_mask & (1 << scancode))) {
+				tpacpi_input_send_key_masked(scancode);
+				*send_acpi_ev = false;
+			} else {
+				*ignore_acpi_ev = true;
+			}
+			return true;
 		}
-		return true;
-	} else {
+		break;
+
+	case 1:
 		return adaptive_keyboard_hotkey_notify_hotkey(scancode);
+
+	case 3:
+		/* Extended keycodes start at 0x300 and our offset into the map
+		 * TP_ACPI_HOTKEYSCAN_EXTENDED_START. The calculated scancode
+		 * will be positive, but might not be in the correct range.
+		 */
+		scancode -= (0x300 - TP_ACPI_HOTKEYSCAN_EXTENDED_START);
+		if (scancode >= TP_ACPI_HOTKEYSCAN_EXTENDED_START &&
+		    scancode < TPACPI_HOTKEY_MAP_LEN) {
+			tpacpi_input_send_key(scancode);
+			return true;
+		}
+		break;
 	}
+
 	return false;
 }
 
@@ -4103,6 +4213,7 @@ errexit:
 static const struct acpi_device_id ibm_htk_device_ids[] = {
 	{TPACPI_ACPI_IBM_HKEY_HID, 0},
 	{TPACPI_ACPI_LENOVO_HKEY_HID, 0},
+	{TPACPI_ACPI_LENOVO_HKEY_V2_HID, 0},
 	{"", 0},
 };
 
@@ -4984,6 +5095,207 @@ static struct ibm_struct video_driver_data = {
 };
 
 #endif /* CONFIG_THINKPAD_ACPI_VIDEO */
+
+/*************************************************************************
+ * Keyboard backlight subdriver
+ */
+
+static int kbdlight_set_level(int level)
+{
+	if (!hkey_handle)
+		return -ENXIO;
+
+	if (!acpi_evalf(hkey_handle, NULL, "MLCS", "dd", level))
+		return -EIO;
+
+	return 0;
+}
+
+static int kbdlight_get_level(void)
+{
+	int status = 0;
+
+	if (!hkey_handle)
+		return -ENXIO;
+
+	if (!acpi_evalf(hkey_handle, &status, "MLCG", "dd", 0))
+		return -EIO;
+
+	if (status < 0)
+		return status;
+
+	return status & 0x3;
+}
+
+static bool kbdlight_is_supported(void)
+{
+	int status = 0;
+
+	if (!hkey_handle)
+		return false;
+
+	if (!acpi_has_method(hkey_handle, "MLCG")) {
+		vdbg_printk(TPACPI_DBG_INIT, "kbdlight MLCG is unavailable\n");
+		return false;
+	}
+
+	if (!acpi_evalf(hkey_handle, &status, "MLCG", "qdd", 0)) {
+		vdbg_printk(TPACPI_DBG_INIT, "kbdlight MLCG failed\n");
+		return false;
+	}
+
+	if (status < 0) {
+		vdbg_printk(TPACPI_DBG_INIT, "kbdlight MLCG err: %d\n", status);
+		return false;
+	}
+
+	vdbg_printk(TPACPI_DBG_INIT, "kbdlight MLCG returned 0x%x\n", status);
+	/*
+	 * Guessed test for keyboard backlight:
+	 *
+	 * Machines with backlight keyboard return:
+	 *   b010100000010000000XX - ThinkPad X1 Carbon 3rd
+	 *   b110100010010000000XX - ThinkPad x230
+	 *   b010100000010000000XX - ThinkPad x240
+	 *   b010100000010000000XX - ThinkPad W541
+	 * (XX is current backlight level)
+	 *
+	 * Machines without backlight keyboard return:
+	 *   b10100001000000000000 - ThinkPad x230
+	 *   b10110001000000000000 - ThinkPad E430
+	 *   b00000000000000000000 - ThinkPad E450
+	 *
+	 * Candidate BITs for detection test (XOR):
+	 *   b01000000001000000000
+	 *              ^
+	 */
+	return status & BIT(9);
+}
+
+static void kbdlight_set_worker(struct work_struct *work)
+{
+	struct tpacpi_led_classdev *data =
+			container_of(work, struct tpacpi_led_classdev, work);
+
+	if (likely(tpacpi_lifecycle == TPACPI_LIFE_RUNNING))
+		kbdlight_set_level(data->new_state);
+}
+
+static void kbdlight_sysfs_set(struct led_classdev *led_cdev,
+			enum led_brightness brightness)
+{
+	struct tpacpi_led_classdev *data =
+			container_of(led_cdev,
+				     struct tpacpi_led_classdev,
+				     led_classdev);
+	data->new_state = brightness;
+	queue_work(tpacpi_wq, &data->work);
+}
+
+static enum led_brightness kbdlight_sysfs_get(struct led_classdev *led_cdev)
+{
+	int level;
+
+	level = kbdlight_get_level();
+	if (level < 0)
+		return 0;
+
+	return level;
+}
+
+static struct tpacpi_led_classdev tpacpi_led_kbdlight = {
+	.led_classdev = {
+		.name		= "tpacpi::kbd_backlight",
+		.max_brightness	= 2,
+		.brightness_set	= &kbdlight_sysfs_set,
+		.brightness_get	= &kbdlight_sysfs_get,
+		.flags		= LED_CORE_SUSPENDRESUME,
+	}
+};
+
+static int __init kbdlight_init(struct ibm_init_struct *iibm)
+{
+	int rc;
+
+	vdbg_printk(TPACPI_DBG_INIT, "initializing kbdlight subdriver\n");
+
+	TPACPI_ACPIHANDLE_INIT(hkey);
+	INIT_WORK(&tpacpi_led_kbdlight.work, kbdlight_set_worker);
+
+	if (!kbdlight_is_supported()) {
+		tp_features.kbdlight = 0;
+		vdbg_printk(TPACPI_DBG_INIT, "kbdlight is unsupported\n");
+		return 1;
+	}
+
+	tp_features.kbdlight = 1;
+
+	rc = led_classdev_register(&tpacpi_pdev->dev,
+				   &tpacpi_led_kbdlight.led_classdev);
+	if (rc < 0) {
+		tp_features.kbdlight = 0;
+		return rc;
+	}
+
+	return 0;
+}
+
+static void kbdlight_exit(void)
+{
+	if (tp_features.kbdlight)
+		led_classdev_unregister(&tpacpi_led_kbdlight.led_classdev);
+	flush_workqueue(tpacpi_wq);
+}
+
+static int kbdlight_read(struct seq_file *m)
+{
+	int level;
+
+	if (!tp_features.kbdlight) {
+		seq_printf(m, "status:\t\tnot supported\n");
+	} else {
+		level = kbdlight_get_level();
+		if (level < 0)
+			seq_printf(m, "status:\t\terror %d\n", level);
+		else
+			seq_printf(m, "status:\t\t%d\n", level);
+		seq_printf(m, "commands:\t0, 1, 2\n");
+	}
+
+	return 0;
+}
+
+static int kbdlight_write(char *buf)
+{
+	char *cmd;
+	int level = -1;
+
+	if (!tp_features.kbdlight)
+		return -ENODEV;
+
+	while ((cmd = next_cmd(&buf))) {
+		if (strlencmp(cmd, "0") == 0)
+			level = 0;
+		else if (strlencmp(cmd, "1") == 0)
+			level = 1;
+		else if (strlencmp(cmd, "2") == 0)
+			level = 2;
+		else
+			return -EINVAL;
+	}
+
+	if (level == -1)
+		return -EINVAL;
+
+	return kbdlight_set_level(level);
+}
+
+static struct ibm_struct kbdlight_driver_data = {
+	.name = "kbdlight",
+	.read = kbdlight_read,
+	.write = kbdlight_write,
+	.exit = kbdlight_exit,
+};
 
 /*************************************************************************
  * Light (thinklight) subdriver
@@ -6362,8 +6674,10 @@ static int __init tpacpi_query_bcl_levels(acpi_handle handle)
 	list_for_each_entry(child, &device->children, node) {
 		acpi_status status = acpi_evaluate_object(child->handle, "_BCL",
 							  NULL, &buffer);
-		if (ACPI_FAILURE(status))
+		if (ACPI_FAILURE(status)) {
+			buffer.length = ACPI_ALLOCATE_BUFFER;
 			continue;
+		}
 
 		obj = (union acpi_object *)buffer.pointer;
 		if (!obj || (obj->type != ACPI_TYPE_PACKAGE)) {
@@ -6459,8 +6773,7 @@ static void __init tpacpi_detect_brightness_capabilities(void)
 		pr_info("detected a 8-level brightness capable ThinkPad\n");
 		break;
 	default:
-		pr_err("Unsupported brightness interface, "
-		       "please contact %s\n", TPACPI_MAIL);
+		pr_info("Unsupported brightness interface\n");
 		tp_features.bright_unkfw = 1;
 		bright_maxlvl = b - 1;
 	}
@@ -9207,6 +9520,10 @@ static struct ibm_init_struct ibms_init[] __initdata = {
 		.data = &video_driver_data,
 	},
 #endif
+	{
+		.init = kbdlight_init,
+		.data = &kbdlight_driver_data,
+	},
 	{
 		.init = light_init,
 		.data = &light_driver_data,

@@ -441,7 +441,7 @@ void migrate_irqs(void)
 
 		chip = irq_data_get_irq_chip(data);
 
-		cpumask_and(mask, data->affinity, map);
+		cpumask_and(mask, irq_data_get_affinity_mask(data), map);
 		if (cpumask_any(mask) >= nr_cpu_ids) {
 			pr_warn("Breaking affinity for irq %i\n", irq);
 			cpumask_copy(mask, map);
@@ -484,8 +484,6 @@ void __do_irq(struct pt_regs *regs)
 
 	trace_irq_entry(regs);
 
-	check_stack_overflow();
-
 	/*
 	 * Query the platform PIC for the interrupt & ack it.
 	 *
@@ -516,6 +514,8 @@ void do_IRQ(struct pt_regs *regs)
 	curtp = current_thread_info();
 	irqtp = hardirq_ctx[raw_smp_processor_id()];
 	sirqtp = softirq_ctx[raw_smp_processor_id()];
+
+	check_stack_overflow();
 
 	/* Already there ? */
 	if (unlikely(curtp == irqtp || curtp == sirqtp)) {

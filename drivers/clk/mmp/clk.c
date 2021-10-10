@@ -1,7 +1,6 @@
 #include <linux/io.h>
-#include <linux/clk.h>
 #include <linux/clk-provider.h>
-#include <linux/clkdev.h>
+#include <linux/slab.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 
@@ -183,7 +182,7 @@ void mmp_clk_add(struct mmp_clk_unit *unit, unsigned int id,
 		pr_err("CLK %d has invalid pointer %p\n", id, clk);
 		return;
 	}
-	if (id > unit->nr_clks) {
+	if (id >= unit->nr_clks) {
 		pr_err("CLK %d is invalid\n", id);
 		return;
 	}

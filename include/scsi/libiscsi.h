@@ -144,6 +144,9 @@ struct iscsi_task {
 	void			*dd_data;	/* driver/transport data */
 };
 
+/* invalid scsi_task pointer */
+#define	INVALID_SCSI_TASK	(struct iscsi_task *)-1l
+
 static inline int iscsi_task_has_unsol_data(struct iscsi_task *task)
 {
 	return task->unsol_r2t.data_length > task->unsol_r2t.sent;
@@ -196,6 +199,7 @@ struct iscsi_conn {
 	struct iscsi_task	*task;		/* xmit task in progress */
 
 	/* xmit */
+	spinlock_t		taskqueuelock;  /* protects the next three lists */
 	struct list_head	mgmtqueue;	/* mgmt (control) xmit queue */
 	struct list_head	cmdqueue;	/* data-path cmd queue */
 	struct list_head	requeue;	/* tasks needing another run */
@@ -331,19 +335,12 @@ struct iscsi_session {
 	struct iscsi_transport	*tt;
 	struct Scsi_Host	*host;
 	struct iscsi_conn	*leadconn;	/* leading connection */
-	/* Between the forward and the backward locks exists a strict locking
-	 * hierarchy. The mutual exclusion zone protected by the forward lock
-	 * can enclose the mutual exclusion zone protected by the backward lock
-	 * but not vice versa.
-	 */
-	spinlock_t		frwd_lock;	/* protects session state, *
-						 * cmdsn, queued_cmdsn     *
+	spinlock_t		lock;		/* protects session state, *
+						 * sequence numbers,       *
 						 * session resources:      *
-						 * - cmdpool kfifo_out ,   *
-						 * - mgmtpool,		   */
-	spinlock_t		back_lock;	/* protects cmdsn_exp      *
-						 * cmdsn_max,              *
-						 * cmdpool kfifo_in        */
+						 * - cmdpool,		   *
+						 * - mgmtpool,		   *
+						 * - r2tpool		   */
 	int			state;		/* session state           */
 	int			age;		/* counts session re-opens */
 

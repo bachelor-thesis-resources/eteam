@@ -67,14 +67,12 @@ static void icp_rm_set_vcpu_irq(struct kvm_vcpu *vcpu,
 	}
 
 	/* Check if the core is loaded, if not, too hard */
-	cpu = vcpu->cpu;
+	cpu = vcpu->arch.thread_cpu;
 	if (cpu < 0 || cpu >= nr_cpu_ids) {
 		this_icp->rm_action |= XICS_RM_KICK_VCPU;
 		this_icp->rm_kick_target = vcpu;
 		return;
 	}
-	/* In SMT cpu will always point to thread 0, we adjust it */
-	cpu += vcpu->arch.ptid;
 
 	smp_mb();
 	kvmhv_rm_send_ipi(cpu);
@@ -282,6 +280,7 @@ static void icp_rm_deliver_irq(struct kvmppc_xics *xics, struct kvmppc_icp *icp,
 		 */
 		if (reject && reject != XICS_IPI) {
 			arch_spin_unlock(&ics->lock);
+			icp->n_reject++;
 			new_irq = reject;
 			goto again;
 		}
@@ -613,10 +612,8 @@ int kvmppc_rm_h_eoi(struct kvm_vcpu *vcpu, unsigned long xirr)
 	state = &ics->irq_state[src];
 
 	/* Still asserted, resend it */
-	if (state->asserted) {
-		icp->n_reject++;
+	if (state->asserted)
 		icp_rm_deliver_irq(xics, icp, irq);
-	}
 
 	if (!hlist_empty(&vcpu->kvm->irq_ack_notifier_list)) {
 		icp->rm_action |= XICS_RM_NOTIFY_EOI;

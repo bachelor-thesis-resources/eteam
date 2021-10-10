@@ -99,6 +99,14 @@ static int __ath10k_htt_rx_ring_fill_n(struct ath10k_htt *htt, int num)
 	BUILD_BUG_ON(HTT_RX_RING_FILL_LEVEL >= HTT_RX_RING_SIZE / 2);
 
 	idx = __le32_to_cpu(*htt->rx_ring.alloc_idx.vaddr);
+
+	if (idx < 0 || idx >= htt->rx_ring.size) {
+		ath10k_err(htt->ar, "rx ring index is not valid, firmware malfunctioning?\n");
+		idx &= htt->rx_ring.size_mask;
+		ret = -ENOMEM;
+		goto fail;
+	}
+
 	while (num > 0) {
 		skb = dev_alloc_skb(HTT_RX_BUF_SIZE + HTT_RX_DESC_ALIGN);
 		if (!skb) {
@@ -212,10 +220,11 @@ int ath10k_htt_rx_ring_refill(struct ath10k *ar)
 	spin_lock_bh(&htt->rx_ring.lock);
 	ret = ath10k_htt_rx_ring_fill_n(htt, (htt->rx_ring.fill_level -
 					      htt->rx_ring.fill_cnt));
-	spin_unlock_bh(&htt->rx_ring.lock);
 
 	if (ret)
 		ath10k_htt_rx_ring_free(htt);
+
+	spin_unlock_bh(&htt->rx_ring.lock);
 
 	return ret;
 }
@@ -230,7 +239,9 @@ void ath10k_htt_rx_free(struct ath10k_htt *htt)
 	skb_queue_purge(&htt->rx_compl_q);
 	skb_queue_purge(&htt->rx_in_ord_compl_q);
 
+	spin_lock_bh(&htt->rx_ring.lock);
 	ath10k_htt_rx_ring_free(htt);
+	spin_unlock_bh(&htt->rx_ring.lock);
 
 	dma_free_coherent(htt->ar->dev,
 			  (htt->rx_ring.size *
@@ -368,7 +379,7 @@ static int ath10k_htt_rx_amsdu_pop(struct ath10k_htt *htt,
 		msdu_len_invalid = !!(__le32_to_cpu(rx_desc->attention.flags)
 					& (RX_ATTENTION_FLAGS_MPDU_LENGTH_ERR |
 					   RX_ATTENTION_FLAGS_MSDU_LENGTH_ERR));
-		msdu_len = MS(__le32_to_cpu(rx_desc->msdu_start.info0),
+		msdu_len = MS(__le32_to_cpu(rx_desc->msdu_start.common.info0),
 			      RX_MSDU_START_INFO0_MSDU_LENGTH);
 		msdu_chained = rx_desc->frag_info.ring2_more_count;
 
@@ -394,7 +405,7 @@ static int ath10k_htt_rx_amsdu_pop(struct ath10k_htt *htt,
 			msdu_chaining = 1;
 		}
 
-		last_msdu = __le32_to_cpu(rx_desc->msdu_end.info0) &
+		last_msdu = __le32_to_cpu(rx_desc->msdu_end.common.info0) &
 				RX_MSDU_END_INFO0_LAST_MSDU;
 
 		trace_ath10k_htt_rx_desc(ar, &rx_desc->attention,
@@ -643,6 +654,8 @@ struct amsdu_subframe_hdr {
 	__be16 len;
 } __packed;
 
+#define GROUP_ID_IS_SU_MIMO(x) ((x) == 0 || (x) == 63)
+
 static void ath10k_htt_rx_h_rates(struct ath10k *ar,
 				  struct ieee80211_rx_status *status,
 				  struct htt_rx_desc *rxd)
@@ -650,7 +663,9 @@ static void ath10k_htt_rx_h_rates(struct ath10k *ar,
 	struct ieee80211_supported_band *sband;
 	u8 cck, rate, bw, sgi, mcs, nss;
 	u8 preamble = 0;
+	u8 group_id;
 	u32 info1, info2, info3;
+	u32 stbc, nsts_su;
 
 	info1 = __le32_to_cpu(rxd->ppdu_start.info1);
 	info2 = __le32_to_cpu(rxd->ppdu_start.info2);
@@ -692,10 +707,55 @@ static void ath10k_htt_rx_h_rates(struct ath10k *ar,
 	case HTT_RX_VHT_WITH_TXBF:
 		/* VHT-SIG-A1 in info2, VHT-SIG-A2 in info3
 		   TODO check this */
-		mcs = (info3 >> 4) & 0x0F;
-		nss = ((info2 >> 10) & 0x07) + 1;
 		bw = info2 & 3;
 		sgi = info3 & 1;
+		stbc = (info2 >> 3) & 1;
+		group_id = (info2 >> 4) & 0x3F;
+
+		if (GROUP_ID_IS_SU_MIMO(group_id)) {
+			mcs = (info3 >> 4) & 0x0F;
+			nsts_su = ((info2 >> 10) & 0x07);
+			if (stbc)
+				nss = (nsts_su >> 2) + 1;
+			else
+				nss = (nsts_su + 1);
+		} else {
+			/* Hardware doesn't decode VHT-SIG-B into Rx descriptor
+			 * so it's impossible to decode MCS. Also since
+			 * firmware consumes Group Id Management frames host
+			 * has no knowledge regarding group/user position
+			 * mapping so it's impossible to pick the correct Nsts
+			 * from VHT-SIG-A1.
+			 *
+			 * Bandwidth and SGI are valid so report the rateinfo
+			 * on best-effort basis.
+			 */
+			mcs = 0;
+			nss = 1;
+		}
+
+		if (mcs > 0x09) {
+			ath10k_warn(ar, "invalid MCS received %u\n", mcs);
+			ath10k_warn(ar, "rxd %08x mpdu start %08x %08x msdu start %08x %08x ppdu start %08x %08x %08x %08x %08x\n",
+				    __le32_to_cpu(rxd->attention.flags),
+				    __le32_to_cpu(rxd->mpdu_start.info0),
+				    __le32_to_cpu(rxd->mpdu_start.info1),
+				    __le32_to_cpu(rxd->msdu_start.common.info0),
+				    __le32_to_cpu(rxd->msdu_start.common.info1),
+				    rxd->ppdu_start.info0,
+				    __le32_to_cpu(rxd->ppdu_start.info1),
+				    __le32_to_cpu(rxd->ppdu_start.info2),
+				    __le32_to_cpu(rxd->ppdu_start.info3),
+				    __le32_to_cpu(rxd->ppdu_start.info4));
+
+			ath10k_warn(ar, "msdu end %08x mpdu end %08x\n",
+				    __le32_to_cpu(rxd->msdu_end.common.info0),
+				    __le32_to_cpu(rxd->mpdu_end.info0));
+
+			ath10k_dbg_dump(ar, ATH10K_DBG_HTT_DUMP, NULL,
+					"rx desc msdu payload: ",
+					rxd->msdu_payload, 50);
+		}
 
 		status->rate_idx = mcs;
 		status->vht_nss = nss;
@@ -740,7 +800,7 @@ ath10k_htt_rx_h_peer_channel(struct ath10k *ar, struct htt_rx_desc *rxd)
 	    __cpu_to_le32(RX_ATTENTION_FLAGS_PEER_IDX_INVALID))
 		return NULL;
 
-	if (!(rxd->msdu_end.info0 &
+	if (!(rxd->msdu_end.common.info0 &
 	      __cpu_to_le32(RX_MSDU_END_INFO0_FIRST_MSDU)))
 		return NULL;
 
@@ -832,6 +892,19 @@ static void ath10k_htt_rx_h_signal(struct ath10k *ar,
 				   struct ieee80211_rx_status *status,
 				   struct htt_rx_desc *rxd)
 {
+	int i;
+
+	for (i = 0; i < IEEE80211_MAX_CHAINS ; i++) {
+		status->chains &= ~BIT(i);
+
+		if (rxd->ppdu_start.rssi_chains[i].pri20_mhz != 0x80) {
+			status->chain_signal[i] = ATH10K_DEFAULT_NOISE_FLOOR +
+				rxd->ppdu_start.rssi_chains[i].pri20_mhz;
+
+			status->chains |= BIT(i);
+		}
+	}
+
 	/* FIXME: Get real NF */
 	status->signal = ATH10K_DEFAULT_NOISE_FLOOR +
 			 rxd->ppdu_start.rssi_comb;
@@ -936,7 +1009,7 @@ static void ath10k_process_rx(struct ath10k *ar,
 	*status = *rx_status;
 
 	ath10k_dbg(ar, ATH10K_DBG_DATA,
-		   "rx skb %p len %u peer %pM %s %s sn %u %s%s%s%s%s %srate_idx %u vht_nss %u freq %u band %u flag 0x%x fcs-err %i mic-err %i amsdu-more %i\n",
+		   "rx skb %p len %u peer %pM %s %s sn %u %s%s%s%s%s %srate_idx %u vht_nss %u freq %u band %u flag 0x%llx fcs-err %i mic-err %i amsdu-more %i\n",
 		   skb,
 		   skb->len,
 		   ieee80211_get_SA(hdr),
@@ -991,9 +1064,9 @@ static void ath10k_htt_rx_h_undecap_raw(struct ath10k *ar,
 	bool is_last;
 
 	rxd = (void *)msdu->data - sizeof(*rxd);
-	is_first = !!(rxd->msdu_end.info0 &
+	is_first = !!(rxd->msdu_end.common.info0 &
 		      __cpu_to_le32(RX_MSDU_END_INFO0_FIRST_MSDU));
-	is_last = !!(rxd->msdu_end.info0 &
+	is_last = !!(rxd->msdu_end.common.info0 &
 		     __cpu_to_le32(RX_MSDU_END_INFO0_LAST_MSDU));
 
 	/* Delivered decapped frame:
@@ -1017,9 +1090,8 @@ static void ath10k_htt_rx_h_undecap_raw(struct ath10k *ar,
 	skb_trim(msdu, msdu->len - FCS_LEN);
 
 	/* In most cases this will be true for sniffed frames. It makes sense
-	 * to deliver them as-is without stripping the crypto param. This would
-	 * also make sense for software based decryption (which is not
-	 * implemented in ath10k).
+	 * to deliver them as-is without stripping the crypto param. This is
+	 * necessary for software based decryption.
 	 *
 	 * If there's no error then the frame is decrypted. At least that is
 	 * the case for frames that come in via fragmented rx indication.
@@ -1034,7 +1106,21 @@ static void ath10k_htt_rx_h_undecap_raw(struct ath10k *ar,
 	hdr = (void *)msdu->data;
 
 	/* Tail */
-	skb_trim(msdu, msdu->len - ath10k_htt_rx_crypto_tail_len(ar, enctype));
+	if (status->flag & RX_FLAG_IV_STRIPPED) {
+		skb_trim(msdu, msdu->len -
+			 ath10k_htt_rx_crypto_tail_len(ar, enctype));
+	} else {
+		/* MIC */
+		if ((status->flag & RX_FLAG_MIC_STRIPPED) &&
+		    enctype == HTT_RX_MPDU_ENCRYPT_AES_CCM_WPA2)
+			skb_trim(msdu, msdu->len - 8);
+
+		/* ICV */
+		if (status->flag & RX_FLAG_ICV_STRIPPED &&
+		    enctype != HTT_RX_MPDU_ENCRYPT_AES_CCM_WPA2)
+			skb_trim(msdu, msdu->len -
+				 ath10k_htt_rx_crypto_tail_len(ar, enctype));
+	}
 
 	/* MMIC */
 	if (!ieee80211_has_morefrags(hdr->frame_control) &&
@@ -1053,12 +1139,14 @@ static void ath10k_htt_rx_h_undecap_raw(struct ath10k *ar,
 static void ath10k_htt_rx_h_undecap_nwifi(struct ath10k *ar,
 					  struct sk_buff *msdu,
 					  struct ieee80211_rx_status *status,
-					  const u8 first_hdr[64])
+					  const u8 first_hdr[64],
+					  enum htt_rx_mpdu_encrypt_type enctype)
 {
 	struct ieee80211_hdr *hdr;
 	size_t hdr_len;
 	u8 da[ETH_ALEN];
 	u8 sa[ETH_ALEN];
+	int bytes_aligned = ar->hw_params.decap_align_bytes;
 
 	/* Delivered decapped frame:
 	 * [nwifi 802.11 header] <-- replaced with 802.11 hdr
@@ -1081,6 +1169,14 @@ static void ath10k_htt_rx_h_undecap_nwifi(struct ath10k *ar,
 	/* push original 802.11 header */
 	hdr = (struct ieee80211_hdr *)first_hdr;
 	hdr_len = ieee80211_hdrlen(hdr->frame_control);
+
+	if (!(status->flag & RX_FLAG_IV_STRIPPED)) {
+		memcpy(skb_push(msdu,
+				ath10k_htt_rx_crypto_param_len(ar, enctype)),
+		       (void *)hdr + round_up(hdr_len, bytes_aligned),
+			ath10k_htt_rx_crypto_param_len(ar, enctype));
+	}
+
 	memcpy(skb_push(msdu, hdr_len), hdr, hdr_len);
 
 	/* original 802.11 header has a different DA and in
@@ -1100,13 +1196,14 @@ static void *ath10k_htt_rx_h_find_rfc1042(struct ath10k *ar,
 	size_t hdr_len, crypto_len;
 	void *rfc1042;
 	bool is_first, is_last, is_amsdu;
+	int bytes_aligned = ar->hw_params.decap_align_bytes;
 
 	rxd = (void *)msdu->data - sizeof(*rxd);
 	hdr = (void *)rxd->rx_hdr_status;
 
-	is_first = !!(rxd->msdu_end.info0 &
+	is_first = !!(rxd->msdu_end.common.info0 &
 		      __cpu_to_le32(RX_MSDU_END_INFO0_FIRST_MSDU));
-	is_last = !!(rxd->msdu_end.info0 &
+	is_last = !!(rxd->msdu_end.common.info0 &
 		     __cpu_to_le32(RX_MSDU_END_INFO0_LAST_MSDU));
 	is_amsdu = !(is_first && is_last);
 
@@ -1116,8 +1213,8 @@ static void *ath10k_htt_rx_h_find_rfc1042(struct ath10k *ar,
 		hdr_len = ieee80211_hdrlen(hdr->frame_control);
 		crypto_len = ath10k_htt_rx_crypto_param_len(ar, enctype);
 
-		rfc1042 += round_up(hdr_len, 4) +
-			   round_up(crypto_len, 4);
+		rfc1042 += round_up(hdr_len, bytes_aligned) +
+			   round_up(crypto_len, bytes_aligned);
 	}
 
 	if (is_amsdu)
@@ -1138,6 +1235,7 @@ static void ath10k_htt_rx_h_undecap_eth(struct ath10k *ar,
 	void *rfc1042;
 	u8 da[ETH_ALEN];
 	u8 sa[ETH_ALEN];
+	int bytes_aligned = ar->hw_params.decap_align_bytes;
 
 	/* Delivered decapped frame:
 	 * [eth header] <-- replaced with 802.11 hdr & rfc1042/llc
@@ -1161,6 +1259,14 @@ static void ath10k_htt_rx_h_undecap_eth(struct ath10k *ar,
 	/* push original 802.11 header */
 	hdr = (struct ieee80211_hdr *)first_hdr;
 	hdr_len = ieee80211_hdrlen(hdr->frame_control);
+
+	if (!(status->flag & RX_FLAG_IV_STRIPPED)) {
+		memcpy(skb_push(msdu,
+				ath10k_htt_rx_crypto_param_len(ar, enctype)),
+		       (void *)hdr + round_up(hdr_len, bytes_aligned),
+			ath10k_htt_rx_crypto_param_len(ar, enctype));
+	}
+
 	memcpy(skb_push(msdu, hdr_len), hdr, hdr_len);
 
 	/* original 802.11 header has a different DA and in
@@ -1174,10 +1280,12 @@ static void ath10k_htt_rx_h_undecap_eth(struct ath10k *ar,
 static void ath10k_htt_rx_h_undecap_snap(struct ath10k *ar,
 					 struct sk_buff *msdu,
 					 struct ieee80211_rx_status *status,
-					 const u8 first_hdr[64])
+					 const u8 first_hdr[64],
+					 enum htt_rx_mpdu_encrypt_type enctype)
 {
 	struct ieee80211_hdr *hdr;
 	size_t hdr_len;
+	int bytes_aligned = ar->hw_params.decap_align_bytes;
 
 	/* Delivered decapped frame:
 	 * [amsdu header] <-- replaced with 802.11 hdr
@@ -1189,6 +1297,14 @@ static void ath10k_htt_rx_h_undecap_snap(struct ath10k *ar,
 
 	hdr = (struct ieee80211_hdr *)first_hdr;
 	hdr_len = ieee80211_hdrlen(hdr->frame_control);
+
+	if (!(status->flag & RX_FLAG_IV_STRIPPED)) {
+		memcpy(skb_push(msdu,
+				ath10k_htt_rx_crypto_param_len(ar, enctype)),
+		       (void *)hdr + round_up(hdr_len, bytes_aligned),
+			ath10k_htt_rx_crypto_param_len(ar, enctype));
+	}
+
 	memcpy(skb_push(msdu, hdr_len), hdr, hdr_len);
 }
 
@@ -1201,7 +1317,6 @@ static void ath10k_htt_rx_h_undecap(struct ath10k *ar,
 {
 	struct htt_rx_desc *rxd;
 	enum rx_msdu_decap_format decap;
-	struct ieee80211_hdr *hdr;
 
 	/* First msdu's decapped header:
 	 * [802.11 header] <-- padded to 4 bytes long
@@ -1215,8 +1330,7 @@ static void ath10k_htt_rx_h_undecap(struct ath10k *ar,
 	 */
 
 	rxd = (void *)msdu->data - sizeof(*rxd);
-	hdr = (void *)rxd->rx_hdr_status;
-	decap = MS(__le32_to_cpu(rxd->msdu_start.info1),
+	decap = MS(__le32_to_cpu(rxd->msdu_start.common.info1),
 		   RX_MSDU_START_INFO1_DECAP_FORMAT);
 
 	switch (decap) {
@@ -1225,13 +1339,15 @@ static void ath10k_htt_rx_h_undecap(struct ath10k *ar,
 					    is_decrypted);
 		break;
 	case RX_MSDU_DECAP_NATIVE_WIFI:
-		ath10k_htt_rx_h_undecap_nwifi(ar, msdu, status, first_hdr);
+		ath10k_htt_rx_h_undecap_nwifi(ar, msdu, status, first_hdr,
+					      enctype);
 		break;
 	case RX_MSDU_DECAP_ETHERNET2_DIX:
 		ath10k_htt_rx_h_undecap_eth(ar, msdu, status, first_hdr, enctype);
 		break;
 	case RX_MSDU_DECAP_8023_SNAP_LLC:
-		ath10k_htt_rx_h_undecap_snap(ar, msdu, status, first_hdr);
+		ath10k_htt_rx_h_undecap_snap(ar, msdu, status, first_hdr,
+					     enctype);
 		break;
 	}
 }
@@ -1246,7 +1362,7 @@ static int ath10k_htt_rx_get_csum_state(struct sk_buff *skb)
 
 	rxd = (void *)skb->data - sizeof(*rxd);
 	flags = __le32_to_cpu(rxd->attention.flags);
-	info = __le32_to_cpu(rxd->msdu_start.info1);
+	info = __le32_to_cpu(rxd->msdu_start.common.info1);
 
 	is_ip4 = !!(info & RX_MSDU_START_INFO1_IPV4_PROTO);
 	is_ip6 = !!(info & RX_MSDU_START_INFO1_IPV6_PROTO);
@@ -1274,7 +1390,8 @@ static void ath10k_htt_rx_h_csum_offload(struct sk_buff *msdu)
 
 static void ath10k_htt_rx_h_mpdu(struct ath10k *ar,
 				 struct sk_buff_head *amsdu,
-				 struct ieee80211_rx_status *status)
+				 struct ieee80211_rx_status *status,
+				 bool fill_crypt_header)
 {
 	struct sk_buff *first;
 	struct sk_buff *last;
@@ -1284,7 +1401,6 @@ static void ath10k_htt_rx_h_mpdu(struct ath10k *ar,
 	enum htt_rx_mpdu_encrypt_type enctype;
 	u8 first_hdr[64];
 	u8 *qos;
-	size_t hdr_len;
 	bool has_fcs_err;
 	bool has_crypto_err;
 	bool has_tkip_err;
@@ -1305,15 +1421,17 @@ static void ath10k_htt_rx_h_mpdu(struct ath10k *ar,
 	 * decapped header. It'll be used for undecapping of each MSDU.
 	 */
 	hdr = (void *)rxd->rx_hdr_status;
-	hdr_len = ieee80211_hdrlen(hdr->frame_control);
-	memcpy(first_hdr, hdr, hdr_len);
+	memcpy(first_hdr, hdr, RX_HTT_HDR_STATUS_LEN);
 
 	/* Each A-MSDU subframe will use the original header as the base and be
 	 * reported as a separate MSDU so strip the A-MSDU bit from QoS Ctl.
 	 */
 	hdr = (void *)first_hdr;
-	qos = ieee80211_get_qos_ctl(hdr);
-	qos[0] &= ~IEEE80211_QOS_CTL_A_MSDU_PRESENT;
+
+	if (ieee80211_is_data_qos(hdr->frame_control)) {
+		qos = ieee80211_get_qos_ctl(hdr);
+		qos[0] &= ~IEEE80211_QOS_CTL_A_MSDU_PRESENT;
+	}
 
 	/* Some attention flags are valid only in the last MSDU. */
 	last = skb_peek_tail(amsdu);
@@ -1347,10 +1465,16 @@ static void ath10k_htt_rx_h_mpdu(struct ath10k *ar,
 	if (has_tkip_err)
 		status->flag |= RX_FLAG_MMIC_ERROR;
 
-	if (is_decrypted)
+	if (is_decrypted) {
 		status->flag |= RX_FLAG_DECRYPTED |
-				RX_FLAG_IV_STRIPPED |
 				RX_FLAG_MMIC_STRIPPED;
+
+		if (fill_crypt_header)
+			status->flag |= RX_FLAG_MIC_STRIPPED |
+					RX_FLAG_ICV_STRIPPED;
+		else
+			status->flag |= RX_FLAG_IV_STRIPPED;
+	}
 
 	skb_queue_walk(amsdu, msdu) {
 		ath10k_htt_rx_h_csum_offload(msdu);
@@ -1364,6 +1488,9 @@ static void ath10k_htt_rx_h_mpdu(struct ath10k *ar,
 		if (!is_decrypted)
 			continue;
 
+		if (fill_crypt_header)
+			continue;
+
 		hdr = (void *)msdu->data;
 		hdr->frame_control &= ~__cpu_to_le16(IEEE80211_FCTL_PROTECTED);
 	}
@@ -1374,6 +1501,9 @@ static void ath10k_htt_rx_h_deliver(struct ath10k *ar,
 				    struct ieee80211_rx_status *status)
 {
 	struct sk_buff *msdu;
+	struct sk_buff *first_subframe;
+
+	first_subframe = skb_peek(amsdu);
 
 	while ((msdu = __skb_dequeue(amsdu))) {
 		/* Setup per-MSDU flags */
@@ -1381,6 +1511,13 @@ static void ath10k_htt_rx_h_deliver(struct ath10k *ar,
 			status->flag &= ~RX_FLAG_AMSDU_MORE;
 		else
 			status->flag |= RX_FLAG_AMSDU_MORE;
+
+		if (msdu == first_subframe) {
+			first_subframe = NULL;
+			status->flag &= ~RX_FLAG_ALLOW_SAME_PN;
+		} else {
+			status->flag |= RX_FLAG_ALLOW_SAME_PN;
+		}
 
 		ath10k_process_rx(ar, status, msdu);
 	}
@@ -1439,7 +1576,7 @@ static void ath10k_htt_rx_h_unchain(struct ath10k *ar,
 
 	first = skb_peek(amsdu);
 	rxd = (void *)first->data - sizeof(*rxd);
-	decap = MS(__le32_to_cpu(rxd->msdu_start.info1),
+	decap = MS(__le32_to_cpu(rxd->msdu_start.common.info1),
 		   RX_MSDU_START_INFO1_DECAP_FORMAT);
 
 	if (!chained)
@@ -1567,7 +1704,7 @@ static void ath10k_htt_rx_handler(struct ath10k_htt *htt,
 		ath10k_htt_rx_h_ppdu(ar, &amsdu, rx_status, 0xffff);
 		ath10k_htt_rx_h_unchain(ar, &amsdu, ret > 0);
 		ath10k_htt_rx_h_filter(ar, &amsdu, rx_status);
-		ath10k_htt_rx_h_mpdu(ar, &amsdu, rx_status);
+		ath10k_htt_rx_h_mpdu(ar, &amsdu, rx_status, true);
 		ath10k_htt_rx_h_deliver(ar, &amsdu, rx_status);
 	}
 
@@ -1613,7 +1750,7 @@ static void ath10k_htt_rx_frag_handler(struct ath10k_htt *htt,
 
 	ath10k_htt_rx_h_ppdu(ar, &amsdu, rx_status, 0xffff);
 	ath10k_htt_rx_h_filter(ar, &amsdu, rx_status);
-	ath10k_htt_rx_h_mpdu(ar, &amsdu, rx_status);
+	ath10k_htt_rx_h_mpdu(ar, &amsdu, rx_status, true);
 	ath10k_htt_rx_h_deliver(ar, &amsdu, rx_status);
 
 	if (fw_desc_len > 0) {
@@ -1632,8 +1769,6 @@ static void ath10k_htt_rx_frm_tx_compl(struct ath10k *ar,
 	int status = MS(resp->data_tx_completion.flags, HTT_DATA_TX_STATUS);
 	__le16 msdu_id;
 	int i;
-
-	lockdep_assert_held(&htt->tx_lock);
 
 	switch (status) {
 	case HTT_DATA_TX_STATUS_NO_ACK:
@@ -1759,14 +1894,14 @@ static int ath10k_htt_rx_extract_amsdu(struct sk_buff_head *list,
 		__skb_queue_tail(amsdu, msdu);
 
 		rxd = (void *)msdu->data - sizeof(*rxd);
-		if (rxd->msdu_end.info0 &
+		if (rxd->msdu_end.common.info0 &
 		    __cpu_to_le32(RX_MSDU_END_INFO0_LAST_MSDU))
 			break;
 	}
 
 	msdu = skb_peek_tail(amsdu);
 	rxd = (void *)msdu->data - sizeof(*rxd);
-	if (!(rxd->msdu_end.info0 &
+	if (!(rxd->msdu_end.common.info0 &
 	      __cpu_to_le32(RX_MSDU_END_INFO0_LAST_MSDU))) {
 		skb_queue_splice_init(amsdu, list);
 		return -EAGAIN;
@@ -1914,7 +2049,7 @@ static void ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
 			 */
 			ath10k_htt_rx_h_ppdu(ar, &amsdu, status, vdev_id);
 			ath10k_htt_rx_h_filter(ar, &amsdu, status);
-			ath10k_htt_rx_h_mpdu(ar, &amsdu, status);
+			ath10k_htt_rx_h_mpdu(ar, &amsdu, status, false);
 			ath10k_htt_rx_h_deliver(ar, &amsdu, status);
 			break;
 		case -EAGAIN:
@@ -2000,15 +2135,11 @@ void ath10k_htt_t2h_msg_handler(struct ath10k *ar, struct sk_buff *skb)
 			break;
 		}
 
-		spin_lock_bh(&htt->tx_lock);
 		ath10k_txrx_tx_unref(htt, &tx_done);
-		spin_unlock_bh(&htt->tx_lock);
 		break;
 	}
 	case HTT_T2H_MSG_TYPE_TX_COMPL_IND:
-		spin_lock_bh(&htt->tx_lock);
-		__skb_queue_tail(&htt->tx_compl_q, skb);
-		spin_unlock_bh(&htt->tx_lock);
+		skb_queue_tail(&htt->tx_compl_q, skb);
 		tasklet_schedule(&htt->txrx_compl_task);
 		return;
 	case HTT_T2H_MSG_TYPE_SEC_IND: {
@@ -2074,6 +2205,12 @@ void ath10k_htt_t2h_msg_handler(struct ath10k *ar, struct sk_buff *skb)
 		break;
 	case HTT_T2H_MSG_TYPE_CHAN_CHANGE:
 		break;
+	case HTT_T2H_MSG_TYPE_AGGR_CONF:
+		break;
+	case HTT_T2H_MSG_TYPE_EN_STATS:
+	case HTT_T2H_MSG_TYPE_TX_FETCH_IND:
+	case HTT_T2H_MSG_TYPE_TX_FETCH_CONF:
+	case HTT_T2H_MSG_TYPE_TX_LOW_LATENCY_IND:
 	default:
 		ath10k_warn(ar, "htt event (%d) not handled\n",
 			    resp->hdr.msg_type);
@@ -2085,6 +2222,7 @@ void ath10k_htt_t2h_msg_handler(struct ath10k *ar, struct sk_buff *skb)
 	/* Free the indication buffer */
 	dev_kfree_skb_any(skb);
 }
+EXPORT_SYMBOL(ath10k_htt_t2h_msg_handler);
 
 static void ath10k_htt_txrx_compl_task(unsigned long ptr)
 {
@@ -2093,12 +2231,10 @@ static void ath10k_htt_txrx_compl_task(unsigned long ptr)
 	struct htt_resp *resp;
 	struct sk_buff *skb;
 
-	spin_lock_bh(&htt->tx_lock);
-	while ((skb = __skb_dequeue(&htt->tx_compl_q))) {
+	while ((skb = skb_dequeue(&htt->tx_compl_q))) {
 		ath10k_htt_rx_frm_tx_compl(htt->ar, skb);
 		dev_kfree_skb_any(skb);
 	}
-	spin_unlock_bh(&htt->tx_lock);
 
 	spin_lock_bh(&htt->rx_ring.lock);
 	while ((skb = __skb_dequeue(&htt->rx_compl_q))) {

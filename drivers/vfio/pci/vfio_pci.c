@@ -112,6 +112,35 @@ static inline bool vfio_pci_is_vga(struct pci_dev *pdev)
 
 static void vfio_pci_try_bus_reset(struct vfio_pci_device *vdev);
 
+/*
+ * INTx masking requires the ability to disable INTx signaling via PCI_COMMAND
+ * _and_ the ability detect when the device is asserting INTx via PCI_STATUS.
+ * If a device implements the former but not the latter we would typically
+ * expect broken_intx_masking be set and require an exclusive interrupt.
+ * However since we do have control of the device's ability to assert INTx,
+ * we can instead pretend that the device does not implement INTx, virtualizing
+ * the pin register to report zero and maintaining DisINTx set on the host.
+ */
+static bool vfio_pci_nointx(struct pci_dev *pdev)
+{
+	switch (pdev->vendor) {
+	case PCI_VENDOR_ID_INTEL:
+		switch (pdev->device) {
+		/* All i40e (XL710/X710) 10/20/40GbE NICs */
+		case 0x1572:
+		case 0x1574:
+		case 0x1580 ... 0x1581:
+		case 0x1583 ... 0x1589:
+		case 0x37d0 ... 0x37d2:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	return false;
+}
+
 static int vfio_pci_enable(struct vfio_pci_device *vdev)
 {
 	struct pci_dev *pdev = vdev->pdev;
@@ -135,21 +164,27 @@ static int vfio_pci_enable(struct vfio_pci_device *vdev)
 		pr_debug("%s: Couldn't store %s saved state\n",
 			 __func__, dev_name(&pdev->dev));
 
+	if (likely(!nointxmask)) {
+		if (vfio_pci_nointx(pdev)) {
+			dev_info(&pdev->dev, "Masking broken INTx support\n");
+			vdev->nointx = true;
+			pci_intx(pdev, 0);
+		} else
+			vdev->pci_2_3 = pci_intx_mask_supported(pdev);
+	}
+
+	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+	if (vdev->pci_2_3 && (cmd & PCI_COMMAND_INTX_DISABLE)) {
+		cmd &= ~PCI_COMMAND_INTX_DISABLE;
+		pci_write_config_word(pdev, PCI_COMMAND, cmd);
+	}
+
 	ret = vfio_config_init(vdev);
 	if (ret) {
 		kfree(vdev->pci_saved_state);
 		vdev->pci_saved_state = NULL;
 		pci_disable_device(pdev);
 		return ret;
-	}
-
-	if (likely(!nointxmask))
-		vdev->pci_2_3 = pci_intx_mask_supported(pdev);
-
-	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
-	if (vdev->pci_2_3 && (cmd & PCI_COMMAND_INTX_DISABLE)) {
-		cmd &= ~PCI_COMMAND_INTX_DISABLE;
-		pci_write_config_word(pdev, PCI_COMMAND, cmd);
 	}
 
 	msix_pos = pdev->msix_cap;
@@ -221,11 +256,20 @@ static void vfio_pci_disable(struct vfio_pci_device *vdev)
 	pci_write_config_word(pdev, PCI_COMMAND, PCI_COMMAND_INTX_DISABLE);
 
 	/*
-	 * Try to reset the device.  The success of this is dependent on
-	 * being able to lock the device, which is not always possible.
+	 * Try to get the locks ourselves to prevent a deadlock. The
+	 * success of this is dependent on being able to lock the device,
+	 * which is not always possible.
+	 * We can not use the "try" reset interface here, which will
+	 * overwrite the previously restored configuration information.
 	 */
-	if (vdev->reset_works && !pci_try_reset_function(pdev))
-		vdev->needs_reset = false;
+	if (vdev->reset_works && pci_cfg_access_trylock(pdev)) {
+		if (device_trylock(&pdev->dev)) {
+			if (!__pci_reset_function_locked(pdev))
+				vdev->needs_reset = false;
+			device_unlock(&pdev->dev);
+		}
+		pci_cfg_access_unlock(pdev);
+	}
 
 	pci_restore_state(pdev);
 out:
@@ -246,6 +290,19 @@ static void vfio_pci_release(void *device_data)
 	if (!(--vdev->refcnt)) {
 		vfio_spapr_pci_eeh_release(vdev->pdev);
 		vfio_pci_disable(vdev);
+		mutex_lock(&vdev->igate);
+		if (vdev->err_trigger) {
+			eventfd_ctx_put(vdev->err_trigger);
+			vdev->err_trigger = NULL;
+		}
+		mutex_unlock(&vdev->igate);
+
+		mutex_lock(&vdev->igate);
+		if (vdev->req_trigger) {
+			eventfd_ctx_put(vdev->req_trigger);
+			vdev->req_trigger = NULL;
+		}
+		mutex_unlock(&vdev->igate);
 	}
 
 	mutex_unlock(&driver_lock);
@@ -283,7 +340,7 @@ static int vfio_pci_get_irq_count(struct vfio_pci_device *vdev, int irq_type)
 	if (irq_type == VFIO_PCI_INTX_IRQ_INDEX) {
 		u8 pin;
 		pci_read_config_byte(vdev->pdev, PCI_INTERRUPT_PIN, &pin);
-		if (IS_ENABLED(CONFIG_VFIO_PCI_INTX) && pin)
+		if (IS_ENABLED(CONFIG_VFIO_PCI_INTX) && !vdev->nointx && pin)
 			return 1;
 
 	} else if (irq_type == VFIO_PCI_MSI_IRQ_INDEX) {
@@ -446,7 +503,8 @@ static long vfio_pci_ioctl(void *device_data,
 		info.num_regions = VFIO_PCI_NUM_REGIONS;
 		info.num_irqs = VFIO_PCI_NUM_IRQS;
 
-		return copy_to_user((void __user *)arg, &info, minsz);
+		return copy_to_user((void __user *)arg, &info, minsz) ?
+			-EFAULT : 0;
 
 	} else if (cmd == VFIO_DEVICE_GET_REGION_INFO) {
 		struct pci_dev *pdev = vdev->pdev;
@@ -486,6 +544,7 @@ static long vfio_pci_ioctl(void *device_data,
 		{
 			void __iomem *io;
 			size_t size;
+			u16 orig_cmd;
 
 			info.offset = VFIO_PCI_INDEX_TO_OFFSET(info.index);
 			info.flags = 0;
@@ -495,15 +554,23 @@ static long vfio_pci_ioctl(void *device_data,
 			if (!info.size)
 				break;
 
-			/* Is it really there? */
-			io = pci_map_rom(pdev, &size);
-			if (!io || !size) {
-				info.size = 0;
-				break;
-			}
-			pci_unmap_rom(pdev, io);
+			/*
+			 * Is it really there?  Enable memory decode for
+			 * implicit access in pci_map_rom().
+			 */
+			pci_read_config_word(pdev, PCI_COMMAND, &orig_cmd);
+			pci_write_config_word(pdev, PCI_COMMAND,
+					      orig_cmd | PCI_COMMAND_MEMORY);
 
-			info.flags = VFIO_REGION_INFO_FLAG_READ;
+			io = pci_map_rom(pdev, &size);
+			if (io) {
+				info.flags = VFIO_REGION_INFO_FLAG_READ;
+				pci_unmap_rom(pdev, io);
+			} else {
+				info.size = 0;
+			}
+
+			pci_write_config_word(pdev, PCI_COMMAND, orig_cmd);
 			break;
 		}
 		case VFIO_PCI_VGA_REGION_INDEX:
@@ -520,7 +587,8 @@ static long vfio_pci_ioctl(void *device_data,
 			return -EINVAL;
 		}
 
-		return copy_to_user((void __user *)arg, &info, minsz);
+		return copy_to_user((void __user *)arg, &info, minsz) ?
+			-EFAULT : 0;
 
 	} else if (cmd == VFIO_DEVICE_GET_IRQ_INFO) {
 		struct vfio_irq_info info;
@@ -555,12 +623,14 @@ static long vfio_pci_ioctl(void *device_data,
 		else
 			info.flags |= VFIO_IRQ_INFO_NORESIZE;
 
-		return copy_to_user((void __user *)arg, &info, minsz);
+		return copy_to_user((void __user *)arg, &info, minsz) ?
+			-EFAULT : 0;
 
 	} else if (cmd == VFIO_DEVICE_SET_IRQS) {
 		struct vfio_irq_set hdr;
+		size_t size;
 		u8 *data = NULL;
-		int ret = 0;
+		int max, ret = 0;
 
 		minsz = offsetofend(struct vfio_irq_set, count);
 
@@ -568,23 +638,31 @@ static long vfio_pci_ioctl(void *device_data,
 			return -EFAULT;
 
 		if (hdr.argsz < minsz || hdr.index >= VFIO_PCI_NUM_IRQS ||
+		    hdr.count >= (U32_MAX - hdr.start) ||
 		    hdr.flags & ~(VFIO_IRQ_SET_DATA_TYPE_MASK |
 				  VFIO_IRQ_SET_ACTION_TYPE_MASK))
 			return -EINVAL;
 
-		if (!(hdr.flags & VFIO_IRQ_SET_DATA_NONE)) {
-			size_t size;
-			int max = vfio_pci_get_irq_count(vdev, hdr.index);
+		max = vfio_pci_get_irq_count(vdev, hdr.index);
+		if (hdr.start >= max || hdr.start + hdr.count > max)
+			return -EINVAL;
 
-			if (hdr.flags & VFIO_IRQ_SET_DATA_BOOL)
-				size = sizeof(uint8_t);
-			else if (hdr.flags & VFIO_IRQ_SET_DATA_EVENTFD)
-				size = sizeof(int32_t);
-			else
-				return -EINVAL;
+		switch (hdr.flags & VFIO_IRQ_SET_DATA_TYPE_MASK) {
+		case VFIO_IRQ_SET_DATA_NONE:
+			size = 0;
+			break;
+		case VFIO_IRQ_SET_DATA_BOOL:
+			size = sizeof(uint8_t);
+			break;
+		case VFIO_IRQ_SET_DATA_EVENTFD:
+			size = sizeof(int32_t);
+			break;
+		default:
+			return -EINVAL;
+		}
 
-			if (hdr.argsz - minsz < hdr.count * size ||
-			    hdr.start >= max || hdr.start + hdr.count > max)
+		if (size) {
+			if (hdr.argsz - minsz < hdr.count * size)
 				return -EINVAL;
 
 			data = memdup_user((void __user *)(arg + minsz),
@@ -890,6 +968,10 @@ static int vfio_pci_mmap(void *device_data, struct vm_area_struct *vma)
 			return ret;
 
 		vdev->barmap[index] = pci_iomap(pdev, index, 0);
+		if (!vdev->barmap[index]) {
+			pci_release_selected_regions(pdev, 1 << index);
+			return -ENOMEM;
+		}
 	}
 
 	vma->vm_private_data = vdev;
@@ -1035,7 +1117,7 @@ static pci_ers_result_t vfio_pci_aer_err_detected(struct pci_dev *pdev,
 	return PCI_ERS_RESULT_CAN_RECOVER;
 }
 
-static struct pci_error_handlers vfio_err_handlers = {
+static const struct pci_error_handlers vfio_err_handlers = {
 	.error_detected = vfio_pci_aer_err_detected,
 };
 
@@ -1175,11 +1257,11 @@ static void __init vfio_pci_fill_ids(void)
 		rc = pci_add_dynid(&vfio_pci_driver, vendor, device,
 				   subvendor, subdevice, class, class_mask, 0);
 		if (rc)
-			pr_warn("failed to add dynamic id [%04hx:%04hx[%04hx:%04hx]] class %#08x/%08x (%d)\n",
+			pr_warn("failed to add dynamic id [%04x:%04x[%04x:%04x]] class %#08x/%08x (%d)\n",
 				vendor, device, subvendor, subdevice,
 				class, class_mask, rc);
 		else
-			pr_info("add [%04hx:%04hx[%04hx:%04hx]] class %#08x/%08x\n",
+			pr_info("add [%04x:%04x[%04x:%04x]] class %#08x/%08x\n",
 				vendor, device, subvendor, subdevice,
 				class, class_mask);
 	}

@@ -75,7 +75,7 @@ static struct fsl_otg_config fsl_otg_initdata = {
 	.otg_port = 1,
 };
 
-#ifdef CONFIG_PPC32
+#ifdef CONFIG_PPC
 static u32 _fsl_readl_be(const unsigned __iomem *p)
 {
 	return in_be32(p);
@@ -105,7 +105,7 @@ static void (*_fsl_writel)(u32 v, unsigned __iomem *p);
 #else
 #define fsl_readl(addr)		readl(addr)
 #define fsl_writel(val, addr)	writel(val, addr)
-#endif /* CONFIG_PPC32 */
+#endif /* CONFIG_PPC */
 
 int write_ulpi(u8 addr, u8 data)
 {
@@ -879,6 +879,7 @@ int usb_otg_start(struct platform_device *pdev)
 	if (pdata->init && pdata->init(pdev) != 0)
 		return -EINVAL;
 
+#ifdef CONFIG_PPC32
 	if (pdata->big_endian_mmio) {
 		_fsl_readl = _fsl_readl_be;
 		_fsl_writel = _fsl_writel_be;
@@ -886,6 +887,7 @@ int usb_otg_start(struct platform_device *pdev)
 		_fsl_readl = _fsl_readl_le;
 		_fsl_writel = _fsl_writel_le;
 	}
+#endif
 
 	/* request irq */
 	p_otg->irq = platform_get_irq(pdev, 0);
@@ -976,7 +978,7 @@ int usb_otg_start(struct platform_device *pdev)
 /*
  * state file in sysfs
  */
-static int show_fsl_usb2_otg_state(struct device *dev,
+static ssize_t show_fsl_usb2_otg_state(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
 	struct otg_fsm *fsm = &fsl_otg_dev->fsm;

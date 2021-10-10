@@ -42,6 +42,7 @@
 #include <asm/desc_defs.h>
 #include <asm/kmap_types.h>
 #include <asm/pgtable_types.h>
+#include <asm/nospec-branch.h>
 
 struct page;
 struct thread_struct;
@@ -70,8 +71,13 @@ struct pv_info {
 #endif
 
 	int paravirt_enabled;
+	unsigned int features;	  /* valid only if paravirt_enabled is set */
 	const char *name;
 };
+
+#define paravirt_has(x) paravirt_has_feature(PV_SUPPORTED_##x)
+/* Supported features */
+#define PV_SUPPORTED_RTC        (1<<0)
 
 struct pv_init_ops {
 	/*
@@ -97,7 +103,6 @@ struct pv_lazy_ops {
 struct pv_time_ops {
 	unsigned long long (*sched_clock)(void);
 	unsigned long long (*steal_clock)(int cpu);
-	unsigned long (*get_tsc_khz)(void);
 };
 
 struct pv_cpu_ops {
@@ -156,18 +161,7 @@ struct pv_cpu_ops {
 	u64 (*read_msr)(unsigned int msr, int *err);
 	int (*write_msr)(unsigned int msr, unsigned low, unsigned high);
 
-	u64 (*read_tsc)(void);
 	u64 (*read_pmc)(int counter);
-	unsigned long long (*read_tscp)(unsigned int *aux);
-
-#ifdef CONFIG_X86_32
-	/*
-	 * Atomically enable interrupts and return to userspace.  This
-	 * is only used in 32-bit kernels.  64-bit kernels use
-	 * usergs_sysret32 instead.
-	 */
-	void (*irq_enable_sysexit)(void);
-#endif
 
 	/*
 	 * Switch to usermode gs and return to 64-bit usermode using
@@ -432,7 +426,9 @@ int paravirt_disable_iospace(void);
  * offset into the paravirt_patch_template structure, and can therefore be
  * freely converted back into a structure offset.
  */
-#define PARAVIRT_CALL	"call *%c[paravirt_opptr];"
+#define PARAVIRT_CALL					\
+	ANNOTATE_RETPOLINE_SAFE				\
+	"call *%c[paravirt_opptr];"
 
 /*
  * These macros are intended to wrap calls through one of the paravirt

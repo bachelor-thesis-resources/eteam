@@ -54,14 +54,14 @@
 		timer@0200 {
 			compatible = "arm,cortex-a9-global-timer";
 			reg = <0x0200 0x100>;
-			interrupts = <GIC_PPI 11 IRQ_TYPE_LEVEL_HIGH>;
+			interrupts = <GIC_PPI 11 IRQ_TYPE_EDGE_RISING>;
 			clocks = <&clk_periph>;
 		};
 
 		local-timer@0600 {
 			compatible = "arm,cortex-a9-twd-timer";
 			reg = <0x0600 0x100>;
-			interrupts = <GIC_PPI 13 IRQ_TYPE_LEVEL_HIGH>;
+			interrupts = <GIC_PPI 13 IRQ_TYPE_EDGE_RISING>;
 			clocks = <&clk_periph>;
 		};
 
@@ -78,8 +78,18 @@
 			compatible = "arm,pl310-cache";
 			reg = <0x2000 0x1000>;
 			cache-unified;
+			arm,shared-override;
+			prefetch-data = <1>;
+			prefetch-instr = <1>;
 			cache-level = <2>;
 		};
+	};
+
+	pmu {
+		compatible = "arm,cortex-a9-pmu";
+		interrupts =
+			<GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH>,
+			<GIC_SPI 9 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	clocks {

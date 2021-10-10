@@ -15,6 +15,7 @@
  */
 
 #include <linux/extcon.h>
+#include <linux/gpio.h>
 #include <linux/gpio/consumer.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
@@ -191,6 +192,9 @@ static int usb_extcon_resume(struct device *dev)
 	}
 
 	enable_irq(info->id_irq);
+	if (!device_may_wakeup(dev))
+		queue_delayed_work(system_power_efficient_wq,
+				   &info->wq_detcable, 0);
 
 	return ret;
 }

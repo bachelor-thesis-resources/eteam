@@ -286,7 +286,7 @@ static inline int imxdma_sg_next(struct imxdma_desc *d)
 	struct scatterlist *sg = d->sg;
 	unsigned long now;
 
-	now = min(d->len, sg_dma_len(sg));
+	now = min_t(size_t, d->len, sg_dma_len(sg));
 	if (d->len != IMX_DMA_LENGTH_LOOP)
 		d->len -= now;
 
@@ -619,7 +619,7 @@ static void imxdma_tasklet(unsigned long data)
 {
 	struct imxdma_channel *imxdmac = (void *)data;
 	struct imxdma_engine *imxdma = imxdmac->imxdma;
-	struct imxdma_desc *desc;
+	struct imxdma_desc *desc, *next_desc;
 	unsigned long flags;
 
 	spin_lock_irqsave(&imxdma->lock, flags);
@@ -649,10 +649,10 @@ static void imxdma_tasklet(unsigned long data)
 	list_move_tail(imxdmac->ld_active.next, &imxdmac->ld_free);
 
 	if (!list_empty(&imxdmac->ld_queue)) {
-		desc = list_first_entry(&imxdmac->ld_queue, struct imxdma_desc,
-					node);
+		next_desc = list_first_entry(&imxdmac->ld_queue,
+					     struct imxdma_desc, node);
 		list_move_tail(imxdmac->ld_queue.next, &imxdmac->ld_active);
-		if (imxdma_xfer_desc(desc) < 0)
+		if (imxdma_xfer_desc(next_desc) < 0)
 			dev_warn(imxdma->dev, "%s: channel: %d couldn't xfer desc\n",
 				 __func__, imxdmac->channel);
 	}
@@ -1083,8 +1083,12 @@ static int __init imxdma_probe(struct platform_device *pdev)
 	if (IS_ERR(imxdma->dma_ahb))
 		return PTR_ERR(imxdma->dma_ahb);
 
-	clk_prepare_enable(imxdma->dma_ipg);
-	clk_prepare_enable(imxdma->dma_ahb);
+	ret = clk_prepare_enable(imxdma->dma_ipg);
+	if (ret)
+		return ret;
+	ret = clk_prepare_enable(imxdma->dma_ahb);
+	if (ret)
+		goto disable_dma_ipg_clk;
 
 	/* reset DMA module */
 	imx_dmav1_writel(imxdma, DCR_DRST, DMA_DCR);
@@ -1094,20 +1098,20 @@ static int __init imxdma_probe(struct platform_device *pdev)
 				       dma_irq_handler, 0, "DMA", imxdma);
 		if (ret) {
 			dev_warn(imxdma->dev, "Can't register IRQ for DMA\n");
-			goto err;
+			goto disable_dma_ahb_clk;
 		}
 
 		irq_err = platform_get_irq(pdev, 1);
 		if (irq_err < 0) {
 			ret = irq_err;
-			goto err;
+			goto disable_dma_ahb_clk;
 		}
 
 		ret = devm_request_irq(&pdev->dev, irq_err,
 				       imxdma_err_handler, 0, "DMA", imxdma);
 		if (ret) {
 			dev_warn(imxdma->dev, "Can't register ERRIRQ for DMA\n");
-			goto err;
+			goto disable_dma_ahb_clk;
 		}
 	}
 
@@ -1144,7 +1148,7 @@ static int __init imxdma_probe(struct platform_device *pdev)
 				dev_warn(imxdma->dev, "Can't register IRQ %d "
 					 "for DMA channel %d\n",
 					 irq + i, i);
-				goto err;
+				goto disable_dma_ahb_clk;
 			}
 			init_timer(&imxdmac->watchdog);
 			imxdmac->watchdog.function = &imxdma_watchdog;
@@ -1183,14 +1187,14 @@ static int __init imxdma_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, imxdma);
 
-	imxdma->dma_device.copy_align = 2; /* 2^2 = 4 bytes alignment */
+	imxdma->dma_device.copy_align = DMAENGINE_ALIGN_4_BYTES;
 	imxdma->dma_device.dev->dma_parms = &imxdma->dma_parms;
 	dma_set_max_seg_size(imxdma->dma_device.dev, 0xffffff);
 
 	ret = dma_async_device_register(&imxdma->dma_device);
 	if (ret) {
 		dev_err(&pdev->dev, "unable to register\n");
-		goto err;
+		goto disable_dma_ahb_clk;
 	}
 
 	if (pdev->dev.of_node) {
@@ -1206,9 +1210,10 @@ static int __init imxdma_probe(struct platform_device *pdev)
 
 err_of_dma_controller:
 	dma_async_device_unregister(&imxdma->dma_device);
-err:
-	clk_disable_unprepare(imxdma->dma_ipg);
+disable_dma_ahb_clk:
 	clk_disable_unprepare(imxdma->dma_ahb);
+disable_dma_ipg_clk:
+	clk_disable_unprepare(imxdma->dma_ipg);
 	return ret;
 }
 

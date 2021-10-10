@@ -45,6 +45,7 @@
 
 #include <asm/inst.h>
 #include <linux/linkage.h>
+#include <asm/nospec-branch.h>
 
 ## ISCSI CRC 32 Implementation with crc32 and pclmulqdq Instruction
 
@@ -172,7 +173,7 @@ continue_block:
 	movzxw  (bufp, %rax, 2), len
 	offset=crc_array-jump_table
 	lea     offset(bufp, len, 1), bufp
-	jmp     *bufp
+	JMP_NOSPEC bufp
 
 	################################################################
 	## 2a) PROCESS FULL BLOCKS:
@@ -330,7 +331,7 @@ ENDPROC(crc_pcl)
 	## PCLMULQDQ tables
 	## Table is 128 entries x 2 words (8 bytes) each
 	################################################################
-.section	.rotata, "a", %progbits
+.section	.rodata, "a", %progbits
 .align 8
 K_table:
 	.long 0x493c7d27, 0x00000001

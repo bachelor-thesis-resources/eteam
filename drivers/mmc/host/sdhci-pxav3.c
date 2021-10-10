@@ -135,6 +135,7 @@ static int armada_38x_quirks(struct platform_device *pdev,
 	struct sdhci_pxa *pxa = pltfm_host->priv;
 	struct resource *res;
 
+	host->quirks &= ~SDHCI_QUIRK_CAP_CLOCK_BASE_BROKEN;
 	host->quirks |= SDHCI_QUIRK_MISSING_CAPS;
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
 					   "conf-sdio3");
@@ -290,6 +291,9 @@ static void pxav3_set_uhs_signaling(struct sdhci_host *host, unsigned int uhs)
 		    uhs == MMC_TIMING_UHS_DDR50) {
 			reg_val &= ~SDIO3_CONF_CLK_INV;
 			reg_val |= SDIO3_CONF_SD_FB_CLK;
+		} else if (uhs == MMC_TIMING_MMC_HS) {
+			reg_val &= ~SDIO3_CONF_CLK_INV;
+			reg_val &= ~SDIO3_CONF_SD_FB_CLK;
 		} else {
 			reg_val |= SDIO3_CONF_CLK_INV;
 			reg_val &= ~SDIO3_CONF_SD_FB_CLK;
@@ -303,8 +307,30 @@ static void pxav3_set_uhs_signaling(struct sdhci_host *host, unsigned int uhs)
 		__func__, uhs, ctrl_2);
 }
 
+static void pxav3_set_power(struct sdhci_host *host, unsigned char mode,
+			    unsigned short vdd)
+{
+	struct mmc_host *mmc = host->mmc;
+	u8 pwr = host->pwr;
+
+	sdhci_set_power(host, mode, vdd);
+
+	if (host->pwr == pwr)
+		return;
+
+	if (host->pwr == 0)
+		vdd = 0;
+
+	if (!IS_ERR(mmc->supply.vmmc)) {
+		spin_unlock_irq(&host->lock);
+		mmc_regulator_set_ocr(mmc, mmc->supply.vmmc, vdd);
+		spin_lock_irq(&host->lock);
+	}
+}
+
 static const struct sdhci_ops pxav3_sdhci_ops = {
 	.set_clock = sdhci_set_clock,
+	.set_power = pxav3_set_power,
 	.platform_send_init_74_clocks = pxav3_gen_init_74_clocks,
 	.get_max_clock = sdhci_pltfm_clk_get_max_clock,
 	.set_bus_width = sdhci_set_bus_width,
@@ -398,7 +424,7 @@ static int sdhci_pxav3_probe(struct platform_device *pdev)
 	if (of_device_is_compatible(np, "marvell,armada-380-sdhci")) {
 		ret = armada_38x_quirks(pdev, host);
 		if (ret < 0)
-			goto err_clk_get;
+			goto err_mbus_win;
 		ret = mv_conf_mbus_windows(pdev, mv_mbus_dram_info());
 		if (ret < 0)
 			goto err_mbus_win;

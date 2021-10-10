@@ -184,40 +184,32 @@ finish_or_fault:
  */
 long get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 		    unsigned long start, unsigned long nr_pages,
-		    int write, int force, struct page **pages,
+		    unsigned int gup_flags, struct page **pages,
 		    struct vm_area_struct **vmas)
 {
-	int flags = 0;
-
-	if (write)
-		flags |= FOLL_WRITE;
-	if (force)
-		flags |= FOLL_FORCE;
-
-	return __get_user_pages(tsk, mm, start, nr_pages, flags, pages, vmas,
-				NULL);
+	return __get_user_pages(tsk, mm, start, nr_pages,
+				gup_flags, pages, vmas, NULL);
 }
 EXPORT_SYMBOL(get_user_pages);
 
 long get_user_pages_locked(struct task_struct *tsk, struct mm_struct *mm,
 			   unsigned long start, unsigned long nr_pages,
-			   int write, int force, struct page **pages,
+			   unsigned int gup_flags, struct page **pages,
 			   int *locked)
 {
-	return get_user_pages(tsk, mm, start, nr_pages, write, force,
+	return get_user_pages(tsk, mm, start, nr_pages, gup_flags,
 			      pages, NULL);
 }
 EXPORT_SYMBOL(get_user_pages_locked);
 
 long __get_user_pages_unlocked(struct task_struct *tsk, struct mm_struct *mm,
 			       unsigned long start, unsigned long nr_pages,
-			       int write, int force, struct page **pages,
-			       unsigned int gup_flags)
+			       struct page **pages, unsigned int gup_flags)
 {
 	long ret;
 	down_read(&mm->mmap_sem);
-	ret = get_user_pages(tsk, mm, start, nr_pages, write, force,
-			     pages, NULL);
+	ret = __get_user_pages(tsk, mm, start, nr_pages, gup_flags, pages,
+			       NULL, NULL);
 	up_read(&mm->mmap_sem);
 	return ret;
 }
@@ -225,10 +217,10 @@ EXPORT_SYMBOL(__get_user_pages_unlocked);
 
 long get_user_pages_unlocked(struct task_struct *tsk, struct mm_struct *mm,
 			     unsigned long start, unsigned long nr_pages,
-			     int write, int force, struct page **pages)
+			     struct page **pages, unsigned int gup_flags)
 {
-	return __get_user_pages_unlocked(tsk, mm, start, nr_pages, write,
-					 force, pages, 0);
+	return __get_user_pages_unlocked(tsk, mm, start, nr_pages,
+					 pages, gup_flags);
 }
 EXPORT_SYMBOL(get_user_pages_unlocked);
 
@@ -324,12 +316,12 @@ long vwrite(char *buf, char *addr, unsigned long count)
 }
 
 /*
- *	vmalloc  -  allocate virtually continguos memory
+ *	vmalloc  -  allocate virtually contiguous memory
  *
  *	@size:		allocation size
  *
  *	Allocate enough pages to cover @size from the page level
- *	allocator and map them into continguos kernel virtual space.
+ *	allocator and map them into contiguous kernel virtual space.
  *
  *	For tight control over page level allocator and protection flags
  *	use __vmalloc() instead.
@@ -341,12 +333,12 @@ void *vmalloc(unsigned long size)
 EXPORT_SYMBOL(vmalloc);
 
 /*
- *	vzalloc - allocate virtually continguos memory with zero fill
+ *	vzalloc - allocate virtually contiguous memory with zero fill
  *
  *	@size:		allocation size
  *
  *	Allocate enough pages to cover @size from the page level
- *	allocator and map them into continguos kernel virtual space.
+ *	allocator and map them into contiguous kernel virtual space.
  *	The memory allocated is set to zero.
  *
  *	For tight control over page level allocator and protection flags
@@ -420,7 +412,7 @@ void *vmalloc_exec(unsigned long size)
  *	@size:		allocation size
  *
  *	Allocate enough 32bit PA addressable pages to cover @size from the
- *	page level allocator and map them into continguos kernel virtual space.
+ *	page level allocator and map them into contiguous kernel virtual space.
  */
 void *vmalloc_32(unsigned long size)
 {
@@ -480,10 +472,14 @@ void vm_unmap_aliases(void)
 EXPORT_SYMBOL_GPL(vm_unmap_aliases);
 
 /*
- * Implement a stub for vmalloc_sync_all() if the architecture chose not to
- * have one.
+ * Implement a stub for vmalloc_sync_[un]mapping() if the architecture
+ * chose not to have one.
  */
-void __weak vmalloc_sync_all(void)
+void __weak vmalloc_sync_mappings(void)
+{
+}
+
+void __weak vmalloc_sync_unmappings(void)
 {
 }
 
@@ -578,16 +574,16 @@ static noinline void validate_nommu_regions(void)
 		return;
 
 	last = rb_entry(lastp, struct vm_region, vm_rb);
-	BUG_ON(unlikely(last->vm_end <= last->vm_start));
-	BUG_ON(unlikely(last->vm_top < last->vm_end));
+	BUG_ON(last->vm_end <= last->vm_start);
+	BUG_ON(last->vm_top < last->vm_end);
 
 	while ((p = rb_next(lastp))) {
 		region = rb_entry(p, struct vm_region, vm_rb);
 		last = rb_entry(lastp, struct vm_region, vm_rb);
 
-		BUG_ON(unlikely(region->vm_end <= region->vm_start));
-		BUG_ON(unlikely(region->vm_top < region->vm_end));
-		BUG_ON(unlikely(region->vm_start < last->vm_top));
+		BUG_ON(region->vm_end <= region->vm_start);
+		BUG_ON(region->vm_top < region->vm_end);
+		BUG_ON(region->vm_start < last->vm_top);
 
 		lastp = p;
 	}
@@ -671,7 +667,7 @@ static void __put_nommu_region(struct vm_region *region)
 		up_write(&nommu_region_sem);
 
 		if (region->vm_file)
-			fput(region->vm_file);
+			vmr_fput(region);
 
 		/* IO memory and memory shared directly out of the pagecache
 		 * from ramfs/tmpfs mustn't be released here */
@@ -829,7 +825,7 @@ static void delete_vma(struct mm_struct *mm, struct vm_area_struct *vma)
 	if (vma->vm_ops && vma->vm_ops->close)
 		vma->vm_ops->close(vma);
 	if (vma->vm_file)
-		fput(vma->vm_file);
+		vma_fput(vma);
 	put_nommu_region(vma->vm_region);
 	kmem_cache_free(vm_area_cachep, vma);
 }
@@ -1035,7 +1031,7 @@ static int validate_mmap_request(struct file *file,
 
 		/* handle executable mappings and implied executable
 		 * mappings */
-		if (file->f_path.mnt->mnt_flags & MNT_NOEXEC) {
+		if (path_noexec(&file->f_path)) {
 			if (prot & PROT_EXEC)
 				return -EPERM;
 		} else if ((prot & PROT_READ) && !(prot & PROT_EXEC)) {
@@ -1233,18 +1229,19 @@ enomem:
 /*
  * handle mapping creation for uClinux
  */
-unsigned long do_mmap_pgoff(struct file *file,
-			    unsigned long addr,
-			    unsigned long len,
-			    unsigned long prot,
-			    unsigned long flags,
-			    unsigned long pgoff,
-			    unsigned long *populate)
+unsigned long do_mmap(struct file *file,
+			unsigned long addr,
+			unsigned long len,
+			unsigned long prot,
+			unsigned long flags,
+			vm_flags_t vm_flags,
+			unsigned long pgoff,
+			unsigned long *populate)
 {
 	struct vm_area_struct *vma;
 	struct vm_region *region;
 	struct rb_node *rb;
-	unsigned long capabilities, vm_flags, result;
+	unsigned long capabilities, result;
 	int ret;
 
 	*populate = 0;
@@ -1262,7 +1259,7 @@ unsigned long do_mmap_pgoff(struct file *file,
 
 	/* we've determined that we can make the mapping, now translate what we
 	 * now know into VMA flags */
-	vm_flags = determine_vm_flags(file, prot, flags, capabilities);
+	vm_flags |= determine_vm_flags(file, prot, flags, capabilities);
 
 	/* we're going to need to record the mapping */
 	region = kmem_cache_zalloc(vm_region_jar, GFP_KERNEL);
@@ -1354,7 +1351,7 @@ unsigned long do_mmap_pgoff(struct file *file,
 					goto error_just_free;
 				}
 			}
-			fput(region->vm_file);
+			vmr_fput(region);
 			kmem_cache_free(vm_region_jar, region);
 			region = pregion;
 			result = start;
@@ -1429,10 +1426,10 @@ error_just_free:
 	up_write(&nommu_region_sem);
 error:
 	if (region->vm_file)
-		fput(region->vm_file);
+		vmr_fput(region);
 	kmem_cache_free(vm_region_jar, region);
 	if (vma->vm_file)
-		fput(vma->vm_file);
+		vma_fput(vma);
 	kmem_cache_free(vm_area_cachep, vma);
 	return ret;
 
@@ -1496,7 +1493,7 @@ SYSCALL_DEFINE1(old_mmap, struct mmap_arg_struct __user *, arg)
 
 	if (copy_from_user(&a, arg, sizeof(a)))
 		return -EFAULT;
-	if (a.offset & ~PAGE_MASK)
+	if (offset_in_page(a.offset))
 		return -EINVAL;
 
 	return sys_mmap_pgoff(a.addr, a.len, a.prot, a.flags, a.fd,
@@ -1652,9 +1649,9 @@ int do_munmap(struct mm_struct *mm, unsigned long start, size_t len)
 			goto erase_whole_vma;
 		if (start < vma->vm_start || end > vma->vm_end)
 			return -EINVAL;
-		if (start & ~PAGE_MASK)
+		if (offset_in_page(start))
 			return -EINVAL;
-		if (end != vma->vm_end && end & ~PAGE_MASK)
+		if (end != vma->vm_end && offset_in_page(end))
 			return -EINVAL;
 		if (start != vma->vm_start && end != vma->vm_end) {
 			ret = split_vma(mm, vma, start, 1);
@@ -1735,7 +1732,7 @@ static unsigned long do_mremap(unsigned long addr,
 	if (old_len == 0 || new_len == 0)
 		return (unsigned long) -EINVAL;
 
-	if (addr & ~PAGE_MASK)
+	if (offset_in_page(addr))
 		return -EINVAL;
 
 	if (flags & MREMAP_FIXED && new_addr != addr)
@@ -1936,9 +1933,10 @@ void filemap_map_pages(struct vm_area_struct *vma, struct vm_fault *vmf)
 EXPORT_SYMBOL(filemap_map_pages);
 
 static int __access_remote_vm(struct task_struct *tsk, struct mm_struct *mm,
-		unsigned long addr, void *buf, int len, int write)
+		unsigned long addr, void *buf, int len, unsigned int gup_flags)
 {
 	struct vm_area_struct *vma;
+	int write = gup_flags & FOLL_WRITE;
 
 	down_read(&mm->mmap_sem);
 
@@ -1973,14 +1971,14 @@ static int __access_remote_vm(struct task_struct *tsk, struct mm_struct *mm,
  * @addr:	start address to access
  * @buf:	source or destination buffer
  * @len:	number of bytes to transfer
- * @write:	whether the access is a write
+ * @gup_flags:	flags modifying lookup behaviour
  *
  * The caller must hold a reference on @mm.
  */
 int access_remote_vm(struct mm_struct *mm, unsigned long addr,
-		void *buf, int len, int write)
+		void *buf, int len, unsigned int gup_flags)
 {
-	return __access_remote_vm(NULL, mm, addr, buf, len, write);
+	return __access_remote_vm(NULL, mm, addr, buf, len, gup_flags);
 }
 
 /*
@@ -1998,7 +1996,8 @@ int access_process_vm(struct task_struct *tsk, unsigned long addr, void *buf, in
 	if (!mm)
 		return 0;
 
-	len = __access_remote_vm(tsk, mm, addr, buf, len, write);
+	len = __access_remote_vm(tsk, mm, addr, buf, len,
+			write ? FOLL_WRITE : 0);
 
 	mmput(mm);
 	return len;

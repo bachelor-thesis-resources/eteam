@@ -58,21 +58,17 @@ static struct s2mps11_clk *to_s2mps11_clk(struct clk_hw *hw)
 static int s2mps11_clk_prepare(struct clk_hw *hw)
 {
 	struct s2mps11_clk *s2mps11 = to_s2mps11_clk(hw);
-	int ret;
 
-	ret = regmap_update_bits(s2mps11->iodev->regmap_pmic,
+	return regmap_update_bits(s2mps11->iodev->regmap_pmic,
 				 s2mps11->reg,
 				 s2mps11->mask, s2mps11->mask);
-
-	return ret;
 }
 
 static void s2mps11_clk_unprepare(struct clk_hw *hw)
 {
 	struct s2mps11_clk *s2mps11 = to_s2mps11_clk(hw);
-	int ret;
 
-	ret = regmap_update_bits(s2mps11->iodev->regmap_pmic, s2mps11->reg,
+	regmap_update_bits(s2mps11->iodev->regmap_pmic, s2mps11->reg,
 			   s2mps11->mask, ~s2mps11->mask);
 }
 
@@ -186,15 +182,15 @@ static int s2mps11_clk_probe(struct platform_device *pdev)
 	struct clk_init_data *clks_init;
 	int i, ret = 0;
 
-	s2mps11_clks = devm_kzalloc(&pdev->dev, sizeof(*s2mps11_clk) *
-					S2MPS11_CLKS_NUM, GFP_KERNEL);
+	s2mps11_clks = devm_kcalloc(&pdev->dev, S2MPS11_CLKS_NUM,
+				sizeof(*s2mps11_clk), GFP_KERNEL);
 	if (!s2mps11_clks)
 		return -ENOMEM;
 
 	s2mps11_clk = s2mps11_clks;
 
-	clk_table = devm_kzalloc(&pdev->dev, sizeof(struct clk *) *
-				 S2MPS11_CLKS_NUM, GFP_KERNEL);
+	clk_table = devm_kcalloc(&pdev->dev, S2MPS11_CLKS_NUM,
+				sizeof(struct clk *), GFP_KERNEL);
 	if (!clk_table)
 		return -ENOMEM;
 
@@ -246,7 +242,7 @@ static int s2mps11_clk_probe(struct platform_device *pdev)
 					s2mps11_name(s2mps11_clk), NULL);
 		if (!s2mps11_clk->lookup) {
 			ret = -ENOMEM;
-			goto err_lup;
+			goto err_reg;
 		}
 	}
 
@@ -265,16 +261,11 @@ static int s2mps11_clk_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, s2mps11_clks);
 
 	return ret;
-err_lup:
-	devm_clk_unregister(&pdev->dev, s2mps11_clk->clk);
+
 err_reg:
-	while (s2mps11_clk > s2mps11_clks) {
-		if (s2mps11_clk->lookup) {
-			clkdev_drop(s2mps11_clk->lookup);
-			devm_clk_unregister(&pdev->dev, s2mps11_clk->clk);
-		}
-		s2mps11_clk--;
-	}
+	of_node_put(s2mps11_clks[0].clk_np);
+	while (--i >= 0)
+		clkdev_drop(s2mps11_clks[i].lookup);
 
 	return ret;
 }
@@ -307,6 +298,36 @@ static const struct platform_device_id s2mps11_clk_id[] = {
 };
 MODULE_DEVICE_TABLE(platform, s2mps11_clk_id);
 
+#ifdef CONFIG_OF
+/*
+ * Device is instantiated through parent MFD device and device matching is done
+ * through platform_device_id.
+ *
+ * However if device's DT node contains proper clock compatible and driver is
+ * built as a module, then the *module* matching will be done trough DT aliases.
+ * This requires of_device_id table.  In the same time this will not change the
+ * actual *device* matching so do not add .of_match_table.
+ */
+static const struct of_device_id s2mps11_dt_match[] __used = {
+	{
+		.compatible = "samsung,s2mps11-clk",
+		.data = (void *)S2MPS11X,
+	}, {
+		.compatible = "samsung,s2mps13-clk",
+		.data = (void *)S2MPS13X,
+	}, {
+		.compatible = "samsung,s2mps14-clk",
+		.data = (void *)S2MPS14X,
+	}, {
+		.compatible = "samsung,s5m8767-clk",
+		.data = (void *)S5M8767X,
+	}, {
+		/* Sentinel */
+	},
+};
+MODULE_DEVICE_TABLE(of, s2mps11_dt_match);
+#endif
+
 static struct platform_driver s2mps11_clk_driver = {
 	.driver = {
 		.name  = "s2mps11-clk",
@@ -322,7 +343,7 @@ static int __init s2mps11_clk_init(void)
 }
 subsys_initcall(s2mps11_clk_init);
 
-static void __init s2mps11_clk_cleanup(void)
+static void __exit s2mps11_clk_cleanup(void)
 {
 	platform_driver_unregister(&s2mps11_clk_driver);
 }

@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2005 - 2015 Avago Technologies
+ * Copyright (C) 2005 - 2015 Emulex
  * All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -12,7 +12,7 @@
  * Contact Information:
  * linux-drivers@avagotech.com
  *
- * Avago Technologies
+ * Emulex
  * 3333 Susan Street
  * Costa Mesa, CA 92626
  */
@@ -50,7 +50,7 @@ static unsigned int enable_msix = 1;
 
 MODULE_DESCRIPTION(DRV_DESC " " BUILD_STR);
 MODULE_VERSION(BUILD_STR);
-MODULE_AUTHOR("Avago Technologies");
+MODULE_AUTHOR("Emulex Corporation");
 MODULE_LICENSE("GPL");
 module_param(be_iopoll_budget, int, 0);
 module_param(enable_msix, int, 0);
@@ -232,20 +232,20 @@ static int beiscsi_eh_abort(struct scsi_cmnd *sc)
 	cls_session = starget_to_session(scsi_target(sc->device));
 	session = cls_session->dd_data;
 
-	spin_lock_bh(&session->frwd_lock);
+	spin_lock_bh(&session->lock);
 	if (!aborted_task || !aborted_task->sc) {
 		/* we raced */
-		spin_unlock_bh(&session->frwd_lock);
+		spin_unlock_bh(&session->lock);
 		return SUCCESS;
 	}
 
 	aborted_io_task = aborted_task->dd_data;
 	if (!aborted_io_task->scsi_cmnd) {
 		/* raced or invalid command */
-		spin_unlock_bh(&session->frwd_lock);
+		spin_unlock_bh(&session->lock);
 		return SUCCESS;
 	}
-	spin_unlock_bh(&session->frwd_lock);
+	spin_unlock_bh(&session->lock);
 	/* Invalidate WRB Posted for this Task */
 	AMAP_SET_BITS(struct amap_iscsi_wrb, invld,
 		      aborted_io_task->pwrb_handle->pwrb,
@@ -310,9 +310,9 @@ static int beiscsi_eh_device_reset(struct scsi_cmnd *sc)
 	/* invalidate iocbs */
 	cls_session = starget_to_session(scsi_target(sc->device));
 	session = cls_session->dd_data;
-	spin_lock_bh(&session->frwd_lock);
+	spin_lock_bh(&session->lock);
 	if (!session->leadconn || session->state != ISCSI_STATE_LOGGED_IN) {
-		spin_unlock_bh(&session->frwd_lock);
+		spin_unlock_bh(&session->lock);
 		return FAILED;
 	}
 	conn = session->leadconn;
@@ -341,7 +341,7 @@ static int beiscsi_eh_device_reset(struct scsi_cmnd *sc)
 		num_invalidate++;
 		inv_tbl++;
 	}
-	spin_unlock_bh(&session->frwd_lock);
+	spin_unlock_bh(&session->lock);
 	inv_tbl = phba->inv_tbl;
 
 	nonemb_cmd.va = pci_alloc_consistent(phba->ctrl.pdev,
@@ -552,7 +552,7 @@ MODULE_DEVICE_TABLE(pci, beiscsi_pci_id_table);
 
 static struct scsi_host_template beiscsi_sht = {
 	.module = THIS_MODULE,
-	.name = "Avago Technologies 10Gbe open-iscsi Initiator Driver",
+	.name = "Emulex 10Gbe open-iscsi Initiator Driver",
 	.proc_name = DRV_NAME,
 	.queuecommand = iscsi_queuecommand,
 	.change_queue_depth = scsi_change_queue_depth,
@@ -1137,9 +1137,9 @@ beiscsi_process_async_pdu(struct beiscsi_conn *beiscsi_conn,
 		return 1;
 	}
 
-	spin_lock_bh(&session->back_lock);
+	spin_lock_bh(&session->lock);
 	__iscsi_complete_pdu(conn, (struct iscsi_hdr *)ppdu, pbuffer, buf_len);
-	spin_unlock_bh(&session->back_lock);
+	spin_unlock_bh(&session->lock);
 	return 0;
 }
 
@@ -1198,14 +1198,16 @@ free_io_sgl_handle(struct beiscsi_hba *phba, struct sgl_handle *psgl_handle)
  * alloc_wrb_handle - To allocate a wrb handle
  * @phba: The hba pointer
  * @cid: The cid to use for allocation
+ * @pwrb_context: ptr to ptr to wrb context
  *
  * This happens under session_lock until submission to chip
  */
-struct wrb_handle *alloc_wrb_handle(struct beiscsi_hba *phba, unsigned int cid)
+struct wrb_handle *alloc_wrb_handle(struct beiscsi_hba *phba, unsigned int cid,
+				     struct hwi_wrb_context **pcontext)
 {
 	struct hwi_wrb_context *pwrb_context;
 	struct hwi_controller *phwi_ctrlr;
-	struct wrb_handle *pwrb_handle, *pwrb_handle_tmp;
+	struct wrb_handle *pwrb_handle;
 	uint16_t cri_index = BE_GET_CRI_FROM_CID(cid);
 
 	phwi_ctrlr = phba->phwi_ctrlr;
@@ -1219,9 +1221,9 @@ struct wrb_handle *alloc_wrb_handle(struct beiscsi_hba *phba, unsigned int cid)
 			pwrb_context->alloc_index = 0;
 		else
 			pwrb_context->alloc_index++;
-		pwrb_handle_tmp = pwrb_context->pwrb_handle_base[
-						pwrb_context->alloc_index];
-		pwrb_handle->nxt_wrb_index = pwrb_handle_tmp->wrb_index;
+
+		/* Return the context address */
+		*pcontext = pwrb_context;
 	} else
 		pwrb_handle = NULL;
 	return pwrb_handle;
@@ -1560,7 +1562,7 @@ static void hwi_complete_cmd(struct beiscsi_conn *beiscsi_conn,
 	pwrb = pwrb_handle->pwrb;
 	type = ((struct beiscsi_io_task *)task->dd_data)->wrb_type;
 
-	spin_lock_bh(&session->back_lock);
+	spin_lock_bh(&session->lock);
 	switch (type) {
 	case HWH_TYPE_IO:
 	case HWH_TYPE_IO_RD:
@@ -1599,7 +1601,7 @@ static void hwi_complete_cmd(struct beiscsi_conn *beiscsi_conn,
 		break;
 	}
 
-	spin_unlock_bh(&session->back_lock);
+	spin_unlock_bh(&session->lock);
 }
 
 static struct list_head *hwi_get_async_busy_list(struct hwi_async_pdu_context
@@ -3184,7 +3186,7 @@ be_sgl_create_contiguous(void *virtual_address,
 {
 	WARN_ON(!virtual_address);
 	WARN_ON(!physical_address);
-	WARN_ON(!length > 0);
+	WARN_ON(!length);
 	WARN_ON(!sgl);
 
 	sgl->va = virtual_address;
@@ -4468,6 +4470,7 @@ put_shost:
 	scsi_host_put(phba->shost);
 free_kset:
 	iscsi_boot_destroy_kset(phba->boot_kset);
+	phba->boot_kset = NULL;
 	return -ENOMEM;
 }
 
@@ -4678,6 +4681,7 @@ beiscsi_offload_connection(struct beiscsi_conn *beiscsi_conn,
 			   struct beiscsi_offload_params *params)
 {
 	struct wrb_handle *pwrb_handle;
+	struct hwi_wrb_context *pwrb_context = NULL;
 	struct beiscsi_hba *phba = beiscsi_conn->phba;
 	struct iscsi_task *task = beiscsi_conn->task;
 	struct iscsi_session *session = task->conn->session;
@@ -4688,18 +4692,21 @@ beiscsi_offload_connection(struct beiscsi_conn *beiscsi_conn,
 	 * login/startup related tasks.
 	 */
 	beiscsi_conn->login_in_progress = 0;
-	spin_lock_bh(&session->back_lock);
+	spin_lock_bh(&session->lock);
 	beiscsi_cleanup_task(task);
-	spin_unlock_bh(&session->back_lock);
+	spin_unlock_bh(&session->lock);
 
-	pwrb_handle = alloc_wrb_handle(phba, beiscsi_conn->beiscsi_conn_cid);
+	pwrb_handle = alloc_wrb_handle(phba, beiscsi_conn->beiscsi_conn_cid,
+				       &pwrb_context);
 
 	/* Check for the adapter family */
 	if (is_chip_be2_be3r(phba))
 		beiscsi_offload_cxn_v0(params, pwrb_handle,
-				       phba->init_mem);
+				       phba->init_mem,
+				       pwrb_context);
 	else
-		beiscsi_offload_cxn_v2(params, pwrb_handle);
+		beiscsi_offload_cxn_v2(params, pwrb_handle,
+				       pwrb_context);
 
 	be_dws_le_to_cpu(pwrb_handle->pwrb,
 			 sizeof(struct iscsi_target_context_update_wrb));
@@ -4769,7 +4776,8 @@ static int beiscsi_alloc_pdu(struct iscsi_task *task, uint8_t opcode)
 			goto free_hndls;
 		}
 		io_task->pwrb_handle = alloc_wrb_handle(phba,
-					beiscsi_conn->beiscsi_conn_cid);
+					beiscsi_conn->beiscsi_conn_cid,
+					&io_task->pwrb_context);
 		if (!io_task->pwrb_handle) {
 			beiscsi_log(phba, KERN_ERR,
 				    BEISCSI_LOG_IO | BEISCSI_LOG_CONFIG,
@@ -4803,7 +4811,8 @@ static int beiscsi_alloc_pdu(struct iscsi_task *task, uint8_t opcode)
 							io_task->psgl_handle;
 				io_task->pwrb_handle =
 					alloc_wrb_handle(phba,
-					beiscsi_conn->beiscsi_conn_cid);
+					beiscsi_conn->beiscsi_conn_cid,
+					&io_task->pwrb_context);
 				if (!io_task->pwrb_handle) {
 					beiscsi_log(phba, KERN_ERR,
 						    BEISCSI_LOG_IO |
@@ -4839,7 +4848,8 @@ static int beiscsi_alloc_pdu(struct iscsi_task *task, uint8_t opcode)
 			}
 			io_task->pwrb_handle =
 					alloc_wrb_handle(phba,
-					beiscsi_conn->beiscsi_conn_cid);
+					beiscsi_conn->beiscsi_conn_cid,
+					&io_task->pwrb_context);
 			if (!io_task->pwrb_handle) {
 				beiscsi_log(phba, KERN_ERR,
 					    BEISCSI_LOG_IO | BEISCSI_LOG_CONFIG,
@@ -4925,7 +4935,12 @@ int beiscsi_iotask_v2(struct iscsi_task *task, struct scatterlist *sg,
 
 	hwi_write_sgl_v2(pwrb, sg, num_sg, io_task);
 	AMAP_SET_BITS(struct amap_iscsi_wrb_v2, ptr2nextwrb, pwrb,
-		      io_task->pwrb_handle->nxt_wrb_index);
+		      io_task->pwrb_handle->wrb_index);
+	if (io_task->pwrb_context->plast_wrb)
+		AMAP_SET_BITS(struct amap_iscsi_wrb_v2, ptr2nextwrb,
+			      io_task->pwrb_context->plast_wrb,
+			      io_task->pwrb_handle->wrb_index);
+	io_task->pwrb_context->plast_wrb = pwrb;
 
 	be_dws_le_to_cpu(pwrb, sizeof(struct iscsi_wrb));
 
@@ -4982,7 +4997,13 @@ static int beiscsi_iotask(struct iscsi_task *task, struct scatterlist *sg,
 	hwi_write_sgl(pwrb, sg, num_sg, io_task);
 
 	AMAP_SET_BITS(struct amap_iscsi_wrb, ptr2nextwrb, pwrb,
-		      io_task->pwrb_handle->nxt_wrb_index);
+		      io_task->pwrb_handle->wrb_index);
+	if (io_task->pwrb_context->plast_wrb)
+		AMAP_SET_BITS(struct amap_iscsi_wrb, ptr2nextwrb,
+			      io_task->pwrb_context->plast_wrb,
+			      io_task->pwrb_handle->wrb_index);
+	io_task->pwrb_context->plast_wrb = pwrb;
+
 	be_dws_le_to_cpu(pwrb, sizeof(struct iscsi_wrb));
 
 	doorbell |= beiscsi_conn->beiscsi_conn_cid & DB_WRB_POST_CID_MASK;
@@ -5020,7 +5041,13 @@ static int beiscsi_mtask(struct iscsi_task *task)
 		AMAP_SET_BITS(struct amap_iscsi_wrb, r2t_exp_dtl, pwrb,
 			      task->data_count);
 		AMAP_SET_BITS(struct amap_iscsi_wrb, ptr2nextwrb, pwrb,
-			      io_task->pwrb_handle->nxt_wrb_index);
+			      io_task->pwrb_handle->wrb_index);
+		if (io_task->pwrb_context->plast_wrb)
+			AMAP_SET_BITS(struct amap_iscsi_wrb, ptr2nextwrb,
+				      io_task->pwrb_context->plast_wrb,
+				      io_task->pwrb_handle->wrb_index);
+		io_task->pwrb_context->plast_wrb = pwrb;
+
 		pwrb_typeoffset = BE_WRB_TYPE_OFFSET;
 	} else {
 		AMAP_SET_BITS(struct amap_iscsi_wrb_v2, cmdsn_itt, pwrb,
@@ -5032,7 +5059,13 @@ static int beiscsi_mtask(struct iscsi_task *task)
 		AMAP_SET_BITS(struct amap_iscsi_wrb_v2, r2t_exp_dtl, pwrb,
 			      task->data_count);
 		AMAP_SET_BITS(struct amap_iscsi_wrb_v2, ptr2nextwrb, pwrb,
-			      io_task->pwrb_handle->nxt_wrb_index);
+			      io_task->pwrb_handle->wrb_index);
+		if (io_task->pwrb_context->plast_wrb)
+			AMAP_SET_BITS(struct amap_iscsi_wrb_v2, ptr2nextwrb,
+				      io_task->pwrb_context->plast_wrb,
+				      io_task->pwrb_handle->wrb_index);
+		io_task->pwrb_context->plast_wrb = pwrb;
+
 		pwrb_typeoffset = SKH_WRB_TYPE_OFFSET;
 	}
 

@@ -132,7 +132,7 @@ static int sst_send_slot_map(struct sst_data *drv)
 			      sizeof(cmd.header) + cmd.header.length);
 }
 
-int sst_slot_enum_info(struct snd_kcontrol *kcontrol,
+static int sst_slot_enum_info(struct snd_kcontrol *kcontrol,
 		       struct snd_ctl_elem_info *uinfo)
 {
 	struct sst_enum *e = (struct sst_enum *)kcontrol->private_value;
@@ -443,7 +443,7 @@ static int sst_gain_get(struct snd_kcontrol *kcontrol,
 		break;
 
 	case SST_GAIN_MUTE:
-		ucontrol->value.integer.value[0] = gv->mute ? 1 : 0;
+		ucontrol->value.integer.value[0] = gv->mute ? 0 : 1;
 		break;
 
 	case SST_GAIN_RAMP_DURATION:
@@ -479,7 +479,7 @@ static int sst_gain_put(struct snd_kcontrol *kcontrol,
 		break;
 
 	case SST_GAIN_MUTE:
-		gv->mute = !!ucontrol->value.integer.value[0];
+		gv->mute = !ucontrol->value.integer.value[0];
 		dev_dbg(cmpnt->dev, "%s: Mute %d\n", mc->pname, gv->mute);
 		break;
 
@@ -963,7 +963,9 @@ static int sst_set_be_modules(struct snd_soc_dapm_widget *w,
 	dev_dbg(c->dev, "Enter: widget=%s\n", w->name);
 
 	if (SND_SOC_DAPM_EVENT_ON(event)) {
+		mutex_lock(&drv->lock);
 		ret = sst_send_slot_map(drv);
+		mutex_unlock(&drv->lock);
 		if (ret)
 			return ret;
 		ret = sst_send_pipe_module_params(w, k);
@@ -1298,7 +1300,7 @@ int sst_send_pipe_gains(struct snd_soc_dai *dai, int stream, int mute)
 		dev_dbg(dai->dev, "Stream name=%s\n",
 				dai->playback_widget->name);
 		w = dai->playback_widget;
-		list_for_each_entry(p, &w->sinks, list_source) {
+		snd_soc_dapm_widget_for_each_sink_path(w, p) {
 			if (p->connected && !p->connected(w, p->sink))
 				continue;
 
@@ -1317,8 +1319,8 @@ int sst_send_pipe_gains(struct snd_soc_dai *dai, int stream, int mute)
 		dev_dbg(dai->dev, "Stream name=%s\n",
 				dai->capture_widget->name);
 		w = dai->capture_widget;
-		list_for_each_entry(p, &w->sources, list_sink) {
-			if (p->connected && !p->connected(w, p->sink))
+		snd_soc_dapm_widget_for_each_source_path(w, p) {
+			if (p->connected && !p->connected(w, p->source))
 				continue;
 
 			if (p->connect &&  p->source->power &&

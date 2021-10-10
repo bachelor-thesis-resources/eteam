@@ -103,7 +103,7 @@ static int rsi_find_bulk_in_and_out_endpoints(struct usb_interface *interface,
 	__le16 buffer_size;
 	int ii, bep_found = 0;
 
-	iface_desc = &(interface->altsetting[0]);
+	iface_desc = interface->cur_altsetting;
 
 	for (ii = 0; ii < iface_desc->desc.bNumEndpoints; ++ii) {
 		endpoint = &(iface_desc->endpoint[ii].desc);
@@ -553,7 +553,7 @@ static const struct usb_device_id rsi_dev_table[] = {
 	{ USB_DEVICE(0x0303, 0x0100) },
 	{ USB_DEVICE(0x041B, 0x0301) },
 	{ USB_DEVICE(0x041B, 0x0201) },
-	{ USB_DEVICE(0x041B, 0x9330) },
+	/* { USB_DEVICE(0x041B, 0x9330) }, LP:#1657682 replaced by ubuntu/rsi/ */
 	{ /* Blank */},
 };
 

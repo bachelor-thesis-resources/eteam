@@ -131,7 +131,7 @@
  * ACT8865 voltage number
  */
 #define	ACT8865_VOLTAGE_NUM	64
-#define ACT8600_SUDCDC_VOLTAGE_NUM	255
+#define ACT8600_SUDCDC_VOLTAGE_NUM	256
 
 struct act8865 {
 	struct regmap *regmap;
@@ -154,7 +154,8 @@ static const struct regulator_linear_range act8600_sudcdc_voltage_ranges[] = {
 	REGULATOR_LINEAR_RANGE(3000000, 0, 63, 0),
 	REGULATOR_LINEAR_RANGE(3000000, 64, 159, 100000),
 	REGULATOR_LINEAR_RANGE(12600000, 160, 191, 200000),
-	REGULATOR_LINEAR_RANGE(19000000, 191, 255, 400000),
+	REGULATOR_LINEAR_RANGE(19000000, 192, 247, 400000),
+	REGULATOR_LINEAR_RANGE(41400000, 248, 255, 0),
 };
 
 static struct regulator_ops act8865_ops = {
@@ -255,6 +256,16 @@ static const struct regulator_desc act8865_regulators[] = {
 	ACT88xx_REG("DCDC_REG1", ACT8865, DCDC1, VSET1, "vp1"),
 	ACT88xx_REG("DCDC_REG2", ACT8865, DCDC2, VSET1, "vp2"),
 	ACT88xx_REG("DCDC_REG3", ACT8865, DCDC3, VSET1, "vp3"),
+	ACT88xx_REG("LDO_REG1", ACT8865, LDO1, VSET, "inl45"),
+	ACT88xx_REG("LDO_REG2", ACT8865, LDO2, VSET, "inl45"),
+	ACT88xx_REG("LDO_REG3", ACT8865, LDO3, VSET, "inl67"),
+	ACT88xx_REG("LDO_REG4", ACT8865, LDO4, VSET, "inl67"),
+};
+
+static const struct regulator_desc act8865_alt_regulators[] = {
+	ACT88xx_REG("DCDC_REG1", ACT8865, DCDC1, VSET2, "vp1"),
+	ACT88xx_REG("DCDC_REG2", ACT8865, DCDC2, VSET2, "vp2"),
+	ACT88xx_REG("DCDC_REG3", ACT8865, DCDC3, VSET2, "vp3"),
 	ACT88xx_REG("LDO_REG1", ACT8865, LDO1, VSET, "inl45"),
 	ACT88xx_REG("LDO_REG2", ACT8865, LDO2, VSET, "inl45"),
 	ACT88xx_REG("LDO_REG3", ACT8865, LDO3, VSET, "inl67"),
@@ -413,6 +424,7 @@ static int act8865_pmic_probe(struct i2c_client *client,
 	struct act8865 *act8865;
 	unsigned long type;
 	int off_reg, off_mask;
+	int voltage_select = 0;
 
 	pdata = dev_get_platdata(dev);
 
@@ -424,6 +436,10 @@ static int act8865_pmic_probe(struct i2c_client *client,
 			return -ENODEV;
 
 		type = (unsigned long) id->data;
+
+		voltage_select = !!of_get_property(dev->of_node,
+						   "active-semi,vsel-high",
+						   NULL);
 	} else {
 		type = i2c_id->driver_data;
 	}
@@ -442,8 +458,13 @@ static int act8865_pmic_probe(struct i2c_client *client,
 		off_mask = ACT8846_OFF_SYSMASK;
 		break;
 	case ACT8865:
-		regulators = act8865_regulators;
-		num_regulators = ARRAY_SIZE(act8865_regulators);
+		if (voltage_select) {
+			regulators = act8865_alt_regulators;
+			num_regulators = ARRAY_SIZE(act8865_alt_regulators);
+		} else {
+			regulators = act8865_regulators;
+			num_regulators = ARRAY_SIZE(act8865_regulators);
+		}
 		off_reg = ACT8865_SYS_CTRL;
 		off_mask = ACT8865_MSTROFF;
 		break;
@@ -530,7 +551,6 @@ MODULE_DEVICE_TABLE(i2c, act8865_ids);
 static struct i2c_driver act8865_pmic_driver = {
 	.driver	= {
 		.name	= "act8865",
-		.owner	= THIS_MODULE,
 	},
 	.probe		= act8865_pmic_probe,
 	.id_table	= act8865_ids,

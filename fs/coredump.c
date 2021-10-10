@@ -1,6 +1,7 @@
 #include <linux/slab.h>
 #include <linux/file.h>
 #include <linux/fdtable.h>
+#include <linux/freezer.h>
 #include <linux/mm.h>
 #include <linux/stat.h>
 #include <linux/fcntl.h>
@@ -32,6 +33,9 @@
 #include <linux/pipe_fs_i.h>
 #include <linux/oom.h>
 #include <linux/compat.h>
+#include <linux/sched.h>
+#include <linux/fs.h>
+#include <linux/path.h>
 
 #include <asm/uaccess.h>
 #include <asm/mmu_context.h>
@@ -280,23 +284,24 @@ out:
 	return ispipe;
 }
 
-static int zap_process(struct task_struct *start, int exit_code)
+static int zap_process(struct task_struct *start, int exit_code, int flags)
 {
 	struct task_struct *t;
 	int nr = 0;
 
+	/* ignore all signals except SIGKILL, see prepare_signal() */
+	start->signal->flags = SIGNAL_GROUP_COREDUMP | flags;
 	start->signal->group_exit_code = exit_code;
 	start->signal->group_stop_count = 0;
 
-	t = start;
-	do {
+	for_each_thread(start, t) {
 		task_clear_jobctl_pending(t, JOBCTL_PENDING_MASK);
 		if (t != current && t->mm) {
 			sigaddset(&t->pending.signal, SIGKILL);
 			signal_wake_up(t, 1);
 			nr++;
 		}
-	} while_each_thread(start, t);
+	}
 
 	return nr;
 }
@@ -311,10 +316,8 @@ static int zap_threads(struct task_struct *tsk, struct mm_struct *mm,
 	spin_lock_irq(&tsk->sighand->siglock);
 	if (!signal_group_exit(tsk->signal)) {
 		mm->core_state = core_state;
-		nr = zap_process(tsk, exit_code);
 		tsk->signal->group_exit_task = tsk;
-		/* ignore all signals except SIGKILL, see prepare_signal() */
-		tsk->signal->flags = SIGNAL_GROUP_COREDUMP;
+		nr = zap_process(tsk, exit_code, 0);
 		clear_tsk_thread_flag(tsk, TIF_SIGPENDING);
 	}
 	spin_unlock_irq(&tsk->sighand->siglock);
@@ -360,18 +363,18 @@ static int zap_threads(struct task_struct *tsk, struct mm_struct *mm,
 			continue;
 		if (g->flags & PF_KTHREAD)
 			continue;
-		p = g;
-		do {
-			if (p->mm) {
-				if (unlikely(p->mm == mm)) {
-					lock_task_sighand(p, &flags);
-					nr += zap_process(p, exit_code);
-					p->signal->flags = SIGNAL_GROUP_EXIT;
-					unlock_task_sighand(p, &flags);
-				}
-				break;
+
+		for_each_thread(g, p) {
+			if (unlikely(!p->mm))
+				continue;
+			if (unlikely(p->mm == mm)) {
+				lock_task_sighand(p, &flags);
+				nr += zap_process(p, exit_code,
+							SIGNAL_GROUP_EXIT);
+				unlock_task_sighand(p, &flags);
 			}
-		} while_each_thread(g, p);
+			break;
+		}
 	}
 	rcu_read_unlock();
 done:
@@ -397,7 +400,9 @@ static int coredump_wait(int exit_code, struct core_state *core_state)
 	if (core_waiters > 0) {
 		struct core_thread *ptr;
 
+		freezer_do_not_count();
 		wait_for_completion(&core_state->startup);
+		freezer_count();
 		/*
 		 * Wait for all the threads to become inactive, so that
 		 * all the thread context (extended register state, like
@@ -628,6 +633,8 @@ void do_coredump(const siginfo_t *siginfo)
 		}
 	} else {
 		struct inode *inode;
+		int open_flags = O_CREAT | O_RDWR | O_NOFOLLOW |
+				 O_LARGEFILE | O_EXCL;
 
 		if (cprm.limit < binfmt->min_coredump)
 			goto fail_unlock;
@@ -666,10 +673,27 @@ void do_coredump(const siginfo_t *siginfo)
 		 * what matters is that at least one of the two processes
 		 * writes its coredump successfully, not which one.
 		 */
-		cprm.file = filp_open(cn.corename,
-				 O_CREAT | 2 | O_NOFOLLOW |
-				 O_LARGEFILE | O_EXCL,
-				 0600);
+		if (need_suid_safe) {
+			/*
+			 * Using user namespaces, normal user tasks can change
+			 * their current->fs->root to point to arbitrary
+			 * directories. Since the intention of the "only dump
+			 * with a fully qualified path" rule is to control where
+			 * coredumps may be placed using root privileges,
+			 * current->fs->root must not be used. Instead, use the
+			 * root directory of init_task.
+			 */
+			struct path root;
+
+			task_lock(&init_task);
+			get_fs_root(init_task.fs, &root);
+			task_unlock(&init_task);
+			cprm.file = file_open_root(root.dentry, root.mnt,
+				cn.corename, open_flags, 0600);
+			path_put(&root);
+		} else {
+			cprm.file = filp_open(cn.corename, open_flags, 0600);
+		}
 		if (IS_ERR(cprm.file))
 			goto fail_unlock;
 
@@ -786,3 +810,21 @@ int dump_align(struct coredump_params *cprm, int align)
 	return mod ? dump_skip(cprm, align - mod) : 1;
 }
 EXPORT_SYMBOL(dump_align);
+
+/*
+ * Ensures that file size is big enough to contain the current file
+ * postion. This prevents gdb from complaining about a truncated file
+ * if the last "write" to the file was dump_skip.
+ */
+void dump_truncate(struct coredump_params *cprm)
+{
+	struct file *file = cprm->file;
+	loff_t offset;
+
+	if (file->f_op->llseek && file->f_op->llseek != no_llseek) {
+		offset = file->f_op->llseek(file, 0, SEEK_CUR);
+		if (i_size_read(file->f_mapping->host) < offset)
+			do_truncate(file->f_path.dentry, offset, 0, file);
+	}
+}
+EXPORT_SYMBOL(dump_truncate);

@@ -111,7 +111,7 @@ struct fscache_cookie *__fscache_acquire_cookie(
 
 	/* radix tree insertion won't use the preallocation pool unless it's
 	 * told it may not wait */
-	INIT_RADIX_TREE(&cookie->stores, GFP_NOFS & ~__GFP_WAIT);
+	INIT_RADIX_TREE(&cookie->stores, GFP_NOFS & ~__GFP_DIRECT_RECLAIM);
 
 	switch (cookie->def->type) {
 	case FSCACHE_COOKIE_TYPE_INDEX:
@@ -302,6 +302,7 @@ static int fscache_alloc_object(struct fscache_cache *cache,
 		goto error;
 	}
 
+	ASSERTCMP(object->cookie, ==, cookie);
 	fscache_stat(&fscache_n_object_alloc);
 
 	object->debug_id = atomic_inc_return(&fscache_object_debug_id);
@@ -357,6 +358,8 @@ static int fscache_attach_object(struct fscache_cookie *cookie,
 
 	_enter("{%s},{OBJ%x}", cookie->def->name, object->debug_id);
 
+	ASSERTCMP(object->cookie, ==, cookie);
+
 	spin_lock(&cookie->lock);
 
 	/* there may be multiple initial creations of this object, but we only
@@ -396,9 +399,7 @@ static int fscache_attach_object(struct fscache_cookie *cookie,
 		spin_unlock(&cache->object_list_lock);
 	}
 
-	/* attach to the cookie */
-	object->cookie = cookie;
-	atomic_inc(&cookie->usage);
+	/* Attach to the cookie.  The object already has a ref on it. */
 	hlist_add_head(&object->cookie_link, &cookie->backing_objects);
 
 	fscache_objlist_add(object);
@@ -542,6 +543,7 @@ void __fscache_disable_cookie(struct fscache_cookie *cookie, bool invalidate)
 		hlist_for_each_entry(object, &cookie->backing_objects, cookie_link) {
 			if (invalidate)
 				set_bit(FSCACHE_OBJECT_RETIRED, &object->flags);
+			clear_bit(FSCACHE_OBJECT_PENDING_WRITE, &object->flags);
 			fscache_raise_event(object, FSCACHE_OBJECT_EV_KILL);
 		}
 	} else {
@@ -559,6 +561,10 @@ void __fscache_disable_cookie(struct fscache_cookie *cookie, bool invalidate)
 	if (!atomic_dec_and_test(&cookie->n_active))
 		wait_on_atomic_t(&cookie->n_active, fscache_wait_atomic_t,
 				 TASK_UNINTERRUPTIBLE);
+
+	/* Make sure any pending writes are cancelled. */
+	if (cookie->def->type != FSCACHE_COOKIE_TYPE_INDEX)
+		fscache_invalidate_writes(cookie);
 
 	/* Reset the cookie state if it wasn't relinquished */
 	if (!test_bit(FSCACHE_COOKIE_RELINQUISHED, &cookie->flags)) {

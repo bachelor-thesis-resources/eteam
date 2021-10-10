@@ -367,6 +367,20 @@ void sas_remove_host(struct Scsi_Host *shost)
 EXPORT_SYMBOL(sas_remove_host);
 
 /**
+ * sas_get_address - return the SAS address of the device
+ * @sdev: scsi device
+ *
+ * Returns the SAS address of the scsi device
+ */
+u64 sas_get_address(struct scsi_device *sdev)
+{
+	struct sas_end_device *rdev = sas_sdev_to_rdev(sdev);
+
+	return rdev->rphy.identify.sas_address;
+}
+EXPORT_SYMBOL(sas_get_address);
+
+/**
  * sas_tlr_supported - checking TLR bit in vpd 0x90
  * @sdev: scsi device struct
  *
@@ -1222,13 +1236,6 @@ show_sas_rphy_enclosure_identifier(struct device *dev,
 	u64 identifier;
 	int error;
 
-	/*
-	 * Only devices behind an expander are supported, because the
-	 * enclosure identifier is a SMP feature.
-	 */
-	if (scsi_is_sas_phy_local(phy))
-		return -EINVAL;
-
 	error = i->f->get_enclosure_identifier(rphy, &identifier);
 	if (error)
 		return error;
@@ -1247,9 +1254,6 @@ show_sas_rphy_bay_identifier(struct device *dev,
 	struct Scsi_Host *shost = dev_to_shost(phy->dev.parent);
 	struct sas_internal *i = to_sas_internal(shost->transportt);
 	int val;
-
-	if (scsi_is_sas_phy_local(phy))
-		return -EINVAL;
 
 	val = i->f->get_bay_identifier(rphy);
 	if (val < 0)

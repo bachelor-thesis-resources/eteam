@@ -1039,7 +1039,6 @@ static int synaptics_rmi4_remove(struct i2c_client *client)
 	return 0;
 }
 
-#ifdef CONFIG_PM
 /**
  * synaptics_rmi4_suspend() - suspend the touch screen controller
  * @dev: pointer to device structure
@@ -1047,7 +1046,7 @@ static int synaptics_rmi4_remove(struct i2c_client *client)
  * This function is used to suspend the
  * touch panel controller and returns integer
  */
-static int synaptics_rmi4_suspend(struct device *dev)
+static int __maybe_unused synaptics_rmi4_suspend(struct device *dev)
 {
 	/* Touch sleep mode */
 	int retval;
@@ -1081,7 +1080,7 @@ static int synaptics_rmi4_suspend(struct device *dev)
  * This function is used to resume the touch panel
  * controller and returns integer.
  */
-static int synaptics_rmi4_resume(struct device *dev)
+static int __maybe_unused synaptics_rmi4_resume(struct device *dev)
 {
 	int retval;
 	unsigned char intr_status;
@@ -1112,8 +1111,6 @@ static int synaptics_rmi4_resume(struct device *dev)
 	return 0;
 }
 
-#endif
-
 static SIMPLE_DEV_PM_OPS(synaptics_rmi4_dev_pm_ops, synaptics_rmi4_suspend,
 			 synaptics_rmi4_resume);
 
@@ -1126,7 +1123,6 @@ MODULE_DEVICE_TABLE(i2c, synaptics_rmi4_id_table);
 static struct i2c_driver synaptics_rmi4_driver = {
 	.driver = {
 		.name	=	DRIVER_NAME,
-		.owner	=	THIS_MODULE,
 		.pm	=	&synaptics_rmi4_dev_pm_ops,
 	},
 	.probe		=	synaptics_rmi4_probe,
@@ -1139,4 +1135,3 @@ module_i2c_driver(synaptics_rmi4_driver);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("naveen.gaddipati@stericsson.com, js.ha@stericsson.com");
 MODULE_DESCRIPTION("synaptics rmi4 i2c touch Driver");
-MODULE_ALIAS("i2c:synaptics_rmi4_ts");

@@ -40,6 +40,7 @@
 #include <linux/seq_file.h>
 #include <linux/root_dev.h>
 #include <linux/of.h>
+#include <linux/of_pci.h>
 #include <linux/kexec.h>
 
 #include <asm/mmu.h>
@@ -66,6 +67,7 @@
 #include <asm/eeh.h>
 #include <asm/reg.h>
 #include <asm/plpar_wrappers.h>
+#include <asm/security_features.h>
 
 #include "pseries.h"
 
@@ -111,7 +113,7 @@ static void __init fwnmi_init(void)
 		fwnmi_active = 1;
 }
 
-static void pseries_8259_cascade(unsigned int irq, struct irq_desc *desc)
+static void pseries_8259_cascade(struct irq_desc *desc)
 {
 	struct irq_chip *chip = irq_desc_get_chip(desc);
 	unsigned int cascade_irq = i8259_irq();
@@ -254,24 +256,26 @@ static void __init pseries_discover_pic(void)
 static int pci_dn_reconfig_notifier(struct notifier_block *nb, unsigned long action, void *data)
 {
 	struct of_reconfig_data *rd = data;
-	struct device_node *np = rd->dn;
-	struct pci_dn *pci = NULL;
+	struct device_node *parent, *np = rd->dn;
+	struct pci_dn *pdn;
 	int err = NOTIFY_OK;
 
 	switch (action) {
 	case OF_RECONFIG_ATTACH_NODE:
-		pci = np->parent->data;
-		if (pci) {
-			update_dn_pci_info(np, pci->phb);
-
-			/* Create EEH device for the OF node */
-			eeh_dev_init(PCI_DN(np), pci->phb);
+		parent = of_get_parent(np);
+		pdn = parent ? PCI_DN(parent) : NULL;
+		if (pdn) {
+			/* Create pdn and EEH device */
+			update_dn_pci_info(np, pdn->phb);
+			eeh_dev_init(PCI_DN(np), pdn->phb);
 		}
+
+		of_node_put(parent);
 		break;
 	case OF_RECONFIG_DETACH_NODE:
-		pci = PCI_DN(np);
-		if (pci)
-			list_del(&pci->list);
+		pdn = PCI_DN(np);
+		if (pdn)
+			list_del(&pdn->list);
 		break;
 	default:
 		err = NOTIFY_DONE;
@@ -364,6 +368,9 @@ static void pseries_lpar_idle(void)
 	 * Default handler to go into low thread priority and possibly
 	 * low power mode by cedeing processor to hypervisor
 	 */
+
+	if (!prep_irq_for_idle())
+		return;
 
 	/* Indicate to hypervisor that we are idle. */
 	get_lppaca()->idle = 1;
@@ -493,18 +500,98 @@ static void __init find_and_init_phbs(void)
 	 * PCI_PROBE_ONLY and PCI_REASSIGN_ALL_BUS can be set via properties
 	 * in chosen.
 	 */
-	if (of_chosen) {
-		const int *prop;
+	of_pci_check_probe_only();
+}
 
-		prop = of_get_property(of_chosen,
-				"linux,pci-probe-only", NULL);
-		if (prop) {
-			if (*prop)
-				pci_add_flags(PCI_PROBE_ONLY);
-			else
-				pci_clear_flags(PCI_PROBE_ONLY);
-		}
-	}
+static void init_cpu_char_feature_flags(struct h_cpu_char_result *result)
+{
+	/*
+	 * The features below are disabled by default, so we instead look to see
+	 * if firmware has *enabled* them, and set them if so.
+	 */
+	if (result->character & H_CPU_CHAR_SPEC_BAR_ORI31)
+		security_ftr_set(SEC_FTR_SPEC_BAR_ORI31);
+
+	if (result->character & H_CPU_CHAR_BCCTRL_SERIALISED)
+		security_ftr_set(SEC_FTR_BCCTRL_SERIALISED);
+
+	if (result->character & H_CPU_CHAR_L1D_FLUSH_ORI30)
+		security_ftr_set(SEC_FTR_L1D_FLUSH_ORI30);
+
+	if (result->character & H_CPU_CHAR_L1D_FLUSH_TRIG2)
+		security_ftr_set(SEC_FTR_L1D_FLUSH_TRIG2);
+
+	if (result->character & H_CPU_CHAR_L1D_THREAD_PRIV)
+		security_ftr_set(SEC_FTR_L1D_THREAD_PRIV);
+
+	if (result->character & H_CPU_CHAR_COUNT_CACHE_DISABLED)
+		security_ftr_set(SEC_FTR_COUNT_CACHE_DISABLED);
+
+	if (result->character & H_CPU_CHAR_BCCTR_FLUSH_ASSIST)
+		security_ftr_set(SEC_FTR_BCCTR_FLUSH_ASSIST);
+
+	if (result->behaviour & H_CPU_BEHAV_FLUSH_COUNT_CACHE)
+		security_ftr_set(SEC_FTR_FLUSH_COUNT_CACHE);
+
+	/*
+	 * The features below are enabled by default, so we instead look to see
+	 * if firmware has *disabled* them, and clear them if so.
+	 */
+	if (!(result->behaviour & H_CPU_BEHAV_FAVOUR_SECURITY))
+		security_ftr_clear(SEC_FTR_FAVOUR_SECURITY);
+
+	if (!(result->behaviour & H_CPU_BEHAV_L1D_FLUSH_PR))
+		security_ftr_clear(SEC_FTR_L1D_FLUSH_PR);
+
+	if (!(result->behaviour & H_CPU_BEHAV_BNDS_CHK_SPEC_BAR))
+		security_ftr_clear(SEC_FTR_BNDS_CHK_SPEC_BAR);
+}
+
+void pseries_setup_rfi_flush(void)
+{
+	struct h_cpu_char_result result;
+	enum l1d_flush_type types;
+	bool enable;
+	long rc;
+
+	/*
+	 * Set features to the defaults assumed by init_cpu_char_feature_flags()
+	 * so it can set/clear again any features that might have changed after
+	 * migration, and in case the hypercall fails and it is not even called.
+	 */
+	powerpc_security_features = SEC_FTR_DEFAULT;
+
+	rc = plpar_get_cpu_characteristics(&result);
+	if (rc == H_SUCCESS)
+		init_cpu_char_feature_flags(&result);
+
+	/*
+	 * We're the guest so this doesn't apply to us, clear it to simplify
+	 * handling of it elsewhere.
+	 */
+	security_ftr_clear(SEC_FTR_L1D_FLUSH_HV);
+
+	types = L1D_FLUSH_FALLBACK;
+
+	if (security_ftr_enabled(SEC_FTR_L1D_FLUSH_TRIG2))
+		types |= L1D_FLUSH_MTTRIG;
+
+	if (security_ftr_enabled(SEC_FTR_L1D_FLUSH_ORI30))
+		types |= L1D_FLUSH_ORI;
+
+	enable = security_ftr_enabled(SEC_FTR_FAVOUR_SECURITY) && \
+		 security_ftr_enabled(SEC_FTR_L1D_FLUSH_PR);
+
+	setup_rfi_flush(types, enable);
+	setup_count_cache_flush();
+
+	enable = security_ftr_enabled(SEC_FTR_FAVOUR_SECURITY) &&
+		 security_ftr_enabled(SEC_FTR_L1D_FLUSH_ENTRY);
+	setup_entry_flush(enable);
+
+	enable = security_ftr_enabled(SEC_FTR_FAVOUR_SECURITY) &&
+		 security_ftr_enabled(SEC_FTR_L1D_FLUSH_UACCESS);
+	setup_uaccess_flush(enable);
 }
 
 static void __init pSeries_setup_arch(void)
@@ -523,7 +610,10 @@ static void __init pSeries_setup_arch(void)
 
 	fwnmi_init();
 
-	/* By default, only probe PCI (can be overriden by rtas_pci) */
+	pseries_setup_rfi_flush();
+	setup_stf_barrier();
+
+	/* By default, only probe PCI (can be overridden by rtas_pci) */
 	pci_add_flags(PCI_PROBE_ONLY);
 
 	/* Find and initialize PCI host bridges */
@@ -835,10 +925,6 @@ static int pSeries_pci_probe_mode(struct pci_bus *bus)
 	return PCI_PROBE_NORMAL;
 }
 
-#ifndef CONFIG_PCI
-void pSeries_final_fixup(void) { }
-#endif
-
 struct pci_controller_ops pseries_pci_controller_ops = {
 	.probe_mode		= pSeries_pci_probe_mode,
 };
@@ -853,7 +939,6 @@ define_machine(pseries) {
 	.pcibios_fixup		= pSeries_final_fixup,
 	.restart		= rtas_restart,
 	.halt			= rtas_halt,
-	.panic			= rtas_os_term,
 	.get_boot_time		= rtas_get_boot_time,
 	.get_rtc_time		= rtas_get_rtc_time,
 	.set_rtc_time		= rtas_set_rtc_time,

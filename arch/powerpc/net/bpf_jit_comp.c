@@ -78,18 +78,9 @@ static void bpf_jit_build_prologue(struct bpf_prog *fp, u32 *image,
 		PPC_LI(r_X, 0);
 	}
 
-	switch (filter[0].code) {
-	case BPF_RET | BPF_K:
-	case BPF_LD | BPF_W | BPF_LEN:
-	case BPF_LD | BPF_W | BPF_ABS:
-	case BPF_LD | BPF_H | BPF_ABS:
-	case BPF_LD | BPF_B | BPF_ABS:
-		/* first instruction sets A register (or is RET 'constant') */
-		break;
-	default:
-		/* make sure we dont leak kernel information to user */
+	/* make sure we dont leak kernel information to user */
+	if (bpf_needs_clear_a(&filter[0]))
 		PPC_LI(r_A, 0);
-	}
 }
 
 static void bpf_jit_build_epilogue(u32 *image, struct codegen_context *ctx)
@@ -337,6 +328,9 @@ static int bpf_jit_build_body(struct bpf_prog *fp, u32 *image,
 		case BPF_LD | BPF_W | BPF_LEN: /*	A = skb->len; */
 			BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, len) != 4);
 			PPC_LWZ_OFFS(r_A, r_skb, offsetof(struct sk_buff, len));
+			break;
+		case BPF_LDX | BPF_W | BPF_ABS: /* A = *((u32 *)(seccomp_data + K)); */
+			PPC_LWZ_OFFS(r_A, r_skb, K);
 			break;
 		case BPF_LDX | BPF_W | BPF_LEN: /* X = skb->len; */
 			PPC_LWZ_OFFS(r_X, r_skb, offsetof(struct sk_buff, len));
@@ -679,7 +673,7 @@ void bpf_jit_compile(struct bpf_prog *fp)
 		((u64 *)image)[1] = local_paca->kernel_toc;
 #endif
 		fp->bpf_func = (void *)image;
-		fp->jited = true;
+		fp->jited = 1;
 	}
 out:
 	kfree(addrs);

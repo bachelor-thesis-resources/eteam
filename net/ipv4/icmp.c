@@ -96,6 +96,7 @@
 #include <net/xfrm.h>
 #include <net/inet_common.h>
 #include <net/ip_fib.h>
+#include <net/l3mdev.h>
 
 /*
  *	Build xmit assembly blocks
@@ -245,7 +246,7 @@ static struct {
 /**
  * icmp_global_allow - Are we allowed to send one more ICMP message ?
  *
- * Uses a token bucket to limit our ICMP messages to sysctl_icmp_msgs_per_sec.
+ * Uses a token bucket to limit our ICMP messages to ~sysctl_icmp_msgs_per_sec.
  * Returns false if we reached the limit and can not send another packet.
  * Note: called with BH disabled
  */
@@ -255,10 +256,11 @@ bool icmp_global_allow(void)
 	bool rc = false;
 
 	/* Check if token bucket is empty and cannot be refilled
-	 * without taking the spinlock.
+	 * without taking the spinlock. The READ_ONCE() are paired
+	 * with the following WRITE_ONCE() in this same function.
 	 */
-	if (!icmp_global.credit) {
-		delta = min_t(u32, now - icmp_global.stamp, HZ);
+	if (!READ_ONCE(icmp_global.credit)) {
+		delta = min_t(u32, now - READ_ONCE(icmp_global.stamp), HZ);
 		if (delta < HZ / 50)
 			return false;
 	}
@@ -268,14 +270,17 @@ bool icmp_global_allow(void)
 	if (delta >= HZ / 50) {
 		incr = sysctl_icmp_msgs_per_sec * delta / HZ ;
 		if (incr)
-			icmp_global.stamp = now;
+			WRITE_ONCE(icmp_global.stamp, now);
 	}
 	credit = min_t(u32, icmp_global.credit + incr, sysctl_icmp_msgs_burst);
 	if (credit) {
-		credit--;
+		/* We want to use a credit of one in average, but need to randomize
+		 * it for security reasons.
+		 */
+		credit = max_t(int, credit - prandom_u32_max(3), 0);
 		rc = true;
 	}
-	icmp_global.credit = credit;
+	WRITE_ONCE(icmp_global.credit, credit);
 	spin_unlock(&icmp_global.lock);
 	return rc;
 }
@@ -308,9 +313,10 @@ static bool icmpv4_xrlim_allow(struct net *net, struct rtable *rt,
 
 	rc = false;
 	if (icmp_global_allow()) {
+		int vif = l3mdev_master_ifindex(dst->dev);
 		struct inet_peer *peer;
 
-		peer = inet_getpeer_v4(net->ipv4.peers, fl4->daddr, 1);
+		peer = inet_getpeer_v4(net->ipv4.peers, fl4->daddr, vif, 1);
 		rc = inet_peer_xrlim_allow(peer,
 					   net->ipv4.sysctl_icmp_ratelimit);
 		if (peer)
@@ -425,6 +431,7 @@ static void icmp_reply(struct icmp_bxm *icmp_param, struct sk_buff *skb)
 	fl4.flowi4_mark = mark;
 	fl4.flowi4_tos = RT_TOS(ip_hdr(skb)->tos);
 	fl4.flowi4_proto = IPPROTO_ICMP;
+	fl4.flowi4_oif = l3mdev_master_ifindex(skb->dev);
 	security_skb_classify_flow(skb, flowi4_to_flowi(&fl4));
 	rt = ip_route_output_key(net, &fl4);
 	if (IS_ERR(rt))
@@ -436,6 +443,22 @@ static void icmp_reply(struct icmp_bxm *icmp_param, struct sk_buff *skb)
 out_unlock:
 	icmp_xmit_unlock(sk);
 }
+
+#ifdef CONFIG_IP_ROUTE_MULTIPATH
+
+/* Source and destination is swapped. See ip_multipath_icmp_hash */
+static int icmp_multipath_hash_skb(const struct sk_buff *skb)
+{
+	const struct iphdr *iph = ip_hdr(skb);
+
+	return fib_multipath_hash(iph->daddr, iph->saddr);
+}
+
+#else
+
+#define icmp_multipath_hash_skb(skb) (-1)
+
+#endif
 
 static struct rtable *icmp_route_lookup(struct net *net,
 					struct flowi4 *fl4,
@@ -458,8 +481,11 @@ static struct rtable *icmp_route_lookup(struct net *net,
 	fl4->flowi4_proto = IPPROTO_ICMP;
 	fl4->fl4_icmp_type = type;
 	fl4->fl4_icmp_code = code;
+	fl4->flowi4_oif = l3mdev_master_ifindex(skb_dst(skb_in)->dev);
+
 	security_skb_classify_flow(skb_in, flowi4_to_flowi(fl4));
-	rt = __ip_route_output_key(net, fl4);
+	rt = __ip_route_output_key_hash(net, fl4,
+					icmp_multipath_hash_skb(skb_in));
 	if (IS_ERR(rt))
 		return rt;
 
@@ -480,7 +506,8 @@ static struct rtable *icmp_route_lookup(struct net *net,
 	if (err)
 		goto relookup_failed;
 
-	if (inet_addr_type(net, fl4_dec.saddr) == RTN_LOCAL) {
+	if (inet_addr_type_dev_table(net, skb_dst(skb_in)->dev,
+				     fl4_dec.saddr) == RTN_LOCAL) {
 		rt2 = __ip_route_output_key(net, &fl4_dec);
 		if (IS_ERR(rt2))
 			err = PTR_ERR(rt2);
@@ -496,6 +523,7 @@ static struct rtable *icmp_route_lookup(struct net *net,
 		}
 		/* Ugh! */
 		orefdst = skb_in->_skb_refdst; /* save old refdst */
+		skb_dst_set(skb_in, NULL);
 		err = ip_route_input(skb_in, fl4_dec.daddr, fl4_dec.saddr,
 				     RT_TOS(tos), rt2->dst.dev);
 
@@ -541,7 +569,8 @@ relookup_failed:
  *			MUST reply to only the first fragment.
  */
 
-void icmp_send(struct sk_buff *skb_in, int type, int code, __be32 info)
+void __icmp_send(struct sk_buff *skb_in, int type, int code, __be32 info,
+		 const struct ip_options *opt)
 {
 	struct iphdr *iph;
 	int room;
@@ -655,7 +684,7 @@ void icmp_send(struct sk_buff *skb_in, int type, int code, __be32 info)
 					  iph->tos;
 	mark = IP4_REPLY_MARK(net, skb_in->mark);
 
-	if (ip_options_echo(&icmp_param->replyopts.opt.opt, skb_in))
+	if (__ip_options_echo(&icmp_param->replyopts.opt.opt, skb_in, opt))
 		goto out_unlock;
 
 
@@ -707,7 +736,7 @@ out_free:
 	kfree(icmp_param);
 out:;
 }
-EXPORT_SYMBOL(icmp_send);
+EXPORT_SYMBOL(__icmp_send);
 
 
 static void icmp_socket_deliver(struct sk_buff *skb, u32 info)
@@ -828,7 +857,7 @@ static bool icmp_unreach(struct sk_buff *skb)
 	 */
 
 	if (!net->ipv4.sysctl_icmp_ignore_bogus_error_responses &&
-	    inet_addr_type(net, iph->daddr) == RTN_BROADCAST) {
+	    inet_addr_type_dev_table(net, skb->dev, iph->daddr) == RTN_BROADCAST) {
 		net_warn_ratelimited("%pI4 sent an invalid ICMP type %u, code %u error to a broadcast: %pI4 on %s\n",
 				     &ip_hdr(skb)->saddr,
 				     icmph->type, icmph->code,

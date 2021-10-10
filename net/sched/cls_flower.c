@@ -13,6 +13,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/rhashtable.h>
+#include <linux/workqueue.h>
 
 #include <linux/if_ether.h>
 #include <linux/in6.h>
@@ -55,7 +56,10 @@ struct cls_fl_head {
 	bool mask_assigned;
 	struct list_head filters;
 	struct rhashtable_params ht_params;
-	struct rcu_head rcu;
+	union {
+		struct work_struct work;
+		struct rcu_head	rcu;
+	};
 };
 
 struct cls_fl_filter {
@@ -123,13 +127,14 @@ static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 	struct fl_flow_key skb_key;
 	struct fl_flow_key skb_mkey;
 
+	flow_dissector_init_keys(&skb_key.control, &skb_key.basic);
 	fl_clear_masked_range(&skb_key, &head->mask);
 	skb_key.indev_ifindex = skb->skb_iif;
 	/* skb_flow_dissect() does not set n_proto in case an unknown protocol,
 	 * so do it rather here.
 	 */
 	skb_key.basic.n_proto = skb->protocol;
-	skb_flow_dissect(skb, &head->dissector, &skb_key);
+	skb_flow_dissect(skb, &head->dissector, &skb_key, 0);
 
 	fl_set_masked_key(&skb_mkey, &skb_key, &head->mask);
 
@@ -165,6 +170,24 @@ static void fl_destroy_filter(struct rcu_head *head)
 	kfree(f);
 }
 
+static void fl_destroy_sleepable(struct work_struct *work)
+{
+	struct cls_fl_head *head = container_of(work, struct cls_fl_head,
+						work);
+	if (head->mask_assigned)
+		rhashtable_destroy(&head->ht);
+	kfree(head);
+	module_put(THIS_MODULE);
+}
+
+static void fl_destroy_rcu(struct rcu_head *rcu)
+{
+	struct cls_fl_head *head = container_of(rcu, struct cls_fl_head, rcu);
+
+	INIT_WORK(&head->work, fl_destroy_sleepable);
+	schedule_work(&head->work);
+}
+
 static bool fl_destroy(struct tcf_proto *tp, bool force)
 {
 	struct cls_fl_head *head = rtnl_dereference(tp->root);
@@ -177,10 +200,9 @@ static bool fl_destroy(struct tcf_proto *tp, bool force)
 		list_del_rcu(&f->list);
 		call_rcu(&f->rcu, fl_destroy_filter);
 	}
-	RCU_INIT_POINTER(tp->root, NULL);
-	if (head->mask_assigned)
-		rhashtable_destroy(&head->ht);
-	kfree_rcu(head, rcu);
+
+	__module_get(THIS_MODULE);
+	call_rcu(&head->rcu, fl_destroy_rcu);
 	return true;
 }
 
@@ -252,23 +274,28 @@ static int fl_set_key(struct net *net, struct nlattr **tb,
 	fl_set_key_val(tb, key->eth.src, TCA_FLOWER_KEY_ETH_SRC,
 		       mask->eth.src, TCA_FLOWER_KEY_ETH_SRC_MASK,
 		       sizeof(key->eth.src));
+
 	fl_set_key_val(tb, &key->basic.n_proto, TCA_FLOWER_KEY_ETH_TYPE,
 		       &mask->basic.n_proto, TCA_FLOWER_UNSPEC,
 		       sizeof(key->basic.n_proto));
+
 	if (key->basic.n_proto == htons(ETH_P_IP) ||
 	    key->basic.n_proto == htons(ETH_P_IPV6)) {
 		fl_set_key_val(tb, &key->basic.ip_proto, TCA_FLOWER_KEY_IP_PROTO,
 			       &mask->basic.ip_proto, TCA_FLOWER_UNSPEC,
 			       sizeof(key->basic.ip_proto));
 	}
-	if (key->control.addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
+
+	if (tb[TCA_FLOWER_KEY_IPV4_SRC] || tb[TCA_FLOWER_KEY_IPV4_DST]) {
+		key->control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
 		fl_set_key_val(tb, &key->ipv4.src, TCA_FLOWER_KEY_IPV4_SRC,
 			       &mask->ipv4.src, TCA_FLOWER_KEY_IPV4_SRC_MASK,
 			       sizeof(key->ipv4.src));
 		fl_set_key_val(tb, &key->ipv4.dst, TCA_FLOWER_KEY_IPV4_DST,
 			       &mask->ipv4.dst, TCA_FLOWER_KEY_IPV4_DST_MASK,
 			       sizeof(key->ipv4.dst));
-	} else if (key->control.addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
+	} else if (tb[TCA_FLOWER_KEY_IPV6_SRC] || tb[TCA_FLOWER_KEY_IPV6_DST]) {
+		key->control.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
 		fl_set_key_val(tb, &key->ipv6.src, TCA_FLOWER_KEY_IPV6_SRC,
 			       &mask->ipv6.src, TCA_FLOWER_KEY_IPV6_SRC_MASK,
 			       sizeof(key->ipv6.src));
@@ -276,6 +303,7 @@ static int fl_set_key(struct net *net, struct nlattr **tb,
 			       &mask->ipv6.dst, TCA_FLOWER_KEY_IPV6_DST_MASK,
 			       sizeof(key->ipv6.dst));
 	}
+
 	if (key->basic.ip_proto == IPPROTO_TCP) {
 		fl_set_key_val(tb, &key->tp.src, TCA_FLOWER_KEY_TCP_SRC,
 			       &mask->tp.src, TCA_FLOWER_UNSPEC,
@@ -323,12 +351,10 @@ static int fl_init_hashtable(struct cls_fl_head *head,
 
 #define FL_KEY_MEMBER_OFFSET(member) offsetof(struct fl_flow_key, member)
 #define FL_KEY_MEMBER_SIZE(member) (sizeof(((struct fl_flow_key *) 0)->member))
-#define FL_KEY_MEMBER_END_OFFSET(member)					\
-	(FL_KEY_MEMBER_OFFSET(member) + FL_KEY_MEMBER_SIZE(member))
 
-#define FL_KEY_IN_RANGE(mask, member)						\
-        (FL_KEY_MEMBER_OFFSET(member) <= (mask)->range.end &&			\
-         FL_KEY_MEMBER_END_OFFSET(member) >= (mask)->range.start)
+#define FL_KEY_IS_MASKED(mask, member)						\
+	memchr_inv(((char *)mask) + FL_KEY_MEMBER_OFFSET(member),		\
+		   0, FL_KEY_MEMBER_SIZE(member))				\
 
 #define FL_KEY_SET(keys, cnt, id, member)					\
 	do {									\
@@ -337,9 +363,9 @@ static int fl_init_hashtable(struct cls_fl_head *head,
 		cnt++;								\
 	} while(0);
 
-#define FL_KEY_SET_IF_IN_RANGE(mask, keys, cnt, id, member)			\
+#define FL_KEY_SET_IF_MASKED(mask, keys, cnt, id, member)			\
 	do {									\
-		if (FL_KEY_IN_RANGE(mask, member))				\
+		if (FL_KEY_IS_MASKED(mask, member))				\
 			FL_KEY_SET(keys, cnt, id, member);			\
 	} while(0);
 
@@ -351,14 +377,14 @@ static void fl_init_dissector(struct cls_fl_head *head,
 
 	FL_KEY_SET(keys, cnt, FLOW_DISSECTOR_KEY_CONTROL, control);
 	FL_KEY_SET(keys, cnt, FLOW_DISSECTOR_KEY_BASIC, basic);
-	FL_KEY_SET_IF_IN_RANGE(mask, keys, cnt,
-			       FLOW_DISSECTOR_KEY_ETH_ADDRS, eth);
-	FL_KEY_SET_IF_IN_RANGE(mask, keys, cnt,
-			       FLOW_DISSECTOR_KEY_IPV4_ADDRS, ipv4);
-	FL_KEY_SET_IF_IN_RANGE(mask, keys, cnt,
-			       FLOW_DISSECTOR_KEY_IPV6_ADDRS, ipv6);
-	FL_KEY_SET_IF_IN_RANGE(mask, keys, cnt,
-			       FLOW_DISSECTOR_KEY_PORTS, tp);
+	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+			     FLOW_DISSECTOR_KEY_ETH_ADDRS, eth);
+	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+			     FLOW_DISSECTOR_KEY_IPV4_ADDRS, ipv4);
+	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+			     FLOW_DISSECTOR_KEY_IPV6_ADDRS, ipv6);
+	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+			     FLOW_DISSECTOR_KEY_PORTS, tp);
 
 	skb_flow_dissector_init(&head->dissector, keys, cnt);
 }

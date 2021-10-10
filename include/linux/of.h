@@ -126,6 +126,8 @@ extern raw_spinlock_t devtree_lock;
 #define OF_POPULATED	3 /* device already created for the node */
 #define OF_POPULATED_BUS	4 /* of_platform_populate recursed to children of this node */
 
+#define OF_BAD_ADDR	((u64)-1)
+
 #ifdef CONFIG_OF
 void of_core_init(void);
 
@@ -136,7 +138,8 @@ static inline bool is_of_node(struct fwnode_handle *fwnode)
 
 static inline struct device_node *to_of_node(struct fwnode_handle *fwnode)
 {
-	return fwnode ? container_of(fwnode, struct device_node, fwnode) : NULL;
+	return is_of_node(fwnode) ?
+		container_of(fwnode, struct device_node, fwnode) : NULL;
 }
 
 static inline bool of_have_populated_dt(void)
@@ -196,8 +199,8 @@ extern struct device_node *of_find_all_nodes(struct device_node *prev);
 static inline u64 of_read_number(const __be32 *cell, int size)
 {
 	u64 r = 0;
-	while (size--)
-		r = (r << 32) | be32_to_cpu(*(cell++));
+	for (; size--; cell++)
+		r = (r << 32) | be32_to_cpu(*cell);
 	return r;
 }
 
@@ -227,8 +230,6 @@ static inline unsigned long of_read_ulong(const __be32 *cell, int size)
 
 #define OF_IS_DYNAMIC(x) test_bit(OF_DYNAMIC, &x->_flags)
 #define OF_MARK_DYNAMIC(x) set_bit(OF_DYNAMIC, &x->_flags)
-
-#define OF_BAD_ADDR	((u64)-1)
 
 static inline const char *of_node_full_name(const struct device_node *np)
 {
@@ -264,6 +265,8 @@ extern struct device_node *of_get_next_child(const struct device_node *node,
 extern struct device_node *of_get_next_available_child(
 	const struct device_node *node, struct device_node *prev);
 
+extern struct device_node *of_get_compatible_child(const struct device_node *parent,
+					const char *compatible);
 extern struct device_node *of_get_child_by_name(const struct device_node *node,
 					const char *name);
 
@@ -459,6 +462,12 @@ static inline struct device_node *of_find_node_with_property(
 static inline bool of_have_populated_dt(void)
 {
 	return false;
+}
+
+static inline struct device_node *of_get_compatible_child(const struct device_node *parent,
+					const char *compatible)
+{
+	return NULL;
 }
 
 static inline struct device_node *of_get_child_by_name(
@@ -681,6 +690,15 @@ extern int of_node_to_nid(struct device_node *np);
 static inline int of_node_to_nid(struct device_node *device)
 {
 	return NUMA_NO_NODE;
+}
+#endif
+
+#ifdef CONFIG_OF_NUMA
+extern int of_numa_init(void);
+#else
+static inline int of_numa_init(void)
+{
+	return -ENOSYS;
 }
 #endif
 
@@ -932,6 +950,7 @@ static inline int of_get_available_child_count(const struct device_node *np)
 #define _OF_DECLARE(table, name, compat, fn, fn_type)			\
 	static const struct of_device_id __of_table_##name		\
 		__used __section(__##table##_of_table)			\
+		__aligned(__alignof__(struct of_device_id))		\
 		 = { .compatible = compat,				\
 		     .data = (fn == (fn_type)NULL) ? fn : fn  }
 #else

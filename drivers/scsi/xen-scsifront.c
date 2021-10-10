@@ -377,7 +377,6 @@ static int map_data_for_request(struct vscsifrnt_info *info,
 	unsigned int data_len = scsi_bufflen(sc);
 	unsigned int data_grants = 0, seg_grants = 0;
 	struct scatterlist *sg;
-	unsigned long mfn;
 	struct scsiif_request_segment *seg;
 
 	ring_req->nr_segments = 0;
@@ -420,9 +419,9 @@ static int map_data_for_request(struct vscsifrnt_info *info,
 			ref = gnttab_claim_grant_reference(&gref_head);
 			BUG_ON(ref == -ENOSPC);
 
-			mfn = pfn_to_mfn(page_to_pfn(page));
 			gnttab_grant_foreign_access_ref(ref,
-				info->dev->otherend_id, mfn, 1);
+				info->dev->otherend_id,
+				xen_page_to_gfn(page), 1);
 			shadow->gref[ref_cnt] = ref;
 			ring_req->seg[ref_cnt].gref   = ref;
 			ring_req->seg[ref_cnt].offset = (uint16_t)off;
@@ -454,9 +453,10 @@ static int map_data_for_request(struct vscsifrnt_info *info,
 			ref = gnttab_claim_grant_reference(&gref_head);
 			BUG_ON(ref == -ENOSPC);
 
-			mfn = pfn_to_mfn(page_to_pfn(page));
 			gnttab_grant_foreign_access_ref(ref,
-				info->dev->otherend_id, mfn, grant_ro);
+				info->dev->otherend_id,
+				xen_page_to_gfn(page),
+				grant_ro);
 
 			shadow->gref[ref_cnt] = ref;
 			seg->gref   = ref;
@@ -676,10 +676,17 @@ static int scsifront_dev_reset_handler(struct scsi_cmnd *sc)
 static int scsifront_sdev_configure(struct scsi_device *sdev)
 {
 	struct vscsifrnt_info *info = shost_priv(sdev->host);
+	int err;
 
-	if (info && current == info->curr)
-		xenbus_printf(XBT_NIL, info->dev->nodename,
+	if (info && current == info->curr) {
+		err = xenbus_printf(XBT_NIL, info->dev->nodename,
 			      info->dev_state_path, "%d", XenbusStateConnected);
+		if (err) {
+			xenbus_dev_error(info->dev, err,
+				"%s: writing dev_state_path", __func__);
+			return err;
+		}
+	}
 
 	return 0;
 }
@@ -687,10 +694,15 @@ static int scsifront_sdev_configure(struct scsi_device *sdev)
 static void scsifront_sdev_destroy(struct scsi_device *sdev)
 {
 	struct vscsifrnt_info *info = shost_priv(sdev->host);
+	int err;
 
-	if (info && current == info->curr)
-		xenbus_printf(XBT_NIL, info->dev->nodename,
+	if (info && current == info->curr) {
+		err = xenbus_printf(XBT_NIL, info->dev->nodename,
 			      info->dev_state_path, "%d", XenbusStateClosed);
+		if (err)
+			xenbus_dev_error(info->dev, err,
+				"%s: writing dev_state_path", __func__);
+	}
 }
 
 static struct scsi_host_template scsifront_sht = {
@@ -1025,9 +1037,12 @@ static void scsifront_do_lun_hotplug(struct vscsifrnt_info *info, int op)
 
 			if (scsi_add_device(info->host, chn, tgt, lun)) {
 				dev_err(&dev->dev, "scsi_add_device\n");
-				xenbus_printf(XBT_NIL, dev->nodename,
+				err = xenbus_printf(XBT_NIL, dev->nodename,
 					      info->dev_state_path,
 					      "%d", XenbusStateClosed);
+				if (err)
+					xenbus_dev_error(dev, err,
+						"%s: writing dev_state_path", __func__);
 			}
 			break;
 		case VSCSIFRONT_OP_DEL_LUN:
@@ -1041,10 +1056,14 @@ static void scsifront_do_lun_hotplug(struct vscsifrnt_info *info, int op)
 			}
 			break;
 		case VSCSIFRONT_OP_READD_LUN:
-			if (device_state == XenbusStateConnected)
-				xenbus_printf(XBT_NIL, dev->nodename,
+			if (device_state == XenbusStateConnected) {
+				err = xenbus_printf(XBT_NIL, dev->nodename,
 					      info->dev_state_path,
 					      "%d", XenbusStateConnected);
+				if (err)
+					xenbus_dev_error(dev, err,
+						"%s: writing dev_state_path", __func__);
+			}
 			break;
 		default:
 			break;

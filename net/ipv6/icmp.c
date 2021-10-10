@@ -68,6 +68,7 @@
 #include <net/xfrm.h>
 #include <net/inet_common.h>
 #include <net/dsfield.h>
+#include <net/l3mdev.h>
 
 #include <asm/uaccess.h>
 
@@ -97,7 +98,7 @@ static void icmpv6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 
 	if (!(type & ICMPV6_INFOMSG_MASK))
 		if (icmp6->icmp6_type == ICMPV6_ECHO_REQUEST)
-			ping_err(skb, offset, info);
+			ping_err(skb, offset, ntohl(info));
 }
 
 static int icmpv6_rcv(struct sk_buff *skb);
@@ -329,7 +330,7 @@ static struct dst_entry *icmpv6_route_lookup(struct net *net,
 	struct flowi6 fl2;
 	int err;
 
-	err = ip6_dst_lookup(sk, &dst, fl6);
+	err = ip6_dst_lookup(net, sk, &dst, fl6);
 	if (err)
 		return ERR_PTR(err);
 
@@ -361,7 +362,7 @@ static struct dst_entry *icmpv6_route_lookup(struct net *net,
 	if (err)
 		goto relookup_failed;
 
-	err = ip6_dst_lookup(sk, &dst2, &fl2);
+	err = ip6_dst_lookup(net, sk, &dst2, &fl2);
 	if (err)
 		goto relookup_failed;
 
@@ -444,6 +445,10 @@ static void icmp6_send(struct sk_buff *skb, u8 type, u8 code, __u32 info)
 
 	if (__ipv6_addr_needs_scope_id(addr_type))
 		iif = skb->dev->ifindex;
+	else {
+		dst = skb_dst(skb);
+		iif = l3mdev_master_ifindex(dst ? dst->dev : skb->dev);
+	}
 
 	/*
 	 *	Must not send error if the source does not uniquely
@@ -452,7 +457,8 @@ static void icmp6_send(struct sk_buff *skb, u8 type, u8 code, __u32 info)
 	 *	and anycast addresses will be checked later.
 	 */
 	if ((addr_type == IPV6_ADDR_ANY) || (addr_type & IPV6_ADDR_MULTICAST)) {
-		net_dbg_ratelimited("icmp6_send: addr_any/mcast source\n");
+		net_dbg_ratelimited("icmp6_send: addr_any/mcast source [%pI6c > %pI6c]\n",
+				    &hdr->saddr, &hdr->daddr);
 		return;
 	}
 
@@ -460,7 +466,8 @@ static void icmp6_send(struct sk_buff *skb, u8 type, u8 code, __u32 info)
 	 *	Never answer to a ICMP packet.
 	 */
 	if (is_ineligible(skb)) {
-		net_dbg_ratelimited("icmp6_send: no reply to icmp error\n");
+		net_dbg_ratelimited("icmp6_send: no reply to icmp error [%pI6c > %pI6c]\n",
+				    &hdr->saddr, &hdr->daddr);
 		return;
 	}
 
@@ -509,7 +516,8 @@ static void icmp6_send(struct sk_buff *skb, u8 type, u8 code, __u32 info)
 	len = skb->len - msg.offset;
 	len = min_t(unsigned int, len, IPV6_MIN_MTU - sizeof(struct ipv6hdr) - sizeof(struct icmp6hdr));
 	if (len < 0) {
-		net_dbg_ratelimited("icmp: len problem\n");
+		net_dbg_ratelimited("icmp: len problem [%pI6c > %pI6c]\n",
+				    &hdr->saddr, &hdr->daddr);
 		goto out_dst_release;
 	}
 
@@ -575,7 +583,7 @@ static void icmpv6_echo_reply(struct sk_buff *skb)
 	fl6.daddr = ipv6_hdr(skb)->saddr;
 	if (saddr)
 		fl6.saddr = *saddr;
-	fl6.flowi6_oif = skb->dev->ifindex;
+	fl6.flowi6_oif = l3mdev_fib_oif(skb->dev);
 	fl6.fl6_icmp_type = ICMPV6_ECHO_REPLY;
 	fl6.flowi6_mark = mark;
 	security_skb_classify_flow(skb, flowi6_to_flowi(&fl6));
@@ -591,7 +599,7 @@ static void icmpv6_echo_reply(struct sk_buff *skb)
 	else if (!fl6.flowi6_oif)
 		fl6.flowi6_oif = np->ucast_oif;
 
-	err = ip6_dst_lookup(sk, &dst, &fl6);
+	err = ip6_dst_lookup(net, sk, &dst, &fl6);
 	if (err)
 		goto out;
 	dst = xfrm_lookup(net, dst, flowi6_to_flowi(&fl6), sk, 0);
@@ -781,7 +789,8 @@ static int icmpv6_rcv(struct sk_buff *skb)
 		if (type & ICMPV6_INFOMSG_MASK)
 			break;
 
-		net_dbg_ratelimited("icmpv6: msg of unknown type\n");
+		net_dbg_ratelimited("icmpv6: msg of unknown type [%pI6c > %pI6c]\n",
+				    saddr, daddr);
 
 		/*
 		 * error of unknown type.
@@ -826,11 +835,6 @@ void icmpv6_flow_init(struct sock *sk, struct flowi6 *fl6,
 	security_sk_classify_flow(sk, flowi6_to_flowi(fl6));
 }
 
-/*
- * Special lock-class for __icmpv6_sk:
- */
-static struct lock_class_key icmpv6_socket_sk_dst_lock_key;
-
 static int __net_init icmpv6_sk_init(struct net *net)
 {
 	struct sock *sk;
@@ -851,15 +855,6 @@ static int __net_init icmpv6_sk_init(struct net *net)
 		}
 
 		net->ipv6.icmp_sk[i] = sk;
-
-		/*
-		 * Split off their lock-class, because sk->sk_dst_lock
-		 * gets used from softirqs, which is safe for
-		 * __icmpv6_sk (because those never get directly used
-		 * via userspace syscalls), but unsafe for normal sockets.
-		 */
-		lockdep_set_class(&sk->sk_dst_lock,
-				  &icmpv6_socket_sk_dst_lock_key);
 
 		/* Enough space for 2 64K ICMP packets, including
 		 * sk_buff struct overhead.

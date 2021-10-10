@@ -79,7 +79,10 @@ struct packet_fanout {
 	u16			id;
 	u8			type;
 	u8			flags;
-	atomic_t		rr_cur;
+	union {
+		atomic_t		rr_cur;
+		struct bpf_prog __rcu	*bpf_prog;
+	};
 	struct list_head	list;
 	struct sock		*arr[PACKET_FANOUT_MAX];
 	spinlock_t		lock;
@@ -89,7 +92,6 @@ struct packet_fanout {
 
 struct packet_rollover {
 	int			sock;
-	struct rcu_head		rcu;
 	atomic_long_t		num;
 	atomic_long_t		num_huge;
 	atomic_long_t		num_failed;
@@ -107,10 +109,12 @@ struct packet_sock {
 	int			copy_thresh;
 	spinlock_t		bind_lock;
 	struct mutex		pg_vec_lock;
-	unsigned int		running:1,	/* prot_hook is attached*/
-				auxdata:1,
+	unsigned int		running;	/* bind_lock must be held */
+	unsigned int		auxdata:1,	/* writer must hold sock lock */
 				origdev:1,
-				has_vnet_hdr:1;
+				has_vnet_hdr:1,
+				tp_loss:1,
+				tp_tx_has_off:1;
 	int			pressure;
 	int			ifindex;	/* bound device		*/
 	__be16			num;
@@ -120,8 +124,6 @@ struct packet_sock {
 	enum tpacket_versions	tp_version;
 	unsigned int		tp_hdrlen;
 	unsigned int		tp_reserve;
-	unsigned int		tp_loss:1;
-	unsigned int		tp_tx_has_off:1;
 	unsigned int		tp_tstamp;
 	struct net_device __rcu	*cached_dev;
 	int			(*xmit)(struct sk_buff *skb);

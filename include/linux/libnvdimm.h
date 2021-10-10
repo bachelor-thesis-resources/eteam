@@ -31,6 +31,9 @@ enum {
 	ND_CMD_ARS_STATUS_MAX = SZ_4K,
 	ND_MAX_MAPPINGS = 32,
 
+	/* region flag indicating to direct-map persistent memory by default */
+	ND_REGION_PAGEMAP = 0,
+
 	/* mark newly adjusted resources as requiring a label update */
 	DPA_RESOURCE_ADJUSTED = 1 << 0,
 };
@@ -80,6 +83,8 @@ struct nd_cmd_desc {
 
 struct nd_interleave_set {
 	u64 cookie;
+	/* compatibility with initial buggy Linux implementation */
+	u64 altcookie;
 };
 
 struct nd_region_desc {
@@ -91,6 +96,7 @@ struct nd_region_desc {
 	void *provider_data;
 	int num_lanes;
 	int numa_node;
+	unsigned long flags;
 };
 
 struct nvdimm_bus;

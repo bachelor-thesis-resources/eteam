@@ -101,7 +101,7 @@
 #define AD7795_CH_AIN1M_AIN1M	8 /* AIN1(-) - AIN1(-) */
 
 /* ID Register Bit Designations (AD7793_REG_ID) */
-#define AD7785_ID		0xB
+#define AD7785_ID		0x3
 #define AD7792_ID		0xA
 #define AD7793_ID		0xB
 #define AD7794_ID		0xF
@@ -257,7 +257,7 @@ static int ad7793_setup(struct iio_dev *indio_dev,
 	unsigned int vref_mv)
 {
 	struct ad7793_state *st = iio_priv(indio_dev);
-	int i, ret = -1;
+	int i, ret;
 	unsigned long long scale_uv;
 	u32 id;
 
@@ -266,7 +266,7 @@ static int ad7793_setup(struct iio_dev *indio_dev,
 		return ret;
 
 	/* reset the serial interface */
-	ret = spi_write(st->sd.spi, (u8 *)&ret, sizeof(ret));
+	ret = ad_sd_reset(&st->sd, 32);
 	if (ret < 0)
 		goto out;
 	usleep_range(500, 2000); /* Wait for at least 500us */
@@ -579,7 +579,7 @@ static const struct iio_info ad7797_info = {
 	.read_raw = &ad7793_read_raw,
 	.write_raw = &ad7793_write_raw,
 	.write_raw_get_fmt = &ad7793_write_raw_get_fmt,
-	.attrs = &ad7793_attribute_group,
+	.attrs = &ad7797_attribute_group,
 	.validate_trigger = ad_sd_validate_trigger,
 	.driver_module = THIS_MODULE,
 };
@@ -852,7 +852,6 @@ MODULE_DEVICE_TABLE(spi, ad7793_id);
 static struct spi_driver ad7793_driver = {
 	.driver = {
 		.name	= "ad7793",
-		.owner	= THIS_MODULE,
 	},
 	.probe		= ad7793_probe,
 	.remove		= ad7793_remove,

@@ -318,7 +318,7 @@ struct wl1271 {
 	bool watchdog_recovery;
 
 	/* Reg domain last configuration */
-	u32 reg_ch_conf_last[2];
+	u32 reg_ch_conf_last[2]  __aligned(8);
 	/* Reg domain pending configuration */
 	u32 reg_ch_conf_pending[2];
 
@@ -500,6 +500,9 @@ struct wl1271 {
 	/* interface combinations supported by the hw */
 	const struct ieee80211_iface_combination *iface_combinations;
 	u8 n_iface_combinations;
+
+	/* dynamic fw traces */
+	u32 dynamic_fw_traces;
 };
 
 int wlcore_probe(struct wl1271 *wl, struct platform_device *pdev);
@@ -552,9 +555,6 @@ wlcore_set_min_fw_ver(struct wl1271 *wl, unsigned int chip,
 
 /* Each RX/TX transaction requires an end-of-transaction transfer */
 #define WLCORE_QUIRK_END_OF_TRANSACTION		BIT(0)
-
-/* the first start_role(sta) sometimes doesn't work on wl12xx */
-#define WLCORE_QUIRK_START_STA_FAILS		BIT(1)
 
 /* wl127x and SPI don't support SDIO block size alignment */
 #define WLCORE_QUIRK_TX_BLOCKSIZE_ALIGN		BIT(2)

@@ -28,8 +28,6 @@ struct mem_cgroup;
 		IS_ENABLED(CONFIG_ARCH_ENABLE_SPLIT_PMD_PTLOCK))
 #define ALLOC_SPLIT_PTLOCKS	(SPINLOCK_SIZE > BITS_PER_LONG/8)
 
-typedef void compound_page_dtor(struct page *);
-
 /*
  * Each physical page in the system has a struct page associated with
  * it to keep track of whatever it is we are using the page for at the
@@ -113,7 +111,13 @@ struct page {
 		};
 	};
 
-	/* Third double word block */
+	/*
+	 * Third double word block
+	 *
+	 * WARNING: bit 0 of the first word encode PageTail(). That means
+	 * the rest users of the storage space MUST NOT use the bit to
+	 * avoid collision and false-positive PageTail().
+	 */
 	union {
 		struct list_head lru;	/* Pageout list, eg. active_list
 					 * protected by zone->lru_lock !
@@ -131,18 +135,37 @@ struct page {
 #endif
 		};
 
-		struct slab *slab_page; /* slab fields */
 		struct rcu_head rcu_head;	/* Used by SLAB
 						 * when destroying via RCU
 						 */
-		/* First tail page of compound page */
+		/* Tail pages of compound page */
 		struct {
-			compound_page_dtor *compound_dtor;
-			unsigned long compound_order;
+			unsigned long compound_head; /* If bit zero is set */
+
+			/* First tail page only */
+#ifdef CONFIG_64BIT
+			/*
+			 * On 64 bit system we have enough space in struct page
+			 * to encode compound_dtor and compound_order with
+			 * unsigned int. It can help compiler generate better or
+			 * smaller code on some archtectures.
+			 */
+			unsigned int compound_dtor;
+			unsigned int compound_order;
+#else
+			unsigned short int compound_dtor;
+			unsigned short int compound_order;
+#endif
 		};
 
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && USE_SPLIT_PMD_PTLOCKS
-		pgtable_t pmd_huge_pte; /* protected by page->ptl */
+		struct {
+			unsigned long __pad;	/* do not overlay pmd_huge_pte
+						 * with compound_head to avoid
+						 * possible bit 0 collision.
+						 */
+			pgtable_t pmd_huge_pte; /* protected by page->ptl */
+		};
 #endif
 	};
 
@@ -163,7 +186,6 @@ struct page {
 #endif
 #endif
 		struct kmem_cache *slab_cache;	/* SL[AU]B: Pointer to slab */
-		struct page *first_page;	/* Compound tail pages */
 	};
 
 #ifdef CONFIG_MEMCG
@@ -235,7 +257,7 @@ struct page_frag_cache {
 	bool pfmemalloc;
 };
 
-typedef unsigned long __nocast vm_flags_t;
+typedef unsigned long vm_flags_t;
 
 /*
  * A region containing a mapping of a non-memory backed file under NOMMU
@@ -250,11 +272,22 @@ struct vm_region {
 	unsigned long	vm_top;		/* region allocated to here */
 	unsigned long	vm_pgoff;	/* the offset in vm_file corresponding to vm_start */
 	struct file	*vm_file;	/* the backing file or NULL */
+	struct file	*vm_prfile;	/* the virtual backing file or NULL */
 
 	int		vm_usage;	/* region usage count (access under nommu_region_sem) */
 	bool		vm_icache_flushed : 1; /* true if the icache has been flushed for
 						* this region */
 };
+
+#ifdef CONFIG_USERFAULTFD
+#define NULL_VM_UFFD_CTX ((struct vm_userfaultfd_ctx) { NULL, })
+struct vm_userfaultfd_ctx {
+	struct userfaultfd_ctx *ctx;
+};
+#else /* CONFIG_USERFAULTFD */
+#define NULL_VM_UFFD_CTX ((struct vm_userfaultfd_ctx) {})
+struct vm_userfaultfd_ctx {};
+#endif /* CONFIG_USERFAULTFD */
 
 /*
  * This struct defines a memory VMM memory area. There is one of these
@@ -314,6 +347,7 @@ struct vm_area_struct {
 	unsigned long vm_pgoff;		/* Offset (within vm_file) in PAGE_SIZE
 					   units, *not* PAGE_CACHE_SIZE */
 	struct file * vm_file;		/* File we map to (can be NULL). */
+	struct file *vm_prfile;		/* shadow of vm_file */
 	void * vm_private_data;		/* was vm_pte (shared mem) */
 
 #ifndef CONFIG_MMU
@@ -322,6 +356,7 @@ struct vm_area_struct {
 #ifdef CONFIG_NUMA
 	struct mempolicy *vm_policy;	/* NUMA policy for the VMA */
 #endif
+	struct vm_userfaultfd_ctx vm_userfaultfd_ctx;
 };
 
 struct core_thread {
@@ -359,7 +394,7 @@ struct kioctx_table;
 struct mm_struct {
 	struct vm_area_struct *mmap;		/* list of VMAs */
 	struct rb_root mm_rb;
-	u32 vmacache_seqnum;                   /* per-thread vmacache */
+	u64 vmacache_seqnum;                   /* per-thread vmacache */
 #ifdef CONFIG_MMU
 	unsigned long (*get_unmapped_area) (struct file *filp,
 				unsigned long addr, unsigned long len,
@@ -436,6 +471,7 @@ struct mm_struct {
 	 */
 	struct task_struct __rcu *owner;
 #endif
+	struct user_namespace *user_ns;
 
 	/* store ref to file /proc/<pid>/exe symlink points to */
 	struct file __rcu *exe_file;
@@ -470,10 +506,17 @@ struct mm_struct {
 	 */
 	bool tlb_flush_pending;
 #endif
+#ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+	/* See flush_tlb_batched_pending() */
+	bool tlb_flush_batched;
+#endif
 	struct uprobes_state uprobes_state;
 #ifdef CONFIG_X86_INTEL_MPX
 	/* address of the bounds directory */
 	void __user *bd_addr;
+#endif
+#ifdef CONFIG_HUGETLB_PAGE
+	atomic_long_t hugetlb_usage;
 #endif
 };
 
@@ -543,6 +586,7 @@ enum tlb_flush_reason {
 	TLB_REMOTE_SHOOTDOWN,
 	TLB_LOCAL_SHOOTDOWN,
 	TLB_LOCAL_MM_SHOOTDOWN,
+	TLB_REMOTE_SEND_IPI,
 	NR_TLB_FLUSH_REASONS,
 };
 

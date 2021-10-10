@@ -331,6 +331,8 @@ static int drbd_thread_setup(void *arg)
 		 thi->name[0],
 		 resource->name);
 
+	allow_kernel_signal(DRBD_SIGKILL);
+	allow_kernel_signal(SIGXCPU);
 restart:
 	retval = thi->function(thi);
 
@@ -792,7 +794,6 @@ int __drbd_send_protocol(struct drbd_connection *connection, enum drbd_packet cm
 
 	if (nc->tentative && connection->agreed_pro_version < 92) {
 		rcu_read_unlock();
-		mutex_unlock(&sock->mutex);
 		drbd_err(connection, "--dry-run is not supported by peer");
 		return -EOPNOTSUPP;
 	}
@@ -1802,7 +1803,7 @@ int drbd_send(struct drbd_connection *connection, struct socket *sock,
  * do we need to block DRBD_SIG if sock == &meta.socket ??
  * otherwise wake_asender() might interrupt some send_*Ack !
  */
-		rv = kernel_sendmsg(sock, &msg, &iov, 1, size);
+		rv = kernel_sendmsg(sock, &msg, &iov, 1, iov.iov_len);
 		if (rv == -EAGAIN) {
 			if (we_should_drop_the_connection(connection, sock))
 				break;
@@ -2393,7 +2394,7 @@ static int drbd_congested(void *congested_data, int bdi_bits)
 
 	if (get_ldev(device)) {
 		q = bdev_get_queue(device->ldev->backing_bdev);
-		r = bdi_congested(&q->backing_dev_info, bdi_bits);
+		r = bdi_congested(q->backing_dev_info, bdi_bits);
 		put_ldev(device);
 		if (r)
 			reason = 'b';
@@ -2765,8 +2766,8 @@ enum drbd_ret_code drbd_create_device(struct drbd_config_context *adm_ctx, unsig
 	/* we have no partitions. we contain only ourselves. */
 	device->this_bdev->bd_contains = device->this_bdev;
 
-	q->backing_dev_info.congested_fn = drbd_congested;
-	q->backing_dev_info.congested_data = device;
+	q->backing_dev_info->congested_fn = drbd_congested;
+	q->backing_dev_info->congested_data = device;
 
 	blk_queue_make_request(q, drbd_make_request);
 	blk_queue_flush(q, REQ_FLUSH | REQ_FUA);
@@ -2774,7 +2775,6 @@ enum drbd_ret_code drbd_create_device(struct drbd_config_context *adm_ctx, unsig
 	   This triggers a max_bio_size message upon first attach or connect */
 	blk_queue_max_hw_sectors(q, DRBD_MAX_BIO_SIZE_SAFE >> 8);
 	blk_queue_bounce_limit(q, BLK_BOUNCE_ANY);
-	blk_queue_merge_bvec(q, drbd_merge_bvec);
 	q->queue_lock = &resource->req_lock;
 
 	device->md_io.page = alloc_page(GFP_KERNEL);

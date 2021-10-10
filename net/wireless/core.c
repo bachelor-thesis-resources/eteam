@@ -94,6 +94,9 @@ static int cfg80211_dev_check_name(struct cfg80211_registered_device *rdev,
 
 	ASSERT_RTNL();
 
+	if (strlen(newname) > NL80211_WIPHY_NAME_MAXLEN)
+		return -EINVAL;
+
 	/* prohibit calling the thing phy%d when %d is not its number */
 	sscanf(newname, PHY_NAME "%d%n", &wiphy_idx, &taken);
 	if (taken == strlen(newname) && wiphy_idx != rdev->wiphy_idx) {
@@ -390,6 +393,8 @@ struct wiphy *wiphy_new_nm(const struct cfg80211_ops *ops, int sizeof_priv,
 		if (rv)
 			goto use_default_name;
 	} else {
+		int rv;
+
 use_default_name:
 		/* NOTE:  This is *probably* safe w/out holding rtnl because of
 		 * the restrictions on phy names.  Probably this call could
@@ -397,7 +402,11 @@ use_default_name:
 		 * phyX.  But, might should add some locking and check return
 		 * value, and use a different name if this one exists?
 		 */
-		dev_set_name(&rdev->wiphy.dev, PHY_NAME "%d", rdev->wiphy_idx);
+		rv = dev_set_name(&rdev->wiphy.dev, PHY_NAME "%d", rdev->wiphy_idx);
+		if (rv < 0) {
+			kfree(rdev);
+			return NULL;
+		}
 	}
 
 	INIT_LIST_HEAD(&rdev->wdev_list);
@@ -407,6 +416,9 @@ use_default_name:
 	INIT_LIST_HEAD(&rdev->bss_list);
 	INIT_WORK(&rdev->scan_done_wk, __cfg80211_scan_done);
 	INIT_WORK(&rdev->sched_scan_results_wk, __cfg80211_sched_scan_results);
+	INIT_LIST_HEAD(&rdev->mlme_unreg);
+	spin_lock_init(&rdev->mlme_unreg_lock);
+	INIT_WORK(&rdev->mlme_unreg_wk, cfg80211_mlme_unreg_wk);
 	INIT_DELAYED_WORK(&rdev->dfs_update_channels_wk,
 			  cfg80211_dfs_channels_update_work);
 #ifdef CONFIG_CFG80211_WEXT
@@ -416,6 +428,7 @@ use_default_name:
 	device_initialize(&rdev->wiphy.dev);
 	rdev->wiphy.dev.class = &ieee80211_class;
 	rdev->wiphy.dev.platform_data = rdev;
+	device_enable_async_suspend(&rdev->wiphy.dev);
 
 	INIT_LIST_HEAD(&rdev->destroy_list);
 	spin_lock_init(&rdev->destroy_list_lock);
@@ -434,7 +447,7 @@ use_default_name:
 				   &rdev->rfkill_ops, rdev);
 
 	if (!rdev->rfkill) {
-		kfree(rdev);
+		wiphy_free(&rdev->wiphy);
 		return NULL;
 	}
 
@@ -456,6 +469,9 @@ use_default_name:
 	rdev->wiphy.coverage_class = 0;
 
 	rdev->wiphy.max_num_csa_counters = 1;
+
+	rdev->wiphy.max_sched_scan_plans = 1;
+	rdev->wiphy.max_sched_scan_plan_interval = U32_MAX;
 
 	return &rdev->wiphy;
 }
@@ -632,7 +648,7 @@ int wiphy_register(struct wiphy *wiphy)
 		if (WARN_ON(!sband->n_channels))
 			return -EINVAL;
 		/*
-		 * on 60gHz band, there are no legacy rates, so
+		 * on 60GHz band, there are no legacy rates, so
 		 * n_bitrates is 0
 		 */
 		if (WARN_ON(band != IEEE80211_BAND_60GHZ &&
@@ -802,6 +818,7 @@ void wiphy_unregister(struct wiphy *wiphy)
 	cancel_delayed_work_sync(&rdev->dfs_update_channels_wk);
 	flush_work(&rdev->destroy_work);
 	flush_work(&rdev->sched_scan_stop_wk);
+	flush_work(&rdev->mlme_unreg_wk);
 
 #ifdef CONFIG_PM
 	if (rdev->wiphy.wowlan_config && rdev->ops->set_wakeup)
@@ -855,6 +872,7 @@ void cfg80211_unregister_wdev(struct wireless_dev *wdev)
 
 	switch (wdev->iftype) {
 	case NL80211_IFTYPE_P2P_DEVICE:
+		cfg80211_mlme_purge_registrations(wdev);
 		cfg80211_stop_p2p_device(rdev, wdev);
 		break;
 	default:
@@ -1137,6 +1155,8 @@ static int cfg80211_netdev_notifier_call(struct notifier_block *nb,
 	default:
 		return NOTIFY_DONE;
 	}
+
+	wireless_nlevent_flush();
 
 	return NOTIFY_OK;
 }

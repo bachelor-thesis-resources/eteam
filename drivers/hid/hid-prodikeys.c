@@ -427,7 +427,7 @@ static int pcmidi_handle_report4(struct pcmidi_snd *pm, u8 *data)
 					pm->midi_octave = 2;
 				dbg_hid("pcmidi mode: %d octave: %d\n",
 					pm->midi_mode, pm->midi_octave);
-			    continue;
+				continue;
 			} else
 				key = KEY_MESSENGER;
 			break;
@@ -556,10 +556,14 @@ static void pcmidi_setup_extra_keys(
 
 static int pcmidi_set_operational(struct pcmidi_snd *pm)
 {
+	int rc;
+
 	if (pm->ifnum != 1)
 		return 0; /* only set up ONCE for interace 1 */
 
-	pcmidi_get_output_report(pm);
+	rc = pcmidi_get_output_report(pm);
+	if (rc < 0)
+		return rc;
 	pcmidi_submit_output_report(pm, 0xc1);
 	return 0;
 }
@@ -688,14 +692,18 @@ static int pcmidi_snd_initialise(struct pcmidi_snd *pm)
 	spin_lock_init(&pm->rawmidi_in_lock);
 
 	init_sustain_timers(pm);
-	pcmidi_set_operational(pm);
+	err = pcmidi_set_operational(pm);
+	if (err < 0) {
+		pk_error("failed to find output report\n");
+		goto fail_register;
+	}
 
 	/* register it */
 	err = snd_card_register(card);
 	if (err < 0) {
 		pk_error("failed to register pc-midi sound card: error %d\n",
 			 err);
-			 goto fail_register;
+		goto fail_register;
 	}
 
 	dbg_hid("pcmidi_snd_initialise finished ok\n");

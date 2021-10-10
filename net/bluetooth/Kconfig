@@ -13,6 +13,7 @@ menuconfig BT
 	select CRYPTO_CMAC
 	select CRYPTO_ECB
 	select CRYPTO_SHA256
+	select CRYPTO_ECDH
 	help
 	  Bluetooth is low-cost, low-power, short-range wireless technology.
 	  It was designed as a replacement for cables and other short-range
@@ -52,6 +53,11 @@ source "net/bluetooth/bnep/Kconfig"
 source "net/bluetooth/cmtp/Kconfig"
 
 source "net/bluetooth/hidp/Kconfig"
+
+config BT_HS
+	bool "Bluetooth High Speed (HS) features"
+	depends on BT_BREDR
+	default y
 
 config BT_LE
 	bool "Bluetooth Low Energy (LE) features"

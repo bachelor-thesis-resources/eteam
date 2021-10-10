@@ -330,6 +330,7 @@ static inline int fnic_queue_wq_copy_desc(struct fnic *fnic,
 	int flags;
 	u8 exch_flags;
 	struct scsi_lun fc_lun;
+	int r;
 
 	if (sg_count) {
 		/* For each SGE, create a device desc entry */
@@ -346,12 +347,27 @@ static inline int fnic_queue_wq_copy_desc(struct fnic *fnic,
 			 io_req->sgl_list,
 			 sizeof(io_req->sgl_list[0]) * sg_count,
 			 PCI_DMA_TODEVICE);
+
+		r = pci_dma_mapping_error(fnic->pdev, io_req->sgl_list_pa);
+		if (r) {
+			printk(KERN_ERR "PCI mapping failed with error %d\n", r);
+			return SCSI_MLQUEUE_HOST_BUSY;
+		}
 	}
 
 	io_req->sense_buf_pa = pci_map_single(fnic->pdev,
 					      sc->sense_buffer,
 					      SCSI_SENSE_BUFFERSIZE,
 					      PCI_DMA_FROMDEVICE);
+
+	r = pci_dma_mapping_error(fnic->pdev, io_req->sense_buf_pa);
+	if (r) {
+		pci_unmap_single(fnic->pdev, io_req->sgl_list_pa,
+				sizeof(io_req->sgl_list[0]) * sg_count,
+				PCI_DMA_TODEVICE);
+		printk(KERN_ERR "PCI mapping failed with error %d\n", r);
+		return SCSI_MLQUEUE_HOST_BUSY;
+	}
 
 	int_to_scsilun(sc->device->lun, &fc_lun);
 
@@ -428,6 +444,9 @@ static int fnic_queuecommand_lck(struct scsi_cmnd *sc, void (*done)(struct scsi_
 	int io_lock_acquired = 0;
 
 	if (unlikely(fnic_chk_state_flags_locked(fnic, FNIC_FLAGS_IO_BLOCKED)))
+		return SCSI_MLQUEUE_HOST_BUSY;
+
+	if (unlikely(fnic_chk_state_flags_locked(fnic, FNIC_FLAGS_FWRESET)))
 		return SCSI_MLQUEUE_HOST_BUSY;
 
 	rport = starget_to_rport(scsi_target(sc->device));
@@ -2517,6 +2536,19 @@ int fnic_host_reset(struct scsi_cmnd *sc)
 	unsigned long wait_host_tmo;
 	struct Scsi_Host *shost = sc->device->host;
 	struct fc_lport *lp = shost_priv(shost);
+	struct fnic *fnic = lport_priv(lp);
+	unsigned long flags;
+
+	spin_lock_irqsave(&fnic->fnic_lock, flags);
+	if (fnic->internal_reset_inprogress == 0) {
+		fnic->internal_reset_inprogress = 1;
+	} else {
+		spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+		FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host,
+			"host reset in progress skipping another host reset\n");
+		return SUCCESS;
+	}
+	spin_unlock_irqrestore(&fnic->fnic_lock, flags);
 
 	/*
 	 * If fnic_reset is successful, wait for fabric login to complete
@@ -2537,6 +2569,9 @@ int fnic_host_reset(struct scsi_cmnd *sc)
 		}
 	}
 
+	spin_lock_irqsave(&fnic->fnic_lock, flags);
+	fnic->internal_reset_inprogress = 0;
+	spin_unlock_irqrestore(&fnic->fnic_lock, flags);
 	return ret;
 }
 

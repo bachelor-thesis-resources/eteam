@@ -124,10 +124,12 @@ static const struct key_entry acer_wmi_keymap[] __initconst = {
 	{KE_KEY, 0x64, {KEY_SWITCHVIDEOMODE} },	/* Display Switch */
 	{KE_IGNORE, 0x81, {KEY_SLEEP} },
 	{KE_KEY, 0x82, {KEY_TOUCHPAD_TOGGLE} },	/* Touch Pad Toggle */
+	{KE_IGNORE, 0x84, {KEY_KBDILLUMTOGGLE} }, /* Automatic Keyboard background light toggle */
 	{KE_KEY, KEY_TOUCHPAD_ON, {KEY_TOUCHPAD_ON} },
 	{KE_KEY, KEY_TOUCHPAD_OFF, {KEY_TOUCHPAD_OFF} },
 	{KE_IGNORE, 0x83, {KEY_TOUCHPAD_TOGGLE} },
 	{KE_KEY, 0x85, {KEY_TOUCHPAD_TOGGLE} },
+	{KE_KEY, 0x87, {KEY_POWER} },
 	{KE_END, 0}
 };
 
@@ -228,6 +230,7 @@ static int mailled = -1;
 static int brightness = -1;
 static int threeg = -1;
 static int force_series;
+static int force_caps = -1;
 static bool ec_raw_mode;
 static bool has_type_aa;
 static u16 commun_func_bitmap;
@@ -237,11 +240,13 @@ module_param(mailled, int, 0444);
 module_param(brightness, int, 0444);
 module_param(threeg, int, 0444);
 module_param(force_series, int, 0444);
+module_param(force_caps, int, 0444);
 module_param(ec_raw_mode, bool, 0444);
 MODULE_PARM_DESC(mailled, "Set initial state of Mail LED");
 MODULE_PARM_DESC(brightness, "Set initial LCD backlight brightness");
 MODULE_PARM_DESC(threeg, "Set initial state of 3G hardware");
 MODULE_PARM_DESC(force_series, "Force a different laptop series");
+MODULE_PARM_DESC(force_caps, "Force the capability bitmask to this value");
 MODULE_PARM_DESC(ec_raw_mode, "Enable EC raw mode");
 
 struct acer_data {
@@ -807,6 +812,7 @@ static const struct acpi_device_id norfkill_ids[] __initconst = {
 	{ "IBM0068", 0},
 	{ "LEN0068", 0},
 	{ "SNY5001", 0},	/* sony-laptop in charge */
+	{ "HPQ6601", 0},
 	{ "", 0},
 };
 
@@ -1661,58 +1667,6 @@ static void acer_rfkill_exit(void)
 	return;
 }
 
-/*
- * sysfs interface
- */
-static ssize_t show_bool_threeg(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	u32 result; \
-	acpi_status status;
-
-	pr_info("This threeg sysfs will be removed in 2014 - used by: %s\n",
-		current->comm);
-	status = get_u32(&result, ACER_CAP_THREEG);
-	if (ACPI_SUCCESS(status))
-		return sprintf(buf, "%u\n", result);
-	return sprintf(buf, "Read error\n");
-}
-
-static ssize_t set_bool_threeg(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t count)
-{
-	u32 tmp = simple_strtoul(buf, NULL, 10);
-	acpi_status status = set_u32(tmp, ACER_CAP_THREEG);
-	pr_info("This threeg sysfs will be removed in 2014 - used by: %s\n",
-		current->comm);
-	if (ACPI_FAILURE(status))
-		return -EINVAL;
-	return count;
-}
-static DEVICE_ATTR(threeg, S_IRUGO | S_IWUSR, show_bool_threeg,
-	set_bool_threeg);
-
-static ssize_t show_interface(struct device *dev, struct device_attribute *attr,
-	char *buf)
-{
-	pr_info("This interface sysfs will be removed in 2014 - used by: %s\n",
-		current->comm);
-	switch (interface->type) {
-	case ACER_AMW0:
-		return sprintf(buf, "AMW0\n");
-	case ACER_AMW0_V2:
-		return sprintf(buf, "AMW0 v2\n");
-	case ACER_WMID:
-		return sprintf(buf, "WMID\n");
-	case ACER_WMID_v2:
-		return sprintf(buf, "WMID v2\n");
-	default:
-		return sprintf(buf, "Error!\n");
-	}
-}
-
-static DEVICE_ATTR(interface, S_IRUGO, show_interface, NULL);
-
 static void acer_wmi_notify(u32 value, void *context)
 {
 	struct acpi_buffer response = { ACPI_ALLOCATE_BUFFER, NULL };
@@ -1867,11 +1821,24 @@ static int __init acer_wmi_enable_lm(void)
 	return status;
 }
 
+#define ACER_WMID_ACCEL_HID	"BST0001"
+
 static acpi_status __init acer_wmi_get_handle_cb(acpi_handle ah, u32 level,
 						void *ctx, void **retval)
 {
+	struct acpi_device *dev;
+
+	if (!strcmp(ctx, "SENR")) {
+		if (acpi_bus_get_device(ah, &dev))
+			return AE_OK;
+		if (strcmp(ACER_WMID_ACCEL_HID, acpi_device_hid(dev)))
+			return AE_OK;
+	} else
+		return AE_OK;
+
 	*(acpi_handle *)retval = ah;
-	return AE_OK;
+
+	return AE_CTRL_TERMINATE;
 }
 
 static int __init acer_wmi_get_handle(const char *name, const char *prop,
@@ -1885,8 +1852,7 @@ static int __init acer_wmi_get_handle(const char *name, const char *prop,
 	handle = NULL;
 	status = acpi_get_devices(prop, acer_wmi_get_handle_cb,
 					(void *)name, &handle);
-
-	if (ACPI_SUCCESS(status)) {
+	if (ACPI_SUCCESS(status) && handle) {
 		*ah = handle;
 		return 0;
 	} else {
@@ -1898,7 +1864,7 @@ static int __init acer_wmi_accel_setup(void)
 {
 	int err;
 
-	err = acer_wmi_get_handle("SENR", "BST0001", &gsensor_handle);
+	err = acer_wmi_get_handle("SENR", ACER_WMID_ACCEL_HID, &gsensor_handle);
 	if (err)
 		return err;
 
@@ -2126,39 +2092,6 @@ static struct platform_driver acer_platform_driver = {
 
 static struct platform_device *acer_platform_device;
 
-static int remove_sysfs(struct platform_device *device)
-{
-	if (has_cap(ACER_CAP_THREEG))
-		device_remove_file(&device->dev, &dev_attr_threeg);
-
-	device_remove_file(&device->dev, &dev_attr_interface);
-
-	return 0;
-}
-
-static int __init create_sysfs(void)
-{
-	int retval = -ENOMEM;
-
-	if (has_cap(ACER_CAP_THREEG)) {
-		retval = device_create_file(&acer_platform_device->dev,
-			&dev_attr_threeg);
-		if (retval)
-			goto error_sysfs;
-	}
-
-	retval = device_create_file(&acer_platform_device->dev,
-		&dev_attr_interface);
-	if (retval)
-		goto error_sysfs;
-
-	return 0;
-
-error_sysfs:
-		remove_sysfs(acer_platform_device);
-	return retval;
-}
-
 static void remove_debugfs(void)
 {
 	debugfs_remove(interface->debug.devices);
@@ -2221,7 +2154,7 @@ static int __init acer_wmi_init(void)
 		}
 		/* WMID always provides brightness methods */
 		interface->capability |= ACER_CAP_BRIGHTNESS;
-	} else if (!wmi_has_guid(WMID_GUID2) && interface && !has_type_aa) {
+	} else if (!wmi_has_guid(WMID_GUID2) && interface && !has_type_aa && force_caps == -1) {
 		pr_err("No WMID device detection method found\n");
 		return -ENODEV;
 	}
@@ -2251,6 +2184,9 @@ static int __init acer_wmi_init(void)
 	if (acpi_video_get_backlight_type() != acpi_backlight_vendor)
 		interface->capability &= ~ACER_CAP_BRIGHTNESS;
 
+	if (force_caps != -1)
+		interface->capability = force_caps;
+
 	if (wmi_has_guid(WMID_GUID3)) {
 		if (ec_raw_mode) {
 			if (ACPI_FAILURE(acer_wmi_enable_ec_raw())) {
@@ -2269,9 +2205,10 @@ static int __init acer_wmi_init(void)
 		err = acer_wmi_input_setup();
 		if (err)
 			return err;
+		err = acer_wmi_accel_setup();
+		if (err && err != -ENODEV)
+			pr_warn("Cannot enable accelerometer\n");
 	}
-
-	acer_wmi_accel_setup();
 
 	err = platform_driver_register(&acer_platform_driver);
 	if (err) {
@@ -2289,10 +2226,6 @@ static int __init acer_wmi_init(void)
 	if (err)
 		goto error_device_add;
 
-	err = create_sysfs();
-	if (err)
-		goto error_create_sys;
-
 	if (wmi_has_guid(WMID_GUID2)) {
 		interface->debug.wmid_devices = get_wmid_devices();
 		err = create_debugfs();
@@ -2306,8 +2239,6 @@ static int __init acer_wmi_init(void)
 	return 0;
 
 error_create_debugfs:
-	remove_sysfs(acer_platform_device);
-error_create_sys:
 	platform_device_del(acer_platform_device);
 error_device_add:
 	platform_device_put(acer_platform_device);
@@ -2330,7 +2261,6 @@ static void __exit acer_wmi_exit(void)
 	if (has_cap(ACER_CAP_ACCEL))
 		acer_wmi_accel_destroy();
 
-	remove_sysfs(acer_platform_device);
 	remove_debugfs();
 	platform_device_unregister(acer_platform_device);
 	platform_driver_unregister(&acer_platform_driver);

@@ -233,6 +233,7 @@ static const struct bios_settings bios_tbl[] = {
 	{"Gateway", "LT31",   "v1.3201",  0x55, 0x58, {0x9e, 0x00}, 0},
 	{"Gateway", "LT31",   "v1.3302",  0x55, 0x58, {0x9e, 0x00}, 0},
 	{"Gateway", "LT31",   "v1.3303t", 0x55, 0x58, {0x9e, 0x00}, 0},
+	{"Gateway", "LT31",   "v1.3307",  0x55, 0x58, {0x9e, 0x00}, 0},
 	/* Packard Bell */
 	{"Packard Bell", "DOA150",  "v0.3104",  0x55, 0x58, {0x21, 0x00}, 0},
 	{"Packard Bell", "DOA150",  "v0.3105",  0x55, 0x58, {0x20, 0x00}, 0},
@@ -346,8 +347,7 @@ static void acerhdf_check_param(struct thermal_zone_device *thermal)
  * as late as the polling interval is since we can't do that in the respective
  * accessors of the module parameters.
  */
-static int acerhdf_get_ec_temp(struct thermal_zone_device *thermal,
-			       unsigned long *t)
+static int acerhdf_get_ec_temp(struct thermal_zone_device *thermal, int *t)
 {
 	int temp, err = 0;
 
@@ -453,7 +453,7 @@ static int acerhdf_get_trip_type(struct thermal_zone_device *thermal, int trip,
 }
 
 static int acerhdf_get_trip_hyst(struct thermal_zone_device *thermal, int trip,
-				 unsigned long *temp)
+				 int *temp)
 {
 	if (trip != 0)
 		return -EINVAL;
@@ -464,7 +464,7 @@ static int acerhdf_get_trip_hyst(struct thermal_zone_device *thermal, int trip,
 }
 
 static int acerhdf_get_trip_temp(struct thermal_zone_device *thermal, int trip,
-				 unsigned long *temp)
+				 int *temp)
 {
 	if (trip == 0)
 		*temp = fanon;
@@ -477,7 +477,7 @@ static int acerhdf_get_trip_temp(struct thermal_zone_device *thermal, int trip,
 }
 
 static int acerhdf_get_crit_temp(struct thermal_zone_device *thermal,
-				 unsigned long *temperature)
+				 int *temperature)
 {
 	*temperature = ACERHDF_TEMP_CRIT;
 	return 0;

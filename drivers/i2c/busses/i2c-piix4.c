@@ -54,7 +54,7 @@
 #define SMBSLVDAT	(0xC + piix4_smba)
 
 /* count for request_region */
-#define SMBIOSIZE	8
+#define SMBIOSIZE	9
 
 /* PCI Address Constants */
 #define SMBBA		0x090
@@ -86,7 +86,7 @@ MODULE_PARM_DESC(force, "Forcibly enable the PIIX4. DANGEROUS!");
 /* If force_addr is set to anything different from 0, we forcibly enable
    the PIIX4 at the given address. VERY DANGEROUS! */
 static int force_addr;
-module_param (force_addr, int, 0);
+module_param_hw(force_addr, int, ioport, 0);
 MODULE_PARM_DESC(force_addr,
 		 "Forcibly enable the PIIX4 at the given address. "
 		 "EXTREMELY DANGEROUS!");
@@ -647,7 +647,8 @@ static int piix4_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	}
 
 	if (dev->vendor == PCI_VENDOR_ID_AMD &&
-	    dev->device == PCI_DEVICE_ID_AMD_HUDSON2_SMBUS) {
+	    (dev->device == PCI_DEVICE_ID_AMD_HUDSON2_SMBUS ||
+	     dev->device == PCI_DEVICE_ID_AMD_KERNCZ_SMBUS)) {
 		retval = piix4_setup_sb800(dev, id, 1);
 	}
 

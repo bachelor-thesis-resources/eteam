@@ -49,6 +49,7 @@
 #include <linux/sched.h>
 #include <linux/semaphore.h>
 #include <linux/slab.h>
+#include <linux/nospec.h>
 
 #include <asm/uaccess.h>
 
@@ -133,7 +134,7 @@ static DEFINE_SPINLOCK(port_lock);
 static DECLARE_BITMAP(dev_map, IB_UMAD_MAX_PORTS);
 
 static void ib_umad_add_one(struct ib_device *device);
-static void ib_umad_remove_one(struct ib_device *device);
+static void ib_umad_remove_one(struct ib_device *device, void *client_data);
 
 static void ib_umad_release_dev(struct kobject *kobj)
 {
@@ -341,6 +342,11 @@ static ssize_t ib_umad_read(struct file *filp, char __user *buf,
 
 	mutex_lock(&file->mutex);
 
+	if (file->agents_dead) {
+		mutex_unlock(&file->mutex);
+		return -EIO;
+	}
+
 	while (list_empty(&file->recv_list)) {
 		mutex_unlock(&file->mutex);
 
@@ -483,7 +489,7 @@ static ssize_t ib_umad_write(struct file *filp, const char __user *buf,
 
 	agent = __get_agent(file, packet->mad.hdr.id);
 	if (!agent) {
-		ret = -EINVAL;
+		ret = -EIO;
 		goto err_up;
 	}
 
@@ -842,11 +848,14 @@ static int ib_umad_unreg_agent(struct ib_umad_file *file, u32 __user *arg)
 
 	if (get_user(id, arg))
 		return -EFAULT;
+	if (id >= IB_UMAD_MAX_AGENTS)
+		return -EINVAL;
 
 	mutex_lock(&file->port->file_mutex);
 	mutex_lock(&file->mutex);
 
-	if (id >= IB_UMAD_MAX_AGENTS || !__get_agent(file, id)) {
+	id = array_index_nospec(id, IB_UMAD_MAX_AGENTS);
+	if (!__get_agent(file, id)) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -1322,9 +1331,9 @@ free:
 	kobject_put(&umad_dev->kobj);
 }
 
-static void ib_umad_remove_one(struct ib_device *device)
+static void ib_umad_remove_one(struct ib_device *device, void *client_data)
 {
-	struct ib_umad_device *umad_dev = ib_get_client_data(device, &umad_client);
+	struct ib_umad_device *umad_dev = client_data;
 	int i;
 
 	if (!umad_dev)

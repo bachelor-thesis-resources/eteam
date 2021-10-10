@@ -345,6 +345,7 @@ void mlx5_init_qp_table(struct mlx5_core_dev *dev)
 {
 	struct mlx5_qp_table *table = &dev->priv.qp_table;
 
+	memset(table, 0, sizeof(*table));
 	spin_lock_init(&table->lock);
 	INIT_RADIX_TREE(&table->tree, GFP_ATOMIC);
 	mlx5_qp_debugfs_init(dev);
@@ -392,7 +393,7 @@ int mlx5_core_xrcd_alloc(struct mlx5_core_dev *dev, u32 *xrcdn)
 	if (out.hdr.status)
 		err = mlx5_cmd_status_to_err(&out.hdr);
 	else
-		*xrcdn = be32_to_cpu(out.xrcdn);
+		*xrcdn = be32_to_cpu(out.xrcdn) & 0xffffff;
 
 	return err;
 }

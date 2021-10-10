@@ -581,6 +581,7 @@ static int img_spfi_probe(struct platform_device *pdev)
 	struct img_spfi *spfi;
 	struct resource *res;
 	int ret;
+	u32 max_speed_hz;
 
 	master = spi_alloc_master(&pdev->dev, sizeof(*spfi));
 	if (!master)
@@ -645,6 +646,19 @@ static int img_spfi_probe(struct platform_device *pdev)
 	master->max_speed_hz = clk_get_rate(spfi->spfi_clk) / 4;
 	master->min_speed_hz = clk_get_rate(spfi->spfi_clk) / 512;
 
+	/*
+	 * Maximum speed supported by spfi is limited to the lower value
+	 * between 1/4 of the SPFI clock or to "spfi-max-frequency"
+	 * defined in the device tree.
+	 * If no value is defined in the device tree assume the maximum
+	 * speed supported to be 1/4 of the SPFI clock.
+	 */
+	if (!of_property_read_u32(spfi->dev->of_node, "spfi-max-frequency",
+				  &max_speed_hz)) {
+		if (master->max_speed_hz > max_speed_hz)
+			master->max_speed_hz = max_speed_hz;
+	}
+
 	master->setup = img_spfi_setup;
 	master->cleanup = img_spfi_cleanup;
 	master->transfer_one = img_spfi_transfer_one;
@@ -659,6 +673,8 @@ static int img_spfi_probe(struct platform_device *pdev)
 			dma_release_channel(spfi->tx_ch);
 		if (spfi->rx_ch)
 			dma_release_channel(spfi->rx_ch);
+		spfi->tx_ch = NULL;
+		spfi->rx_ch = NULL;
 		dev_warn(spfi->dev, "Failed to get DMA channels, falling back to PIO mode\n");
 	} else {
 		master->dma_tx = spfi->tx_ch;
@@ -757,8 +773,10 @@ static int img_spfi_resume(struct device *dev)
 	int ret;
 
 	ret = pm_runtime_get_sync(dev);
-	if (ret)
+	if (ret) {
+		pm_runtime_put_noidle(dev);
 		return ret;
+	}
 	spfi_reset(spfi);
 	pm_runtime_put(dev);
 

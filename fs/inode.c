@@ -28,16 +28,16 @@
  *   inode->i_state, inode->i_hash, __iget()
  * Inode LRU list locks protect:
  *   inode->i_sb->s_inode_lru, inode->i_lru
- * inode_sb_list_lock protects:
- *   sb->s_inodes, inode->i_sb_list
+ * inode->i_sb->s_inode_list_lock protects:
+ *   inode->i_sb->s_inodes, inode->i_sb_list
  * bdi->wb.list_lock protects:
- *   bdi->wb.b_{dirty,io,more_io,dirty_time}, inode->i_wb_list
+ *   bdi->wb.b_{dirty,io,more_io,dirty_time}, inode->i_io_list
  * inode_hash_lock protects:
  *   inode_hashtable, inode->i_hash
  *
  * Lock ordering:
  *
- * inode_sb_list_lock
+ * inode->i_sb->s_inode_list_lock
  *   inode->i_lock
  *     Inode LRU list locks
  *
@@ -45,7 +45,7 @@
  *   inode->i_lock
  *
  * inode_hash_lock
- *   inode_sb_list_lock
+ *   inode->i_sb->s_inode_list_lock
  *   inode->i_lock
  *
  * iunique_lock
@@ -56,8 +56,6 @@ static unsigned int i_hash_mask __read_mostly;
 static unsigned int i_hash_shift __read_mostly;
 static struct hlist_head *inode_hashtable __read_mostly;
 static __cacheline_aligned_in_smp DEFINE_SPINLOCK(inode_hash_lock);
-
-__cacheline_aligned_in_smp DEFINE_SPINLOCK(inode_sb_list_lock);
 
 /*
  * Empty aops. Can be used for the cases where the user does not
@@ -137,6 +135,7 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
 	inode->i_sb = sb;
 	inode->i_blkbits = sb->s_blocksize_bits;
 	inode->i_flags = 0;
+	atomic64_set(&inode->i_sequence, 0);
 	atomic_set(&inode->i_count, 1);
 	inode->i_op = &empty_iops;
 	inode->i_fop = &no_open_fops;
@@ -155,6 +154,12 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
 	inode->i_link = NULL;
 	inode->i_rdev = 0;
 	inode->dirtied_when = 0;
+
+#ifdef CONFIG_CGROUP_WRITEBACK
+	inode->i_wb_frn_winner = 0;
+	inode->i_wb_frn_avg_time = 0;
+	inode->i_wb_frn_history = 0;
+#endif
 
 	if (security_inode_alloc(inode))
 		goto out;
@@ -359,7 +364,7 @@ void inode_init_once(struct inode *inode)
 	memset(inode, 0, sizeof(*inode));
 	INIT_HLIST_NODE(&inode->i_hash);
 	INIT_LIST_HEAD(&inode->i_devices);
-	INIT_LIST_HEAD(&inode->i_wb_list);
+	INIT_LIST_HEAD(&inode->i_io_list);
 	INIT_LIST_HEAD(&inode->i_lru);
 	address_space_init_once(&inode->i_data);
 	i_size_ordered_init(inode);
@@ -426,18 +431,18 @@ static void inode_lru_list_del(struct inode *inode)
  */
 void inode_sb_list_add(struct inode *inode)
 {
-	spin_lock(&inode_sb_list_lock);
+	spin_lock(&inode->i_sb->s_inode_list_lock);
 	list_add(&inode->i_sb_list, &inode->i_sb->s_inodes);
-	spin_unlock(&inode_sb_list_lock);
+	spin_unlock(&inode->i_sb->s_inode_list_lock);
 }
 EXPORT_SYMBOL_GPL(inode_sb_list_add);
 
 static inline void inode_sb_list_del(struct inode *inode)
 {
 	if (!list_empty(&inode->i_sb_list)) {
-		spin_lock(&inode_sb_list_lock);
+		spin_lock(&inode->i_sb->s_inode_list_lock);
 		list_del_init(&inode->i_sb_list);
-		spin_unlock(&inode_sb_list_lock);
+		spin_unlock(&inode->i_sb->s_inode_list_lock);
 	}
 }
 
@@ -527,8 +532,8 @@ static void evict(struct inode *inode)
 	BUG_ON(!(inode->i_state & I_FREEING));
 	BUG_ON(!list_empty(&inode->i_lru));
 
-	if (!list_empty(&inode->i_wb_list))
-		inode_wb_list_del(inode);
+	if (!list_empty(&inode->i_io_list))
+		inode_io_list_del(inode);
 
 	inode_sb_list_del(inode);
 
@@ -577,6 +582,7 @@ static void dispose_list(struct list_head *head)
 		list_del_init(&inode->i_lru);
 
 		evict(inode);
+		cond_resched();
 	}
 }
 
@@ -594,7 +600,8 @@ void evict_inodes(struct super_block *sb)
 	struct inode *inode, *next;
 	LIST_HEAD(dispose);
 
-	spin_lock(&inode_sb_list_lock);
+again:
+	spin_lock(&sb->s_inode_list_lock);
 	list_for_each_entry_safe(inode, next, &sb->s_inodes, i_sb_list) {
 		if (atomic_read(&inode->i_count))
 			continue;
@@ -609,8 +616,20 @@ void evict_inodes(struct super_block *sb)
 		inode_lru_list_del(inode);
 		spin_unlock(&inode->i_lock);
 		list_add(&inode->i_lru, &dispose);
+
+		/*
+		 * We can have a ton of inodes to evict at unmount time given
+		 * enough memory, check to see if we need to go to sleep for a
+		 * bit so we don't livelock.
+		 */
+		if (need_resched()) {
+			spin_unlock(&sb->s_inode_list_lock);
+			cond_resched();
+			dispose_list(&dispose);
+			goto again;
+		}
 	}
-	spin_unlock(&inode_sb_list_lock);
+	spin_unlock(&sb->s_inode_list_lock);
 
 	dispose_list(&dispose);
 }
@@ -631,7 +650,7 @@ int invalidate_inodes(struct super_block *sb, bool kill_dirty)
 	struct inode *inode, *next;
 	LIST_HEAD(dispose);
 
-	spin_lock(&inode_sb_list_lock);
+	spin_lock(&sb->s_inode_list_lock);
 	list_for_each_entry_safe(inode, next, &sb->s_inodes, i_sb_list) {
 		spin_lock(&inode->i_lock);
 		if (inode->i_state & (I_NEW | I_FREEING | I_WILL_FREE)) {
@@ -654,7 +673,7 @@ int invalidate_inodes(struct super_block *sb, bool kill_dirty)
 		spin_unlock(&inode->i_lock);
 		list_add(&inode->i_lru, &dispose);
 	}
-	spin_unlock(&inode_sb_list_lock);
+	spin_unlock(&sb->s_inode_list_lock);
 
 	dispose_list(&dispose);
 
@@ -890,7 +909,7 @@ struct inode *new_inode(struct super_block *sb)
 {
 	struct inode *inode;
 
-	spin_lock_prefetch(&inode_sb_list_lock);
+	spin_lock_prefetch(&sb->s_inode_list_lock);
 
 	inode = new_inode_pseudo(sb);
 	if (inode)
@@ -1585,6 +1604,7 @@ static int update_time(struct inode *inode, struct timespec *time, int flags)
 /**
  *	touch_atime	-	update the access time
  *	@path: the &struct path to update
+ *	@inode: inode to update
  *
  *	Update the accessed time on an inode and mark it for writeback.
  *	This function automatically handles read only file systems and media,
@@ -1597,6 +1617,13 @@ bool atime_needs_update(const struct path *path, struct inode *inode)
 
 	if (inode->i_flags & S_NOATIME)
 		return false;
+
+	/* Atime updates will likely cause i_uid and i_gid to be written
+	 * back improprely if their true value is unknown to the vfs.
+	 */
+	if (HAS_UNMAPPED_ID(inode))
+		return false;
+
 	if (IS_NOATIME(inode))
 		return false;
 	if ((inode->i_sb->s_flags & MS_NODIRATIME) && S_ISDIR(inode->i_mode))
@@ -1657,7 +1684,8 @@ EXPORT_SYMBOL(touch_atime);
  */
 int should_remove_suid(struct dentry *dentry)
 {
-	umode_t mode = d_inode(dentry)->i_mode;
+	struct inode *inode = d_inode(dentry);
+	umode_t mode = inode->i_mode;
 	int kill = 0;
 
 	/* suid always must be killed */
@@ -1671,7 +1699,8 @@ int should_remove_suid(struct dentry *dentry)
 	if (unlikely((mode & S_ISGID) && (mode & S_IXGRP)))
 		kill |= ATTR_KILL_SGID;
 
-	if (unlikely(kill && !capable(CAP_FSETID) && S_ISREG(mode)))
+	if (unlikely(kill && !capable_wrt_inode_uidgid(inode, CAP_FSETID) &&
+		     S_ISREG(mode)))
 		return kill;
 
 	return 0;
@@ -1720,16 +1749,21 @@ static int __remove_privs(struct dentry *dentry, int kill)
  */
 int file_remove_privs(struct file *file)
 {
-	struct dentry *dentry = file->f_path.dentry;
-	struct inode *inode = d_inode(dentry);
+	struct dentry *dentry = file_dentry(file);
+	struct inode *inode = file_inode(file);
 	int kill;
 	int error = 0;
 
-	/* Fast path for nothing security related */
-	if (IS_NOSEC(inode))
+	/*
+	 * Fast path for nothing security related.
+	 * As well for non-regular files, e.g. blkdev inodes.
+	 * For example, blkdev_write_iter() might get here
+	 * trying to remove privs which it is not allowed to.
+	 */
+	if (IS_NOSEC(inode) || !S_ISREG(inode->i_mode))
 		return 0;
 
-	kill = file_needs_remove_privs(file);
+	kill = dentry_needs_remove_privs(dentry);
 	if (kill < 0)
 		return kill;
 	if (kill)
@@ -1924,8 +1958,14 @@ void inode_init_owner(struct inode *inode, const struct inode *dir,
 	inode->i_uid = current_fsuid();
 	if (dir && dir->i_mode & S_ISGID) {
 		inode->i_gid = dir->i_gid;
+
+		/* Directories are special, and always inherit S_ISGID */
 		if (S_ISDIR(mode))
 			mode |= S_ISGID;
+		else if ((mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP) &&
+			 !in_group_p(inode->i_gid) &&
+			 !capable_wrt_inode_uidgid(dir, CAP_FSETID))
+			mode &= ~S_ISGID;
 	} else
 		inode->i_gid = current_fsgid();
 	inode->i_mode = mode;
@@ -2015,3 +2055,9 @@ void inode_set_flags(struct inode *inode, unsigned int flags,
 				  new_flags) != old_flags));
 }
 EXPORT_SYMBOL(inode_set_flags);
+
+void inode_nohighmem(struct inode *inode)
+{
+	mapping_set_gfp_mask(inode->i_mapping, GFP_USER);
+}
+EXPORT_SYMBOL(inode_nohighmem);

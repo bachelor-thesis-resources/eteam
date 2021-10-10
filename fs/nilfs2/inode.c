@@ -55,7 +55,7 @@ void nilfs_inode_add_blocks(struct inode *inode, int n)
 {
 	struct nilfs_root *root = NILFS_I(inode)->i_root;
 
-	inode_add_bytes(inode, (1 << inode->i_blkbits) * n);
+	inode_add_bytes(inode, i_blocksize(inode) * n);
 	if (root)
 		atomic64_add(n, &root->blocks_count);
 }
@@ -64,7 +64,7 @@ void nilfs_inode_sub_blocks(struct inode *inode, int n)
 {
 	struct nilfs_root *root = NILFS_I(inode)->i_root;
 
-	inode_sub_bytes(inode, (1 << inode->i_blkbits) * n);
+	inode_sub_bytes(inode, i_blocksize(inode) * n);
 	if (root)
 		atomic64_sub(n, &root->blocks_count);
 }
@@ -356,7 +356,7 @@ struct inode *nilfs_new_inode(struct inode *dir, umode_t mode)
 		goto failed;
 
 	mapping_set_gfp_mask(inode->i_mapping,
-			     mapping_gfp_mask(inode->i_mapping) & ~__GFP_FS);
+			   mapping_gfp_constraint(inode->i_mapping, ~__GFP_FS));
 
 	root = NILFS_I(dir)->i_root;
 	ii = NILFS_I(inode);
@@ -522,7 +522,7 @@ static int __nilfs_read_inode(struct super_block *sb,
 	up_read(&NILFS_MDT(nilfs->ns_dat)->mi_sem);
 	nilfs_set_inode_flags(inode);
 	mapping_set_gfp_mask(inode->i_mapping,
-			     mapping_gfp_mask(inode->i_mapping) & ~__GFP_FS);
+			   mapping_gfp_constraint(inode->i_mapping, ~__GFP_FS));
 	return 0;
 
  failed_unmap:
@@ -821,7 +821,7 @@ int nilfs_setattr(struct dentry *dentry, struct iattr *iattr)
 	struct super_block *sb = inode->i_sb;
 	int err;
 
-	err = inode_change_ok(inode, iattr);
+	err = setattr_prepare(dentry, iattr);
 	if (err)
 		return err;
 

@@ -126,6 +126,9 @@ process_mbx:
 		struct fm10k_mbx_info *mbx = &vf_info->mbx;
 		u16 glort = vf_info->glort;
 
+		/* process the SM mailbox first to drain outgoing messages */
+		hw->mbx.ops.process(hw, &hw->mbx);
+
 		/* verify port mapping is valid, if not reset port */
 		if (vf_info->vf_flags && !fm10k_glort_valid_pf(hw, glort))
 			hw->iov.ops.reset_lport(hw, vf_info);
@@ -137,8 +140,11 @@ process_mbx:
 		}
 
 		/* guarantee we have free space in the SM mailbox */
-		if (!hw->mbx.ops.tx_ready(&hw->mbx, FM10K_VFMBX_MSG_MTU))
+		if (!hw->mbx.ops.tx_ready(&hw->mbx, FM10K_VFMBX_MSG_MTU)) {
+			/* keep track of how many times this occurs */
+			interface->hw_sm_mbx_full++;
 			break;
+		}
 
 		/* cleanup mailbox and process received messages */
 		mbx->ops.process(hw, mbx);
@@ -227,9 +233,6 @@ int fm10k_iov_resume(struct pci_dev *pdev)
 		/* assign GLORT to VF, and restrict it to multicast */
 		hw->iov.ops.set_lport(hw, vf_info, i,
 				      FM10K_VF_FLAG_MULTI_CAPABLE);
-
-		/* assign our default vid to the VF following reset */
-		vf_info->sw_vid = hw->mac.default_vid;
 
 		/* mailbox is disconnected so we don't send a message */
 		hw->iov.ops.assign_default_mac_vlan(hw, vf_info);

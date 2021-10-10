@@ -94,6 +94,8 @@
 #include "internal.h"
 #include "fd.h"
 
+#include "../../lib/kstrtox.h"
+
 /* NOTE:
  *	Implementing inode permission operations in /proc is almost
  *	certainly an error.  Permission checks need to happen during
@@ -252,7 +254,7 @@ static ssize_t proc_pid_cmdline_read(struct file *file, char __user *buf,
 	 * Inherently racy -- command line shares address space
 	 * with code and data.
 	 */
-	rv = access_remote_vm(mm, arg_end - 1, &c, 1, 0);
+	rv = access_remote_vm(mm, arg_end - 1, &c, 1, FOLL_ANON);
 	if (rv <= 0)
 		goto out_free_page;
 
@@ -270,7 +272,7 @@ static ssize_t proc_pid_cmdline_read(struct file *file, char __user *buf,
 			int nr_read;
 
 			_count = min3(count, len, PAGE_SIZE);
-			nr_read = access_remote_vm(mm, p, page, _count, 0);
+			nr_read = access_remote_vm(mm, p, page, _count, FOLL_ANON);
 			if (nr_read < 0)
 				rv = nr_read;
 			if (nr_read <= 0)
@@ -305,7 +307,7 @@ static ssize_t proc_pid_cmdline_read(struct file *file, char __user *buf,
 			bool final;
 
 			_count = min3(count, len, PAGE_SIZE);
-			nr_read = access_remote_vm(mm, p, page, _count, 0);
+			nr_read = access_remote_vm(mm, p, page, _count, FOLL_ANON);
 			if (nr_read < 0)
 				rv = nr_read;
 			if (nr_read <= 0)
@@ -354,7 +356,7 @@ skip_argv:
 			bool final;
 
 			_count = min3(count, len, PAGE_SIZE);
-			nr_read = access_remote_vm(mm, p, page, _count, 0);
+			nr_read = access_remote_vm(mm, p, page, _count, FOLL_ANON);
 			if (nr_read < 0)
 				rv = nr_read;
 			if (nr_read <= 0)
@@ -403,7 +405,7 @@ static const struct file_operations proc_pid_cmdline_ops = {
 static int proc_pid_auxv(struct seq_file *m, struct pid_namespace *ns,
 			 struct pid *pid, struct task_struct *task)
 {
-	struct mm_struct *mm = mm_access(task, PTRACE_MODE_READ);
+	struct mm_struct *mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
 	if (mm && !IS_ERR(mm)) {
 		unsigned int nwords = 0;
 		do {
@@ -430,13 +432,11 @@ static int proc_pid_wchan(struct seq_file *m, struct pid_namespace *ns,
 
 	wchan = get_wchan(task);
 
-	if (lookup_symbol_name(wchan, symname) < 0) {
-		if (!ptrace_may_access(task, PTRACE_MODE_READ))
-			return 0;
-		seq_printf(m, "%lu", wchan);
-	} else {
+	if (wchan && ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)
+			&& !lookup_symbol_name(wchan, symname))
 		seq_printf(m, "%s", symname);
-	}
+	else
+		seq_putc(m, '0');
 
 	return 0;
 }
@@ -447,7 +447,7 @@ static int lock_trace(struct task_struct *task)
 	int err = mutex_lock_killable(&task->signal->cred_guard_mutex);
 	if (err)
 		return err;
-	if (!ptrace_may_access(task, PTRACE_MODE_ATTACH)) {
+	if (!ptrace_may_access(task, PTRACE_MODE_ATTACH_FSCREDS)) {
 		mutex_unlock(&task->signal->cred_guard_mutex);
 		return -EPERM;
 	}
@@ -470,6 +470,20 @@ static int proc_pid_stack(struct seq_file *m, struct pid_namespace *ns,
 	unsigned long *entries;
 	int err;
 	int i;
+
+	/*
+	 * The ability to racily run the kernel stack unwinder on a running task
+	 * and then observe the unwinder output is scary; while it is useful for
+	 * debugging kernel issues, it can also allow an attacker to leak kernel
+	 * stack contents.
+	 * Doing this in a manner that is at least safe from races would require
+	 * some work to ensure that the remote task can not be scheduled; and
+	 * even then, this would still expose the unwinder as local attack
+	 * surface.
+	 * Therefore, this interface is restricted to root.
+	 */
+	if (!file_ns_capable(m->file, &init_user_ns, CAP_SYS_ADMIN))
+		return -EACCES;
 
 	entries = kmalloc(MAX_STACK_TRACE_DEPTH * sizeof(*entries), GFP_KERNEL);
 	if (!entries)
@@ -700,7 +714,7 @@ static int proc_fd_access_allowed(struct inode *inode)
 	 */
 	task = get_proc_task(inode);
 	if (task) {
-		allowed = ptrace_may_access(task, PTRACE_MODE_READ);
+		allowed = ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);
 		put_task_struct(task);
 	}
 	return allowed;
@@ -710,11 +724,18 @@ int proc_setattr(struct dentry *dentry, struct iattr *attr)
 {
 	int error;
 	struct inode *inode = d_inode(dentry);
+	struct user_namespace *s_user_ns;
 
 	if (attr->ia_valid & ATTR_MODE)
 		return -EPERM;
 
-	error = inode_change_ok(inode, attr);
+	/* Don't let anyone mess with weird proc files */
+	s_user_ns = inode->i_sb->s_user_ns;
+	if (!kuid_has_mapping(s_user_ns, inode->i_uid) ||
+	    !kgid_has_mapping(s_user_ns, inode->i_gid))
+		return -EPERM;
+
+	error = setattr_prepare(dentry, attr);
 	if (error)
 		return error;
 
@@ -735,7 +756,7 @@ static bool has_pid_permissions(struct pid_namespace *pid,
 		return true;
 	if (in_group_p(pid->pid_gid))
 		return true;
-	return ptrace_may_access(task, PTRACE_MODE_READ);
+	return ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);
 }
 
 
@@ -812,7 +833,7 @@ struct mm_struct *proc_mem_open(struct inode *inode, unsigned int mode)
 	struct mm_struct *mm = ERR_PTR(-ESRCH);
 
 	if (task) {
-		mm = mm_access(task, mode);
+		mm = mm_access(task, mode | PTRACE_MODE_FSCREDS);
 		put_task_struct(task);
 
 		if (!IS_ERR_OR_NULL(mm)) {
@@ -854,6 +875,7 @@ static ssize_t mem_rw(struct file *file, char __user *buf,
 	unsigned long addr = *ppos;
 	ssize_t copied;
 	char *page;
+	unsigned int flags;
 
 	if (!mm)
 		return 0;
@@ -866,6 +888,11 @@ static ssize_t mem_rw(struct file *file, char __user *buf,
 	if (!atomic_inc_not_zero(&mm->mm_users))
 		goto free;
 
+	/* Maybe we should limit FOLL_FORCE to actual ptrace users? */
+	flags = FOLL_FORCE;
+	if (write)
+		flags |= FOLL_WRITE;
+
 	while (count > 0) {
 		int this_len = min_t(int, count, PAGE_SIZE);
 
@@ -874,7 +901,7 @@ static ssize_t mem_rw(struct file *file, char __user *buf,
 			break;
 		}
 
-		this_len = access_remote_vm(mm, addr, page, this_len, write);
+		this_len = access_remote_vm(mm, addr, page, this_len, flags);
 		if (!this_len) {
 			if (!copied)
 				copied = -EIO;
@@ -955,8 +982,10 @@ static ssize_t environ_read(struct file *file, char __user *buf,
 	unsigned long src = *ppos;
 	int ret = 0;
 	struct mm_struct *mm = file->private_data;
+	unsigned long env_start, env_end;
 
-	if (!mm)
+	/* Ensure the process spawned far enough to have an environment. */
+	if (!mm || !mm->env_end)
 		return 0;
 
 	page = (char *)__get_free_page(GFP_TEMPORARY);
@@ -966,20 +995,25 @@ static ssize_t environ_read(struct file *file, char __user *buf,
 	ret = 0;
 	if (!atomic_inc_not_zero(&mm->mm_users))
 		goto free;
+
+	down_read(&mm->mmap_sem);
+	env_start = mm->env_start;
+	env_end = mm->env_end;
+	up_read(&mm->mmap_sem);
+
 	while (count > 0) {
 		size_t this_len, max_len;
 		int retval;
 
-		if (src >= (mm->env_end - mm->env_start))
+		if (src >= (env_end - env_start))
 			break;
 
-		this_len = mm->env_end - (mm->env_start + src);
+		this_len = env_end - (env_start + src);
 
 		max_len = min_t(size_t, PAGE_SIZE, count);
 		this_len = min(max_len, this_len);
 
-		retval = access_remote_vm(mm, (mm->env_start + src),
-			page, this_len, 0);
+		retval = access_remote_vm(mm, (env_start + src), page, this_len, FOLL_ANON);
 
 		if (retval <= 0) {
 			ret = retval;
@@ -1035,6 +1069,16 @@ static ssize_t oom_adj_read(struct file *file, char __user *buf, size_t count,
 	return simple_read_from_buffer(buf, count, ppos, buffer, len);
 }
 
+/*
+ * /proc/pid/oom_adj exists solely for backwards compatibility with previous
+ * kernels.  The effective policy is defined by oom_score_adj, which has a
+ * different scale: oom_adj grew exponentially and oom_score_adj grows linearly.
+ * Values written to oom_adj are simply mapped linearly to oom_score_adj.
+ * Processes that become oom disabled via oom_adj will still be oom disabled
+ * with this implementation.
+ *
+ * oom_adj cannot be removed since existing userspace binaries use it.
+ */
 static ssize_t oom_adj_write(struct file *file, const char __user *buf,
 			     size_t count, loff_t *ppos)
 {
@@ -1230,10 +1274,9 @@ static ssize_t proc_loginuid_write(struct file * file, const char __user * buf,
 				   size_t count, loff_t *ppos)
 {
 	struct inode * inode = file_inode(file);
-	char *page, *tmp;
-	ssize_t length;
 	uid_t loginuid;
 	kuid_t kloginuid;
+	int rv;
 
 	rcu_read_lock();
 	if (current != pid_task(proc_pid(inode), PIDTYPE_PID)) {
@@ -1242,46 +1285,28 @@ static ssize_t proc_loginuid_write(struct file * file, const char __user * buf,
 	}
 	rcu_read_unlock();
 
-	if (count >= PAGE_SIZE)
-		count = PAGE_SIZE - 1;
-
 	if (*ppos != 0) {
 		/* No partial writes. */
 		return -EINVAL;
 	}
-	page = (char*)__get_free_page(GFP_TEMPORARY);
-	if (!page)
-		return -ENOMEM;
-	length = -EFAULT;
-	if (copy_from_user(page, buf, count))
-		goto out_free_page;
 
-	page[count] = '\0';
-	loginuid = simple_strtoul(page, &tmp, 10);
-	if (tmp == page) {
-		length = -EINVAL;
-		goto out_free_page;
-
-	}
+	rv = kstrtou32_from_user(buf, count, 10, &loginuid);
+	if (rv < 0)
+		return rv;
 
 	/* is userspace tring to explicitly UNSET the loginuid? */
 	if (loginuid == AUDIT_UID_UNSET) {
 		kloginuid = INVALID_UID;
 	} else {
 		kloginuid = make_kuid(file->f_cred->user_ns, loginuid);
-		if (!uid_valid(kloginuid)) {
-			length = -EINVAL;
-			goto out_free_page;
-		}
+		if (!uid_valid(kloginuid))
+			return -EINVAL;
 	}
 
-	length = audit_set_loginuid(kloginuid);
-	if (likely(length == 0))
-		length = count;
-
-out_free_page:
-	free_page((unsigned long) page);
-	return length;
+	rv = audit_set_loginuid(kloginuid);
+	if (rv < 0)
+		return rv;
+	return count;
 }
 
 static const struct file_operations proc_loginuid_operations = {
@@ -1335,8 +1360,9 @@ static ssize_t proc_fault_inject_write(struct file * file,
 			const char __user * buf, size_t count, loff_t *ppos)
 {
 	struct task_struct *task;
-	char buffer[PROC_NUMBUF], *end;
+	char buffer[PROC_NUMBUF];
 	int make_it_fail;
+	int rv;
 
 	if (!capable(CAP_SYS_RESOURCE))
 		return -EPERM;
@@ -1345,9 +1371,9 @@ static ssize_t proc_fault_inject_write(struct file * file,
 		count = sizeof(buffer) - 1;
 	if (copy_from_user(buffer, buf, count))
 		return -EFAULT;
-	make_it_fail = simple_strtol(strstrip(buffer), &end, 0);
-	if (*end)
-		return -EINVAL;
+	rv = kstrtoint(strstrip(buffer), 0, &make_it_fail);
+	if (rv < 0)
+		return rv;
 	if (make_it_fail < 0 || make_it_fail > 1)
 		return -EINVAL;
 
@@ -1554,18 +1580,13 @@ static const struct file_operations proc_pid_set_comm_operations = {
 static int proc_exe_link(struct dentry *dentry, struct path *exe_path)
 {
 	struct task_struct *task;
-	struct mm_struct *mm;
 	struct file *exe_file;
 
 	task = get_proc_task(d_inode(dentry));
 	if (!task)
 		return -ENOENT;
-	mm = get_task_mm(task);
+	exe_file = get_task_exe_file(task);
 	put_task_struct(task);
-	if (!mm)
-		return -ENOENT;
-	exe_file = get_mm_exe_file(mm);
-	mmput(mm);
 	if (exe_file) {
 		*exe_path = exe_file->f_path;
 		path_get(&exe_file->f_path);
@@ -1836,8 +1857,6 @@ end_instantiate:
 	return dir_emit(ctx, name, len, 1, DT_UNKNOWN);
 }
 
-#ifdef CONFIG_CHECKPOINT_RESTORE
-
 /*
  * dname_to_vma_addr - maps a dentry name into two unsigned longs
  * which represent vma start and end addresses.
@@ -1845,8 +1864,33 @@ end_instantiate:
 static int dname_to_vma_addr(struct dentry *dentry,
 			     unsigned long *start, unsigned long *end)
 {
-	if (sscanf(dentry->d_name.name, "%lx-%lx", start, end) != 2)
+	const char *str = dentry->d_name.name;
+	unsigned long long sval, eval;
+	unsigned int len;
+
+	len = _parse_integer(str, 16, &sval);
+	if (len & KSTRTOX_OVERFLOW)
 		return -EINVAL;
+	if (sval != (unsigned long)sval)
+		return -EINVAL;
+	str += len;
+
+	if (*str != '-')
+		return -EINVAL;
+	str++;
+
+	len = _parse_integer(str, 16, &eval);
+	if (len & KSTRTOX_OVERFLOW)
+		return -EINVAL;
+	if (eval != (unsigned long)eval)
+		return -EINVAL;
+	str += len;
+
+	if (*str != '\0')
+		return -EINVAL;
+
+	*start = sval;
+	*end = eval;
 
 	return 0;
 }
@@ -1864,17 +1908,12 @@ static int map_files_d_revalidate(struct dentry *dentry, unsigned int flags)
 	if (flags & LOOKUP_RCU)
 		return -ECHILD;
 
-	if (!capable(CAP_SYS_ADMIN)) {
-		status = -EPERM;
-		goto out_notask;
-	}
-
 	inode = d_inode(dentry);
 	task = get_proc_task(inode);
 	if (!task)
 		goto out_notask;
 
-	mm = mm_access(task, PTRACE_MODE_READ);
+	mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
 	if (IS_ERR_OR_NULL(mm))
 		goto out;
 
@@ -1939,7 +1978,7 @@ static int proc_map_files_get_link(struct dentry *dentry, struct path *path)
 	down_read(&mm->mmap_sem);
 	vma = find_exact_vma(mm, vm_start, vm_end);
 	if (vma && vma->vm_file) {
-		*path = vma->vm_file->f_path;
+		*path = vma_pr_or_file(vma)->f_path;
 		path_get(path);
 		rc = 0;
 	}
@@ -1957,6 +1996,29 @@ struct map_files_info {
 	unsigned char	name[4*sizeof(long)+2]; /* max: %lx-%lx\0 */
 };
 
+/*
+ * Only allow CAP_SYS_ADMIN to follow the links, due to concerns about how the
+ * symlinks may be used to bypass permissions on ancestor directories in the
+ * path to the file in question.
+ */
+static const char *
+proc_map_files_follow_link(struct dentry *dentry, void **cookie)
+{
+	if (!capable(CAP_SYS_ADMIN))
+		return ERR_PTR(-EPERM);
+
+	return proc_pid_follow_link(dentry, NULL);
+}
+
+/*
+ * Identical to proc_pid_link_inode_operations except for follow_link()
+ */
+static const struct inode_operations proc_map_files_link_inode_operations = {
+	.readlink	= proc_pid_readlink,
+	.follow_link	= proc_map_files_follow_link,
+	.setattr	= proc_setattr,
+};
+
 static int
 proc_map_files_instantiate(struct inode *dir, struct dentry *dentry,
 			   struct task_struct *task, const void *ptr)
@@ -1972,7 +2034,7 @@ proc_map_files_instantiate(struct inode *dir, struct dentry *dentry,
 	ei = PROC_I(inode);
 	ei->op.proc_get_link = proc_map_files_get_link;
 
-	inode->i_op = &proc_pid_link_inode_operations;
+	inode->i_op = &proc_map_files_link_inode_operations;
 	inode->i_size = 64;
 	inode->i_mode = S_IFLNK;
 
@@ -1996,17 +2058,13 @@ static struct dentry *proc_map_files_lookup(struct inode *dir,
 	int result;
 	struct mm_struct *mm;
 
-	result = -EPERM;
-	if (!capable(CAP_SYS_ADMIN))
-		goto out;
-
 	result = -ENOENT;
 	task = get_proc_task(dir);
 	if (!task)
 		goto out;
 
 	result = -EACCES;
-	if (!ptrace_may_access(task, PTRACE_MODE_READ))
+	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS))
 		goto out_put_task;
 
 	result = -ENOENT;
@@ -2053,17 +2111,13 @@ proc_map_files_readdir(struct file *file, struct dir_context *ctx)
 	struct map_files_info *p;
 	int ret;
 
-	ret = -EPERM;
-	if (!capable(CAP_SYS_ADMIN))
-		goto out;
-
 	ret = -ENOENT;
 	task = get_proc_task(file_inode(file));
 	if (!task)
 		goto out;
 
 	ret = -EACCES;
-	if (!ptrace_may_access(task, PTRACE_MODE_READ))
+	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS))
 		goto out_put_task;
 
 	ret = 0;
@@ -2245,7 +2299,6 @@ static const struct file_operations proc_timers_operations = {
 	.llseek		= seq_lseek,
 	.release	= seq_release_private,
 };
-#endif /* CONFIG_CHECKPOINT_RESTORE */
 
 static int proc_pident_instantiate(struct inode *dir,
 	struct dentry *dentry, struct task_struct *task, const void *ptr)
@@ -2481,35 +2534,24 @@ static ssize_t proc_coredump_filter_write(struct file *file,
 {
 	struct task_struct *task;
 	struct mm_struct *mm;
-	char buffer[PROC_NUMBUF], *end;
 	unsigned int val;
 	int ret;
 	int i;
 	unsigned long mask;
 
-	ret = -EFAULT;
-	memset(buffer, 0, sizeof(buffer));
-	if (count > sizeof(buffer) - 1)
-		count = sizeof(buffer) - 1;
-	if (copy_from_user(buffer, buf, count))
-		goto out_no_task;
-
-	ret = -EINVAL;
-	val = (unsigned int)simple_strtoul(buffer, &end, 0);
-	if (*end == '\n')
-		end++;
-	if (end - buffer == 0)
-		goto out_no_task;
+	ret = kstrtouint_from_user(buf, count, 0, &val);
+	if (ret < 0)
+		return ret;
 
 	ret = -ESRCH;
 	task = get_proc_task(file_inode(file));
 	if (!task)
 		goto out_no_task;
 
-	ret = end - buffer;
 	mm = get_task_mm(task);
 	if (!mm)
 		goto out_no_mm;
+	ret = 0;
 
 	for (i = 0, mask = 1; i < MMF_DUMP_FILTER_BITS; i++, mask <<= 1) {
 		if (val & mask)
@@ -2522,7 +2564,9 @@ static ssize_t proc_coredump_filter_write(struct file *file,
  out_no_mm:
 	put_task_struct(task);
  out_no_task:
-	return ret;
+	if (ret < 0)
+		return ret;
+	return count;
 }
 
 static const struct file_operations proc_coredump_filter_operations = {
@@ -2543,7 +2587,7 @@ static int do_io_accounting(struct task_struct *task, struct seq_file *m, int wh
 	if (result)
 		return result;
 
-	if (!ptrace_may_access(task, PTRACE_MODE_READ)) {
+	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)) {
 		result = -EACCES;
 		goto out_unlock;
 	}
@@ -2826,9 +2870,7 @@ static const struct inode_operations proc_task_inode_operations;
 static const struct pid_entry tgid_base_stuff[] = {
 	DIR("task",       S_IRUGO|S_IXUGO, proc_task_inode_operations, proc_task_operations),
 	DIR("fd",         S_IRUSR|S_IXUSR, proc_fd_inode_operations, proc_fd_operations),
-#ifdef CONFIG_CHECKPOINT_RESTORE
 	DIR("map_files",  S_IRUSR|S_IXUSR, proc_map_files_inode_operations, proc_map_files_operations),
-#endif
 	DIR("fdinfo",     S_IRUSR|S_IXUSR, proc_fdinfo_inode_operations, proc_fdinfo_operations),
 	DIR("ns",	  S_IRUSR|S_IXUGO, proc_ns_dir_inode_operations, proc_ns_dir_operations),
 #ifdef CONFIG_NET
@@ -3161,6 +3203,8 @@ int proc_pid_readdir(struct file *file, struct dir_context *ctx)
 	     iter.tgid += 1, iter = next_tgid(ns, iter)) {
 		char name[PROC_NUMBUF];
 		int len;
+
+		cond_resched();
 		if (!has_pid_permissions(ns, iter.task, 2))
 			continue;
 
@@ -3175,6 +3219,44 @@ int proc_pid_readdir(struct file *file, struct dir_context *ctx)
 	ctx->pos = PID_MAX_LIMIT + TGID_OFFSET;
 	return 0;
 }
+
+/*
+ * proc_tid_comm_permission is a special permission function exclusively
+ * used for the node /proc/<pid>/task/<tid>/comm.
+ * It bypasses generic permission checks in the case where a task of the same
+ * task group attempts to access the node.
+ * The rationale behind this is that glibc and bionic access this node for
+ * cross thread naming (pthread_set/getname_np(!self)). However, if
+ * PR_SET_DUMPABLE gets set to 0 this node among others becomes uid=0 gid=0,
+ * which locks out the cross thread naming implementation.
+ * This function makes sure that the node is always accessible for members of
+ * same thread group.
+ */
+static int proc_tid_comm_permission(struct inode *inode, int mask)
+{
+	bool is_same_tgroup;
+	struct task_struct *task;
+
+	task = get_proc_task(inode);
+	if (!task)
+		return -ESRCH;
+	is_same_tgroup = same_thread_group(current, task);
+	put_task_struct(task);
+
+	if (likely(is_same_tgroup && !(mask & MAY_EXEC))) {
+		/* This file (/proc/<pid>/task/<tid>/comm) can always be
+		 * read or written by the members of the corresponding
+		 * thread group.
+		 */
+		return 0;
+	}
+
+	return generic_permission(inode, mask);
+}
+
+static const struct inode_operations proc_tid_comm_inode_operations = {
+		.permission = proc_tid_comm_permission,
+};
 
 /*
  * Tasks
@@ -3194,7 +3276,9 @@ static const struct pid_entry tid_base_stuff[] = {
 #ifdef CONFIG_SCHED_DEBUG
 	REG("sched",     S_IRUGO|S_IWUSR, proc_pid_sched_operations),
 #endif
-	REG("comm",      S_IRUGO|S_IWUSR, proc_pid_set_comm_operations),
+	NOD("comm",      S_IFREG|S_IRUGO|S_IWUSR,
+			 &proc_tid_comm_inode_operations,
+			 &proc_pid_set_comm_operations, {}),
 #ifdef CONFIG_HAVE_ARCH_TRACEHOOK
 	ONE("syscall",   S_IRUSR, proc_pid_syscall),
 #endif

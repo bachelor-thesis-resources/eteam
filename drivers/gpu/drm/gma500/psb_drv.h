@@ -536,6 +536,7 @@ struct drm_psb_private {
 	int lvds_ssc_freq;
 	bool is_lvds_on;
 	bool is_mipi_on;
+	bool lvds_enabled_in_vbt;
 	u32 mipi_ctrl_display;
 
 	unsigned int core_freq;
@@ -687,15 +688,15 @@ extern void psb_irq_turn_off_dpst(struct drm_device *dev);
 extern void psb_irq_uninstall_islands(struct drm_device *dev, int hw_islands);
 extern int psb_vblank_wait2(struct drm_device *dev, unsigned int *sequence);
 extern int psb_vblank_wait(struct drm_device *dev, unsigned int *sequence);
-extern int psb_enable_vblank(struct drm_device *dev, int crtc);
-extern void psb_disable_vblank(struct drm_device *dev, int crtc);
+extern int psb_enable_vblank(struct drm_device *dev, unsigned int pipe);
+extern void psb_disable_vblank(struct drm_device *dev, unsigned int pipe);
 void
 psb_enable_pipestat(struct drm_psb_private *dev_priv, int pipe, u32 mask);
 
 void
 psb_disable_pipestat(struct drm_psb_private *dev_priv, int pipe, u32 mask);
 
-extern u32 psb_get_vblank_counter(struct drm_device *dev, int crtc);
+extern u32 psb_get_vblank_counter(struct drm_device *dev, unsigned int pipe);
 
 /* framebuffer.c */
 extern int psbfb_probed(struct drm_device *dev);

@@ -5,13 +5,14 @@
 #include <linux/errno.h>
 
 typedef struct {
+	spinlock_t lock;
 	cpumask_t cpu_attach_mask;
 	atomic_t attach_count;
 	unsigned int flush_mm;
 	spinlock_t list_lock;
 	struct list_head pgtable_list;
 	struct list_head gmap_list;
-	unsigned long asce_bits;
+	unsigned long asce;
 	unsigned long asce_limit;
 	unsigned long vdso_base;
 	/* The mmu context allocates 4K page tables. */
@@ -23,6 +24,7 @@ typedef struct {
 } mm_context_t;
 
 #define INIT_MM_CONTEXT(name)						      \
+	.context.lock = __SPIN_LOCK_UNLOCKED(name.context.lock),	      \
 	.context.list_lock    = __SPIN_LOCK_UNLOCKED(name.context.list_lock), \
 	.context.pgtable_list = LIST_HEAD_INIT(name.context.pgtable_list),    \
 	.context.gmap_list = LIST_HEAD_INIT(name.context.gmap_list),

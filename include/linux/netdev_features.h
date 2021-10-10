@@ -11,6 +11,8 @@
 #define _LINUX_NETDEV_FEATURES_H
 
 #include <linux/types.h>
+#include <linux/bitops.h>
+#include <asm/byteorder.h>
 
 typedef u64 netdev_features_t;
 
@@ -52,7 +54,7 @@ enum {
 		NETIF_F_GSO_TUNNEL_REMCSUM_BIT,
 
 	NETIF_F_FCOE_CRC_BIT,		/* FCoE CRC32 */
-	NETIF_F_SCTP_CSUM_BIT,		/* SCTP checksum offload */
+	NETIF_F_SCTP_CRC_BIT,		/* SCTP checksum offload */
 	NETIF_F_FCOE_MTU_BIT,		/* Supports max FCoE MTU, 2158 bytes*/
 	NETIF_F_NTUPLE_BIT,		/* N-tuple filters supported */
 	NETIF_F_RXHASH_BIT,		/* Receive hashing offload */
@@ -66,6 +68,8 @@ enum {
 	NETIF_F_HW_VLAN_STAG_FILTER_BIT,/* Receive filtering on VLAN STAGs */
 	NETIF_F_HW_L2FW_DOFFLOAD_BIT,	/* Allow L2 Forwarding in Hardware */
 	NETIF_F_BUSY_POLL_BIT,		/* Busy poll */
+
+	NETIF_F_HW_TC_BIT,		/* Offload TC infrastructure */
 
 	/*
 	 * Add your fresh new feature above and remember to update
@@ -103,7 +107,7 @@ enum {
 #define NETIF_F_NTUPLE		__NETIF_F(NTUPLE)
 #define NETIF_F_RXCSUM		__NETIF_F(RXCSUM)
 #define NETIF_F_RXHASH		__NETIF_F(RXHASH)
-#define NETIF_F_SCTP_CSUM	__NETIF_F(SCTP_CSUM)
+#define NETIF_F_SCTP_CRC	__NETIF_F(SCTP_CRC)
 #define NETIF_F_SG		__NETIF_F(SG)
 #define NETIF_F_TSO6		__NETIF_F(TSO6)
 #define NETIF_F_TSO_ECN		__NETIF_F(TSO_ECN)
@@ -124,6 +128,28 @@ enum {
 #define NETIF_F_HW_VLAN_STAG_TX	__NETIF_F(HW_VLAN_STAG_TX)
 #define NETIF_F_HW_L2FW_DOFFLOAD	__NETIF_F(HW_L2FW_DOFFLOAD)
 #define NETIF_F_BUSY_POLL	__NETIF_F(BUSY_POLL)
+#define NETIF_F_HW_TC		__NETIF_F(HW_TC)
+
+/* Finds the next feature with the highest number of the range of start till 0.
+ */
+static inline int find_next_netdev_feature(u64 feature, unsigned long start)
+{
+	/* like BITMAP_LAST_WORD_MASK() for u64
+	 * this sets the most significant 64 - start to 0.
+	 */
+	feature &= ~0ULL >> (-start & ((sizeof(feature) * 8) - 1));
+
+	return fls64(feature) - 1;
+}
+
+/* This goes for the MSB to the LSB through the set feature bits,
+ * mask_addr should be a u64 and bit an int
+ */
+#define for_each_netdev_feature(mask_addr, bit)				\
+	for ((bit) = find_next_netdev_feature((mask_addr),		\
+					      NETDEV_FEATURE_COUNT);	\
+	     (bit) >= 0;						\
+	     (bit) = find_next_netdev_feature((mask_addr), (bit) - 1))
 
 /* Features valid for ethtool to change */
 /* = all defined minus driver/device-class-related */
@@ -166,6 +192,12 @@ enum {
  * for all in netdev_increment_features.
  */
 #define NETIF_F_ALL_FOR_ALL	(NETIF_F_NOCACHE_COPY | NETIF_F_FSO)
+
+/*
+ * If upper/master device has these features disabled, they must be disabled
+ * on all lower/slave devices as well.
+ */
+#define NETIF_F_UPPER_DISABLES	NETIF_F_LRO
 
 /* changeable features with no special hardware requirements */
 #define NETIF_F_SOFT_FEATURES	(NETIF_F_GSO | NETIF_F_GRO)

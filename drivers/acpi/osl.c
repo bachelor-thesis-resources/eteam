@@ -19,10 +19,6 @@
  *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  *  GNU General Public License for more details.
  *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- *
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  *
  */
@@ -44,9 +40,11 @@
 #include <linux/list.h>
 #include <linux/jiffies.h>
 #include <linux/semaphore.h>
+#include <linux/module.h>
 
 #include <asm/io.h>
 #include <asm/uaccess.h>
+#include <linux/io-64-nonatomic-lo-hi.h>
 
 #include "internal.h"
 
@@ -69,8 +67,6 @@ struct acpi_os_dpc {
 /* stuff for debugger support */
 int acpi_in_debugger;
 EXPORT_SYMBOL(acpi_in_debugger);
-
-extern char line_buf[80];
 #endif				/*ENABLE_DEBUGGER */
 
 static int (*__acpi_os_prepare_sleep)(u8 sleep_state, u32 pm1a_ctrl,
@@ -83,6 +79,8 @@ static void *acpi_irq_context;
 static struct workqueue_struct *kacpid_wq;
 static struct workqueue_struct *kacpi_notify_wq;
 static struct workqueue_struct *kacpi_hotplug_wq;
+static bool acpi_os_initialized;
+unsigned int acpi_sci_irq = INVALID_ACPI_IRQ;
 
 /*
  * This list of permanent mappings is for memory that may be accessed from
@@ -138,7 +136,7 @@ static struct osi_linux {
 	unsigned int	enable:1;
 	unsigned int	dmi:1;
 	unsigned int	cmdline:1;
-	unsigned int	default_disabling:1;
+	u8		default_disabling;
 } osi_linux = {0, 0, 0, 0};
 
 static u32 acpi_osi_handler(acpi_string interface, u32 supported)
@@ -255,7 +253,7 @@ early_param("acpi_rsdp", setup_acpi_rsdp);
 acpi_physical_address __init acpi_os_get_root_pointer(void)
 {
 #ifdef CONFIG_KEXEC
-	if (acpi_rsdp)
+	if (acpi_rsdp && !secure_modules())
 		return acpi_rsdp;
 #endif
 
@@ -427,24 +425,27 @@ acpi_os_map_memory(acpi_physical_address phys, acpi_size size)
 }
 EXPORT_SYMBOL_GPL(acpi_os_map_memory);
 
-static void acpi_os_drop_map_ref(struct acpi_ioremap *map)
+/* Must be called with mutex_lock(&acpi_ioremap_lock) */
+static unsigned long acpi_os_drop_map_ref(struct acpi_ioremap *map)
 {
-	if (!--map->refcount)
+	unsigned long refcount = --map->refcount;
+
+	if (!refcount)
 		list_del_rcu(&map->list);
+	return refcount;
 }
 
 static void acpi_os_map_cleanup(struct acpi_ioremap *map)
 {
-	if (!map->refcount) {
-		synchronize_rcu_expedited();
-		acpi_unmap(map->phys, map->virt);
-		kfree(map);
-	}
+	synchronize_rcu_expedited();
+	acpi_unmap(map->phys, map->virt);
+	kfree(map);
 }
 
 void __ref acpi_os_unmap_iomem(void __iomem *virt, acpi_size size)
 {
 	struct acpi_ioremap *map;
+	unsigned long refcount;
 
 	if (!acpi_gbl_permanent_mmap) {
 		__acpi_unmap_table(virt, size);
@@ -458,10 +459,11 @@ void __ref acpi_os_unmap_iomem(void __iomem *virt, acpi_size size)
 		WARN(true, PREFIX "%s: bad address %p\n", __func__, virt);
 		return;
 	}
-	acpi_os_drop_map_ref(map);
+	refcount = acpi_os_drop_map_ref(map);
 	mutex_unlock(&acpi_ioremap_lock);
 
-	acpi_os_map_cleanup(map);
+	if (!refcount)
+		acpi_os_map_cleanup(map);
 }
 EXPORT_SYMBOL_GPL(acpi_os_unmap_iomem);
 
@@ -502,6 +504,7 @@ void acpi_os_unmap_generic_address(struct acpi_generic_address *gas)
 {
 	u64 addr;
 	struct acpi_ioremap *map;
+	unsigned long refcount;
 
 	if (gas->space_id != ACPI_ADR_SPACE_SYSTEM_MEMORY)
 		return;
@@ -517,10 +520,11 @@ void acpi_os_unmap_generic_address(struct acpi_generic_address *gas)
 		mutex_unlock(&acpi_ioremap_lock);
 		return;
 	}
-	acpi_os_drop_map_ref(map);
+	refcount = acpi_os_drop_map_ref(map);
 	mutex_unlock(&acpi_ioremap_lock);
 
-	acpi_os_map_cleanup(map);
+	if (!refcount)
+		acpi_os_map_cleanup(map);
 }
 EXPORT_SYMBOL(acpi_os_unmap_generic_address);
 
@@ -670,6 +674,11 @@ void __init acpi_initrd_override(void *data, size_t size)
 	}
 	if (table_nr == 0)
 		return;
+
+	if (secure_modules()) {
+		pr_notice("kernel is locked down, ignoring table override\n");
+		return;
+	}
 
 	acpi_tables_addr =
 		memblock_find_in_range(0, max_low_pfn_mapped << PAGE_SHIFT,
@@ -858,17 +867,19 @@ acpi_os_install_interrupt_handler(u32 gsi, acpi_osd_handler handler,
 		acpi_irq_handler = NULL;
 		return AE_NOT_ACQUIRED;
 	}
+	acpi_sci_irq = irq;
 
 	return AE_OK;
 }
 
-acpi_status acpi_os_remove_interrupt_handler(u32 irq, acpi_osd_handler handler)
+acpi_status acpi_os_remove_interrupt_handler(u32 gsi, acpi_osd_handler handler)
 {
-	if (irq != acpi_gbl_FADT.sci_interrupt)
+	if (gsi != acpi_gbl_FADT.sci_interrupt || !acpi_sci_irq_valid())
 		return AE_BAD_PARAMETER;
 
-	free_irq(irq, acpi_irq);
+	free_irq(acpi_sci_irq, acpi_irq);
 	acpi_irq_handler = NULL;
+	acpi_sci_irq = INVALID_ACPI_IRQ;
 
 	return AE_OK;
 }
@@ -947,21 +958,6 @@ acpi_status acpi_os_write_port(acpi_io_address port, u32 value, u32 width)
 
 EXPORT_SYMBOL(acpi_os_write_port);
 
-#ifdef readq
-static inline u64 read64(const volatile void __iomem *addr)
-{
-	return readq(addr);
-}
-#else
-static inline u64 read64(const volatile void __iomem *addr)
-{
-	u64 l, h;
-	l = readl(addr);
-	h = readl(addr+4);
-	return l | (h << 32);
-}
-#endif
-
 acpi_status
 acpi_os_read_memory(acpi_physical_address phys_addr, u64 *value, u32 width)
 {
@@ -994,7 +990,7 @@ acpi_os_read_memory(acpi_physical_address phys_addr, u64 *value, u32 width)
 		*(u32 *) value = readl(virt_addr);
 		break;
 	case 64:
-		*(u64 *) value = read64(virt_addr);
+		*(u64 *) value = readq(virt_addr);
 		break;
 	default:
 		BUG();
@@ -1007,19 +1003,6 @@ acpi_os_read_memory(acpi_physical_address phys_addr, u64 *value, u32 width)
 
 	return AE_OK;
 }
-
-#ifdef writeq
-static inline void write64(u64 val, volatile void __iomem *addr)
-{
-	writeq(val, addr);
-}
-#else
-static inline void write64(u64 val, volatile void __iomem *addr)
-{
-	writel(val, addr);
-	writel(val>>32, addr+4);
-}
-#endif
 
 acpi_status
 acpi_os_write_memory(acpi_physical_address phys_addr, u64 value, u32 width)
@@ -1049,7 +1032,7 @@ acpi_os_write_memory(acpi_physical_address phys_addr, u64 value, u32 width)
 		writel(value, virt_addr);
 		break;
 	case 64:
-		write64(value, virt_addr);
+		writeq(value, virt_addr);
 		break;
 	default:
 		BUG();
@@ -1210,11 +1193,12 @@ void acpi_os_wait_events_complete(void)
 	 * Make sure the GPE handler or the fixed event handler is not used
 	 * on another CPU after removal.
 	 */
-	if (acpi_irq_handler)
-		synchronize_hardirq(acpi_gbl_FADT.sci_interrupt);
+	if (acpi_sci_irq_valid())
+		synchronize_hardirq(acpi_sci_irq);
 	flush_workqueue(kacpid_wq);
 	flush_workqueue(kacpi_notify_wq);
 }
+EXPORT_SYMBOL(acpi_os_wait_events_complete);
 
 struct acpi_hp_work {
 	struct work_struct work;
@@ -1316,6 +1300,9 @@ acpi_status acpi_os_wait_semaphore(acpi_handle handle, u32 units, u16 timeout)
 	long jiffies;
 	int ret = 0;
 
+	if (!acpi_os_initialized)
+		return AE_OK;
+
 	if (!sem || (units < 1))
 		return AE_BAD_PARAMETER;
 
@@ -1355,6 +1342,9 @@ acpi_status acpi_os_signal_semaphore(acpi_handle handle, u32 units)
 {
 	struct semaphore *sem = (struct semaphore *)handle;
 
+	if (!acpi_os_initialized)
+		return AE_OK;
+
 	if (!sem || (units < 1))
 		return AE_BAD_PARAMETER;
 
@@ -1369,15 +1359,13 @@ acpi_status acpi_os_signal_semaphore(acpi_handle handle, u32 units)
 	return AE_OK;
 }
 
-#ifdef ACPI_FUTURE_USAGE
-u32 acpi_os_get_line(char *buffer)
+acpi_status acpi_os_get_line(char *buffer, u32 buffer_length, u32 *bytes_read)
 {
-
 #ifdef ENABLE_DEBUGGER
 	if (acpi_in_debugger) {
 		u32 chars;
 
-		kdb_read(buffer, sizeof(line_buf));
+		kdb_read(buffer, buffer_length);
 
 		/* remove the CR kdb includes */
 		chars = strlen(buffer) - 1;
@@ -1385,9 +1373,8 @@ u32 acpi_os_get_line(char *buffer)
 	}
 #endif
 
-	return 0;
+	return AE_OK;
 }
-#endif				/*  ACPI_FUTURE_USAGE  */
 
 acpi_status acpi_os_signal(u32 function, void *info)
 {
@@ -1470,10 +1457,13 @@ void __init acpi_osi_setup(char *str)
 	if (*str == '!') {
 		str++;
 		if (*str == '\0') {
-			osi_linux.default_disabling = 1;
+			/* Do not override acpi_osi=!* */
+			if (!osi_linux.default_disabling)
+				osi_linux.default_disabling =
+					ACPI_DISABLE_ALL_VENDOR_STRINGS;
 			return;
 		} else if (*str == '*') {
-			acpi_update_interfaces(ACPI_DISABLE_ALL_STRINGS);
+			osi_linux.default_disabling = ACPI_DISABLE_ALL_STRINGS;
 			for (i = 0; i < OSI_STRING_ENTRIES_MAX; i++) {
 				osi = &osi_setup_entries[i];
 				osi->enable = false;
@@ -1546,10 +1536,13 @@ static void __init acpi_osi_setup_late(void)
 	acpi_status status;
 
 	if (osi_linux.default_disabling) {
-		status = acpi_update_interfaces(ACPI_DISABLE_ALL_VENDOR_STRINGS);
+		status = acpi_update_interfaces(osi_linux.default_disabling);
 
 		if (ACPI_SUCCESS(status))
-			printk(KERN_INFO PREFIX "Disabled all _OSI OS vendors\n");
+			printk(KERN_INFO PREFIX "Disabled all _OSI OS vendors%s\n",
+				osi_linux.default_disabling ==
+				ACPI_DISABLE_ALL_STRINGS ?
+				" and feature groups" : "");
 	}
 
 	for (i = 0; i < OSI_STRING_ENTRIES_MAX; i++) {
@@ -1863,6 +1856,7 @@ acpi_status __init acpi_os_initialize(void)
 		rv = acpi_os_map_generic_address(&acpi_gbl_FADT.reset_register);
 		pr_debug(PREFIX "%s: map reset_reg status %d\n", __func__, rv);
 	}
+	acpi_os_initialized = true;
 
 	return AE_OK;
 }

@@ -9,6 +9,7 @@ struct kmem_cachep;
 struct net_device;
 struct sk_buff;
 struct sock;
+struct net;
 
 struct dst_ops {
 	unsigned short		family;
@@ -28,10 +29,12 @@ struct dst_ops {
 					       struct sk_buff *skb, u32 mtu);
 	void			(*redirect)(struct dst_entry *dst, struct sock *sk,
 					    struct sk_buff *skb);
-	int			(*local_out)(struct sk_buff *skb);
+	int			(*local_out)(struct net *net, struct sock *sk, struct sk_buff *skb);
 	struct neighbour *	(*neigh_lookup)(const struct dst_entry *dst,
 						struct sk_buff *skb,
 						const void *daddr);
+	void			(*confirm_neigh)(const struct dst_entry *dst,
+						 const void *daddr);
 
 	struct kmem_cache	*kmem_cachep;
 

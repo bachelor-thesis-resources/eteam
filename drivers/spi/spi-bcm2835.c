@@ -88,7 +88,7 @@ struct bcm2835_spi {
 	u8 *rx_buf;
 	int tx_len;
 	int rx_len;
-	bool dma_pending;
+	unsigned int dma_pending;
 };
 
 static inline u32 bcm2835_rd(struct bcm2835_spi *bs, unsigned reg)
@@ -155,8 +155,7 @@ static irqreturn_t bcm2835_spi_interrupt(int irq, void *dev_id)
 	/* Write as many bytes as possible to FIFO */
 	bcm2835_wr_fifo(bs);
 
-	/* based on flags decide if we can finish the transfer */
-	if (bcm2835_rd(bs, BCM2835_SPI_CS) & BCM2835_SPI_CS_DONE) {
+	if (!bs->rx_len) {
 		/* Transfer complete - reset SPI HW */
 		bcm2835_spi_reset_hw(master);
 		/* wake up the framework */
@@ -233,10 +232,9 @@ static void bcm2835_spi_dma_done(void *data)
 	 * is called the tx-dma must have finished - can't get to this
 	 * situation otherwise...
 	 */
-	dmaengine_terminate_all(master->dma_tx);
-
-	/* mark as no longer pending */
-	bs->dma_pending = 0;
+	if (cmpxchg(&bs->dma_pending, true, false)) {
+		dmaengine_terminate_all(master->dma_tx);
+	}
 
 	/* and mark as completed */;
 	complete(&master->xfer_completion);
@@ -342,6 +340,7 @@ static int bcm2835_spi_transfer_one_dma(struct spi_master *master,
 	if (ret) {
 		/* need to reset on errors */
 		dmaengine_terminate_all(master->dma_tx);
+		bs->dma_pending = false;
 		bcm2835_spi_reset_hw(master);
 		return ret;
 	}
@@ -386,14 +385,14 @@ static bool bcm2835_spi_can_dma(struct spi_master *master,
 	/* otherwise we only allow transfers within the same page
 	 * to avoid wasting time on dma_mapping when it is not practical
 	 */
-	if (((size_t)tfr->tx_buf & PAGE_MASK) + tfr->len > PAGE_SIZE) {
+	if (((size_t)tfr->tx_buf & (PAGE_SIZE - 1)) + tfr->len > PAGE_SIZE) {
 		dev_warn_once(&spi->dev,
 			      "Unaligned spi tx-transfer bridging page\n");
 		return false;
 	}
-	if (((size_t)tfr->rx_buf & PAGE_MASK) + tfr->len > PAGE_SIZE) {
+	if (((size_t)tfr->rx_buf & (PAGE_SIZE - 1)) + tfr->len > PAGE_SIZE) {
 		dev_warn_once(&spi->dev,
-			      "Unaligned spi tx-transfer bridging page\n");
+			      "Unaligned spi rx-transfer bridging page\n");
 		return false;
 	}
 
@@ -480,7 +479,7 @@ static int bcm2835_spi_transfer_one_poll(struct spi_master *master,
 					 struct spi_device *spi,
 					 struct spi_transfer *tfr,
 					 u32 cs,
-					 unsigned long xfer_time_us)
+					 unsigned long long xfer_time_us)
 {
 	struct bcm2835_spi *bs = spi_master_get_devdata(master);
 	unsigned long timeout;
@@ -531,7 +530,8 @@ static int bcm2835_spi_transfer_one(struct spi_master *master,
 {
 	struct bcm2835_spi *bs = spi_master_get_devdata(master);
 	unsigned long spi_hz, clk_hz, cdiv;
-	unsigned long spi_used_hz, xfer_time_us;
+	unsigned long spi_used_hz;
+	unsigned long long xfer_time_us;
 	u32 cs = bcm2835_rd(bs, BCM2835_SPI_CS);
 
 	/* set clock */
@@ -554,7 +554,8 @@ static int bcm2835_spi_transfer_one(struct spi_master *master,
 	bcm2835_wr(bs, BCM2835_SPI_CLK, cdiv);
 
 	/* handle all the 3-wire mode */
-	if ((spi->mode & SPI_3WIRE) && (tfr->rx_buf))
+	if (spi->mode & SPI_3WIRE && tfr->rx_buf &&
+	    tfr->rx_buf != master->dummy_rx)
 		cs |= BCM2835_SPI_CS_REN;
 	else
 		cs &= ~BCM2835_SPI_CS_REN;
@@ -573,9 +574,10 @@ static int bcm2835_spi_transfer_one(struct spi_master *master,
 	bs->rx_len = tfr->len;
 
 	/* calculate the estimated time in us the transfer runs */
-	xfer_time_us = tfr->len
+	xfer_time_us = (unsigned long long)tfr->len
 		* 9 /* clocks/byte - SPI-HW waits 1 clock after each byte */
-		* 1000000 / spi_used_hz;
+		* 1000000;
+	do_div(xfer_time_us, spi_used_hz);
 
 	/* for short requests run polling*/
 	if (xfer_time_us <= BCM2835_SPI_POLLING_LIMIT_US)
@@ -615,10 +617,9 @@ static void bcm2835_spi_handle_err(struct spi_master *master,
 	struct bcm2835_spi *bs = spi_master_get_devdata(master);
 
 	/* if an error occurred and we have an active dma, then terminate */
-	if (bs->dma_pending) {
+	if (cmpxchg(&bs->dma_pending, true, false)) {
 		dmaengine_terminate_all(master->dma_tx);
 		dmaengine_terminate_all(master->dma_rx);
-		bs->dma_pending = 0;
 	}
 	/* and reset */
 	bcm2835_spi_reset_hw(master);
@@ -741,7 +742,7 @@ static int bcm2835_spi_probe(struct platform_device *pdev)
 	struct resource *res;
 	int err;
 
-	master = spi_alloc_master(&pdev->dev, sizeof(*bs));
+	master = devm_spi_alloc_master(&pdev->dev, sizeof(*bs));
 	if (!master) {
 		dev_err(&pdev->dev, "spi_alloc_master() failed\n");
 		return -ENOMEM;
@@ -763,33 +764,23 @@ static int bcm2835_spi_probe(struct platform_device *pdev)
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	bs->regs = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(bs->regs)) {
-		err = PTR_ERR(bs->regs);
-		goto out_master_put;
-	}
+	if (IS_ERR(bs->regs))
+		return PTR_ERR(bs->regs);
 
 	bs->clk = devm_clk_get(&pdev->dev, NULL);
 	if (IS_ERR(bs->clk)) {
 		err = PTR_ERR(bs->clk);
 		dev_err(&pdev->dev, "could not get clk: %d\n", err);
-		goto out_master_put;
+		return err;
 	}
 
-	bs->irq = irq_of_parse_and_map(pdev->dev.of_node, 0);
+	bs->irq = platform_get_irq(pdev, 0);
 	if (bs->irq <= 0) {
 		dev_err(&pdev->dev, "could not get IRQ: %d\n", bs->irq);
-		err = bs->irq ? bs->irq : -ENODEV;
-		goto out_master_put;
+		return bs->irq ? bs->irq : -ENODEV;
 	}
 
 	clk_prepare_enable(bs->clk);
-
-	err = devm_request_irq(&pdev->dev, bs->irq, bcm2835_spi_interrupt, 0,
-			       dev_name(&pdev->dev), master);
-	if (err) {
-		dev_err(&pdev->dev, "could not request IRQ: %d\n", err);
-		goto out_clk_disable;
-	}
 
 	bcm2835_dma_init(master, &pdev->dev);
 
@@ -797,18 +788,24 @@ static int bcm2835_spi_probe(struct platform_device *pdev)
 	bcm2835_wr(bs, BCM2835_SPI_CS,
 		   BCM2835_SPI_CS_CLEAR_RX | BCM2835_SPI_CS_CLEAR_TX);
 
-	err = devm_spi_register_master(&pdev->dev, master);
+	err = devm_request_irq(&pdev->dev, bs->irq, bcm2835_spi_interrupt, 0,
+			       dev_name(&pdev->dev), master);
+	if (err) {
+		dev_err(&pdev->dev, "could not request IRQ: %d\n", err);
+		goto out_dma_release;
+	}
+
+	err = spi_register_master(master);
 	if (err) {
 		dev_err(&pdev->dev, "could not register SPI master: %d\n", err);
-		goto out_clk_disable;
+		goto out_dma_release;
 	}
 
 	return 0;
 
-out_clk_disable:
+out_dma_release:
+	bcm2835_dma_release(master);
 	clk_disable_unprepare(bs->clk);
-out_master_put:
-	spi_master_put(master);
 	return err;
 }
 
@@ -816,6 +813,8 @@ static int bcm2835_spi_remove(struct platform_device *pdev)
 {
 	struct spi_master *master = platform_get_drvdata(pdev);
 	struct bcm2835_spi *bs = spi_master_get_devdata(master);
+
+	spi_unregister_master(master);
 
 	/* Clear FIFOs, and disable the HW block */
 	bcm2835_wr(bs, BCM2835_SPI_CS,

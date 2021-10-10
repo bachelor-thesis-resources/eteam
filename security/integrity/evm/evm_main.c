@@ -23,6 +23,7 @@
 #include <linux/integrity.h>
 #include <linux/evm.h>
 #include <crypto/hash.h>
+#include <crypto/algapi.h>
 #include "evm.h"
 
 int evm_initialized;
@@ -144,11 +145,15 @@ static enum integrity_status evm_verify_hmac(struct dentry *dentry,
 	/* check value type */
 	switch (xattr_data->type) {
 	case EVM_XATTR_HMAC:
+		if (xattr_len != sizeof(struct evm_ima_xattr_data)) {
+			evm_status = INTEGRITY_FAIL;
+			goto out;
+		}
 		rc = evm_calc_hmac(dentry, xattr_name, xattr_value,
 				   xattr_value_len, calc.digest);
 		if (rc)
 			break;
-		rc = memcmp(xattr_data->digest, calc.digest,
+		rc = crypto_memneq(xattr_data->digest, calc.digest,
 			    sizeof(calc.digest));
 		if (rc)
 			rc = -EINVAL;

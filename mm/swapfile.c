@@ -48,6 +48,12 @@ static sector_t map_swap_entry(swp_entry_t, struct block_device**);
 DEFINE_SPINLOCK(swap_lock);
 static unsigned int nr_swapfiles;
 atomic_long_t nr_swap_pages;
+/*
+ * Some modules use swappable objects and may try to swap them out under
+ * memory pressure (via the shrinker). Before doing so, they may wish to
+ * check to see if any swap space is available.
+ */
+EXPORT_SYMBOL_GPL(nr_swap_pages);
 /* protected with swap_lock. reading in vm_swap_full() doesn't need lock */
 long total_swap_pages;
 static int least_priority;
@@ -875,6 +881,48 @@ int page_swapcount(struct page *page)
 }
 
 /*
+ * How many references to @entry are currently swapped out?
+ * This considers COUNT_CONTINUED so it returns exact answer.
+ */
+int swp_swapcount(swp_entry_t entry)
+{
+	int count, tmp_count, n;
+	struct swap_info_struct *p;
+	struct page *page;
+	pgoff_t offset;
+	unsigned char *map;
+
+	p = swap_info_get(entry);
+	if (!p)
+		return 0;
+
+	count = swap_count(p->swap_map[swp_offset(entry)]);
+	if (!(count & COUNT_CONTINUED))
+		goto out;
+
+	count &= ~COUNT_CONTINUED;
+	n = SWAP_MAP_MAX + 1;
+
+	offset = swp_offset(entry);
+	page = vmalloc_to_page(p->swap_map + offset);
+	offset &= ~PAGE_MASK;
+	VM_BUG_ON(page_private(page) != SWP_CONTINUED);
+
+	do {
+		page = list_entry(page->lru.next, struct page, lru);
+		map = kmap_atomic(page);
+		tmp_count = map[offset];
+		kunmap_atomic(map);
+
+		count += (tmp_count & ~COUNT_CONTINUED) * n;
+		n *= (SWAP_CONT_MAX + 1);
+	} while (tmp_count & COUNT_CONTINUED);
+out:
+	spin_unlock(&p->lock);
+	return count;
+}
+
+/*
  * We can write to an anon page without COW if there are no other references
  * to it.  And as a side-effect, free up its swap: because the old content
  * on disk will never be read, and seeking back there to write new content
@@ -1611,7 +1659,7 @@ sector_t map_swap_page(struct page *page, struct block_device **bdev)
 {
 	swp_entry_t entry;
 	entry.val = page_private(page);
-	return map_swap_entry(entry, bdev);
+	return map_swap_entry(entry, bdev) << (PAGE_SHIFT - 9);
 }
 
 /*
@@ -2143,11 +2191,10 @@ static int claim_swapfile(struct swap_info_struct *p, struct inode *inode)
 	if (S_ISBLK(inode->i_mode)) {
 		p->bdev = bdgrab(I_BDEV(inode));
 		error = blkdev_get(p->bdev,
-				   FMODE_READ | FMODE_WRITE | FMODE_EXCL,
-				   sys_swapon);
+				   FMODE_READ | FMODE_WRITE | FMODE_EXCL, p);
 		if (error < 0) {
 			p->bdev = NULL;
-			return -EINVAL;
+			return error;
 		}
 		p->old_block_size = block_size(p->bdev);
 		error = set_blocksize(p->bdev, PAGE_SIZE);
@@ -2163,6 +2210,35 @@ static int claim_swapfile(struct swap_info_struct *p, struct inode *inode)
 		return -EINVAL;
 
 	return 0;
+}
+
+
+/*
+ * Find out how many pages are allowed for a single swap device. There
+ * are two limiting factors:
+ * 1) the number of bits for the swap offset in the swp_entry_t type, and
+ * 2) the number of bits in the swap pte, as defined by the different
+ * architectures.
+ *
+ * In order to find the largest possible bit mask, a swap entry with
+ * swap type 0 and swap offset ~0UL is created, encoded to a swap pte,
+ * decoded to a swp_entry_t again, and finally the swap offset is
+ * extracted.
+ *
+ * This will mask all the bits from the initial ~0UL mask that can't
+ * be encoded in either the swp_entry_t or the architecture definition
+ * of a swap pte.
+ */
+unsigned long generic_max_swapfile_size(void)
+{
+	return swp_offset(pte_to_swp_entry(
+			swp_entry_to_pte(swp_entry(0, ~0UL)))) + 1;
+}
+
+/* Can be overridden by an architecture for additional checks. */
+__weak unsigned long max_swapfile_size(void)
+{
+	return generic_max_swapfile_size();
 }
 
 static unsigned long read_swap_header(struct swap_info_struct *p,
@@ -2184,6 +2260,8 @@ static unsigned long read_swap_header(struct swap_info_struct *p,
 		swab32s(&swap_header->info.version);
 		swab32s(&swap_header->info.last_page);
 		swab32s(&swap_header->info.nr_badpages);
+		if (swap_header->info.nr_badpages > MAX_SWAP_BADPAGES)
+			return 0;
 		for (i = 0; i < swap_header->info.nr_badpages; i++)
 			swab32s(&swap_header->info.badpages[i]);
 	}
@@ -2198,23 +2276,12 @@ static unsigned long read_swap_header(struct swap_info_struct *p,
 	p->cluster_next = 1;
 	p->cluster_nr = 0;
 
-	/*
-	 * Find out how many pages are allowed for a single swap
-	 * device. There are two limiting factors: 1) the number
-	 * of bits for the swap offset in the swp_entry_t type, and
-	 * 2) the number of bits in the swap pte as defined by the
-	 * different architectures. In order to find the
-	 * largest possible bit mask, a swap entry with swap type 0
-	 * and swap offset ~0UL is created, encoded to a swap pte,
-	 * decoded to a swp_entry_t again, and finally the swap
-	 * offset is extracted. This will mask all the bits from
-	 * the initial ~0UL mask that can't be encoded in either
-	 * the swp_entry_t or the architecture definition of a
-	 * swap pte.
-	 */
-	maxpages = swp_offset(pte_to_swp_entry(
-			swp_entry_to_pte(swp_entry(0, ~0UL)))) + 1;
+	maxpages = max_swapfile_size();
 	last_page = swap_header->info.last_page;
+	if (!last_page) {
+		pr_warn("Empty swap-file\n");
+		return 0;
+	}
 	if (last_page > maxpages) {
 		pr_warn("Truncating oversized swap area, only using %luk out of %luk\n",
 			maxpages << (PAGE_SHIFT - 10),
@@ -2348,7 +2415,6 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 	struct filename *name;
 	struct file *swap_file = NULL;
 	struct address_space *mapping;
-	int i;
 	int prio;
 	int error;
 	union swap_header *swap_header;
@@ -2388,19 +2454,8 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 
 	p->swap_file = swap_file;
 	mapping = swap_file->f_mapping;
-
-	for (i = 0; i < nr_swapfiles; i++) {
-		struct swap_info_struct *q = swap_info[i];
-
-		if (q == p || !q->swap_file)
-			continue;
-		if (mapping == q->swap_file->f_mapping) {
-			error = -EBUSY;
-			goto bad_swap;
-		}
-	}
-
 	inode = mapping->host;
+
 	/* If S_ISREG(inode->i_mode) will do mutex_lock(&inode->i_mutex); */
 	error = claim_swapfile(p, inode);
 	if (unlikely(error))
@@ -2433,6 +2488,8 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 		goto bad_swap;
 	}
 	if (p->bdev && blk_queue_nonrot(bdev_get_queue(p->bdev))) {
+		int cpu;
+
 		p->flags |= SWP_SOLIDSTATE;
 		/*
 		 * select a random position to start with to help wear leveling
@@ -2451,9 +2508,9 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 			error = -ENOMEM;
 			goto bad_swap;
 		}
-		for_each_possible_cpu(i) {
+		for_each_possible_cpu(cpu) {
 			struct percpu_cluster *cluster;
-			cluster = per_cpu_ptr(p->percpu_cluster, i);
+			cluster = per_cpu_ptr(p->percpu_cluster, cpu);
 			cluster_set_null(&cluster->index);
 		}
 	}

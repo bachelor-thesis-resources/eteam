@@ -233,7 +233,7 @@ ncp_get_charsets(struct ncp_server* server, struct ncp_nls_ioctl __user *arg)
 		len = strlen(server->nls_vol->charset);
 		if (len > NCP_IOCSNAME_LEN)
 			len = NCP_IOCSNAME_LEN;
-		strncpy(user.codepage, server->nls_vol->charset, len);
+		strscpy(user.codepage, server->nls_vol->charset, NCP_IOCSNAME_LEN);
 		user.codepage[len] = 0;
 	}
 
@@ -243,7 +243,7 @@ ncp_get_charsets(struct ncp_server* server, struct ncp_nls_ioctl __user *arg)
 		len = strlen(server->nls_io->charset);
 		if (len > NCP_IOCSNAME_LEN)
 			len = NCP_IOCSNAME_LEN;
-		strncpy(user.iocharset,	server->nls_io->charset, len);
+		strscpy(user.iocharset,	server->nls_io->charset, NCP_IOCSNAME_LEN);
 		user.iocharset[len] = 0;
 	}
 	mutex_unlock(&server->root_setup_lock);
@@ -525,6 +525,8 @@ static long __ncp_ioctl(struct inode *inode, unsigned int cmd, unsigned long arg
 			switch (rqdata.cmd) {
 				case NCP_LOCK_EX:
 				case NCP_LOCK_SH:
+						if (rqdata.timeout < 0)
+							return -EINVAL;
 						if (rqdata.timeout == 0)
 							rqdata.timeout = NCP_LOCK_DEFAULT_TIMEOUT;
 						else if (rqdata.timeout > NCP_LOCK_MAX_TIMEOUT)
